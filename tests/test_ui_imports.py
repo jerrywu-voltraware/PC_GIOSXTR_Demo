@@ -47,6 +47,83 @@ def test_main_window_tabs_do_not_include_removed_pages():
     ]
 
 
+def test_main_window_shows_device_tabs_for_multiple_ptus():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    first = DeviceState(is_connected=True, device_name="GIOS0801ST#45", device_address="AA:BB", device_number=45)
+    second = DeviceState(is_connected=True, device_name="GIOS0801ST#60", device_address="CC:DD", device_number=60)
+    window.states[first.device_address] = first
+    window.states[second.device_address] = second
+    window.active_address = first.device_address
+    window.state = first
+
+    window.refresh_pages()
+
+    labels = [window.device_tabs.tabText(index) for index in range(window.device_tabs.count())]
+    assert not window.device_tabs.isHidden()
+    assert labels == ["PTU #45", "PTU #60"]
+
+    window.close()
+
+
+def test_main_window_device_tab_switches_active_ptu():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    first = DeviceState(is_connected=True, device_name="A", device_address="AA:BB", device_number=45)
+    second = DeviceState(is_connected=True, device_name="B", device_address="CC:DD", device_number=60)
+    window.states[first.device_address] = first
+    window.states[second.device_address] = second
+    window.active_address = first.device_address
+    window.state = first
+    window.refresh_pages()
+
+    window.device_tabs.setCurrentIndex(1)
+
+    assert window.active_address == second.device_address
+    assert window.state is second
+    window.close()
+
+
+def test_main_window_device_tabs_hide_for_single_ptu_after_disconnect():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    first = DeviceState(is_connected=True, device_name="A", device_address="AA:BB", device_number=45)
+    second = DeviceState(is_connected=True, device_name="B", device_address="CC:DD", device_number=60)
+    window.states[first.device_address] = first
+    window.states[second.device_address] = second
+    window.managers[first.device_address] = object()
+    window.managers[second.device_address] = object()
+    window.active_address = second.device_address
+    window.state = second
+    window.refresh_pages()
+
+    window._cleanup_address(second.device_address)
+
+    assert window.active_address == first.device_address
+    assert window.device_tabs.isHidden()
+    assert window.device_tabs.count() == 1
+    window._close_after_disconnect = True
+    window.close()
+
+
 def test_data_pages_do_not_show_group_column():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication
@@ -153,6 +230,65 @@ def test_demo_showcase_mode_can_open_and_cancel():
 
     page._showcase_dialog.reject()
     assert page._showcase_dialog is None
+
+
+def test_demo_showcase_entries_use_connected_states():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.demo2_page import Demo2Page
+
+    app = QApplication.instance() or QApplication([])
+    page = Demo2Page(demo_use_fake_data=True)
+    first = DeviceState(device_name="GIOS0801ST#45", device_address="AA:BB", device_number=45)
+    second = DeviceState(device_name="GIOS0801ST#60", device_address="CC:DD", device_number=60)
+
+    page.set_showcase_states({first.device_address: first, second.device_address: second}, first.device_address)
+
+    assert page._showcase_entries() == [("AA:BB", "MMEU  #45"), ("CC:DD", "MMEU  #60")]
+
+
+def test_demo_multi_showcase_dialog_builds_quad_tiles():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.demo2_page import Demo2Page
+
+    app = QApplication.instance() or QApplication([])
+    page = Demo2Page(demo_use_fake_data=True)
+    states = {
+        "A": DeviceState(device_name="GIOS0801ST#45", device_address="A", device_number=45, pru_type_string="0403V1", pru_reg_item_state=4, pru_dyn_vout=5097, pru_dyn_iout=1200),
+        "B": DeviceState(device_name="GIOS0801ST#60", device_address="B", device_number=60, pru_type_string="0404V1", pru_reg_item_state=4, pru_dyn_vout=3970, pru_dyn_iout=1200),
+        "C": DeviceState(device_name="GIOS0801ST#69", device_address="C", device_number=69, pru_type_string="0403V1", pru_reg_item_state=4, pru_dyn_vout=5097, pru_dyn_iout=1200),
+    }
+    page.set_showcase_states(states, "A")
+
+    page._open_multi_showcase(["A", "B", "C"], "quad")
+
+    assert page._showcase_dialog is not None
+    assert len(page._showcase_dialog.tiles) == 3
+    assert page._showcase_dialog.tiles["A"].device_label.text() == "MMEU  #45"
+    assert page._showcase_dialog.tiles["B"].device_label.text() == "MMEU  #60"
+    assert page._showcase_dialog.tiles["A"].pct_label.text() == "76%"
+    assert page._showcase_dialog.tiles["B"].pct_label.text() == "81%"
+
+    page._showcase_dialog.reject()
+
+
+def test_demo_showcase_chooser_selects_first_four_by_default():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.windows.demo2_page import _ShowcaseChooserDialog
+
+    app = QApplication.instance() or QApplication([])
+    entries = [(str(index), f"PTU #{index}") for index in range(1, 6)]
+    dialog = _ShowcaseChooserDialog(entries)
+
+    assert dialog.selected_addresses() == ["1", "2", "3", "4"]
+    assert dialog.selected_layout_mode() == "auto"
 
 
 def test_settings_toggle_controls_demo_engineering_mode():

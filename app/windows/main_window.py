@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QTabWidget,
     QToolButton,
+    QVBoxLayout,
     QWidget,
 )
 from qasync import asyncSlot
@@ -88,6 +89,18 @@ class MainWindow(QMainWindow):
         self.scan_panel.recording_stop_all_requested.connect(self.stop_csv_recording_all)
         layout.addWidget(self.scan_panel)
 
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(4)
+
+        self.device_tabs = QTabWidget()
+        self.device_tabs.setDocumentMode(True)
+        self.device_tabs.setTabPosition(QTabWidget.TabPosition.North)
+        self.device_tabs.currentChanged.connect(self._on_device_tab_changed)
+        self.device_tabs.hide()
+        content_layout.addWidget(self.device_tabs)
+
         self.tabs = QTabWidget()
         self.settings_btn = QToolButton()
         self.settings_btn.setText("⚙")
@@ -122,7 +135,8 @@ class MainWindow(QMainWindow):
             ("Error", self.error_page),
         ):
             self.tabs.addTab(widget, label)
-        layout.addWidget(self.tabs, 1)
+        content_layout.addWidget(self.tabs, 1)
+        layout.addWidget(content, 1)
         self.setCentralWidget(central)
         self.refresh_pages()
         self.scan_panel.set_recent_devices(self.recent_device_store.load())
@@ -158,6 +172,43 @@ class MainWindow(QMainWindow):
 
     def _set_demo_preview_device(self, result: DeviceScanResult) -> None:
         self.demo2_page.set_preview_device(result.name, result.device_number)
+
+    def _device_tab_label(self, state: DeviceState) -> str:
+        base = "PTU"
+        if state.device_number is not None:
+            label = f"{base} #{state.device_number}"
+        elif state.device_name:
+            label = state.device_name
+        else:
+            label = _device_tag(state)
+        logger = self.loggers.get(state.device_address)
+        if logger is not None and logger.is_recording:
+            label = f"{label} REC"
+        if state.error_num:
+            label = f"{label} ERR"
+        return label
+
+    def _refresh_device_tabs(self) -> None:
+        self.device_tabs.blockSignals(True)
+        try:
+            self.device_tabs.clear()
+            for address, state in self.states.items():
+                page = QWidget()
+                page.setProperty("address", address)
+                self.device_tabs.addTab(page, self._device_tab_label(state))
+                if address == self.active_address:
+                    self.device_tabs.setCurrentIndex(self.device_tabs.count() - 1)
+            self.device_tabs.setVisible(len(self.states) > 1)
+        finally:
+            self.device_tabs.blockSignals(False)
+
+    def _on_device_tab_changed(self, index: int) -> None:
+        widget = self.device_tabs.widget(index)
+        if widget is None:
+            return
+        address = widget.property("address")
+        if isinstance(address, str) and address and address != self.active_address:
+            self._set_active(address)
 
     def _active_manager(self) -> BleManager | None:
         return self.managers.get(self.active_address)
@@ -206,6 +257,7 @@ class MainWindow(QMainWindow):
         self.loggers[address] = CsvLogger(self.log_dir)
         self.active_address = address
         self.state = state
+        self._refresh_device_tabs()
 
         try:
             await manager.enable_default_notifications()
@@ -277,6 +329,7 @@ class MainWindow(QMainWindow):
             next_addr = next(iter(self.managers), "")
             self.active_address = next_addr
             self.state = self.states.get(next_addr, DeviceState()) if next_addr else DeviceState()
+        self._refresh_device_tabs()
         self.refresh_pages()
 
     @pyqtSlot(str)
@@ -297,7 +350,8 @@ class MainWindow(QMainWindow):
         if address == self.active_address:
             self.refresh_pages()
         else:
-            self.scan_panel.refresh_connected_devices(self._connected_summary())
+            self._refresh_device_tabs()
+            self.scan_panel.refresh_connected_devices(self._connected_summary(), self.active_address)
 
     def _handle_event(self, event: DataEvent, state: DeviceState | None = None) -> None:
         if event.kind == "error":
@@ -409,6 +463,8 @@ class MainWindow(QMainWindow):
 
     def refresh_pages(self) -> None:
         state = self.state
+        self._refresh_device_tabs()
+        self.demo2_page.set_showcase_states(self.states, self.active_address)
         pages = (
             self.overview_page,
             self.ptu_page,

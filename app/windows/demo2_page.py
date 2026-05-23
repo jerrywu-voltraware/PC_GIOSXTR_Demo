@@ -25,8 +25,12 @@ from PyQt6.QtGui import (
     QLinearGradient,
 )
 from PyQt6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -632,6 +636,205 @@ class _ShowcaseDialog(QDialog):
         self.detail_label.setText(detail_text)
 
 
+class _ShowcaseTile(QFrame):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setStyleSheet(
+            "QFrame { background: rgba(255, 255, 255, 210); "
+            "border: 1px solid #DCEAE8; border-radius: 12px; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        self.stage = _VehicleStage(showcase_mode=True)
+        layout.addWidget(self.stage, 1)
+
+        panel = QFrame()
+        panel.setStyleSheet("QFrame { background: white; border: 1px solid #E8F1EF; border-radius: 8px; }")
+        panel_layout = QHBoxLayout(panel)
+        panel_layout.setContentsMargins(12, 8, 12, 8)
+        panel_layout.setSpacing(12)
+        self.battery_icon = _BatteryIcon()
+        self.battery_icon.setFixedSize(42, 90)
+        panel_layout.addWidget(self.battery_icon)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(3)
+        self.device_label = QLabel("-")
+        self.device_label.setStyleSheet("font-size: 17px; color: #546E7A; font-weight: 800;")
+        self.pct_label = QLabel("0%")
+        self.pct_label.setMinimumHeight(52)
+        self.pct_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.pct_label.setStyleSheet("font-size: 42px; font-weight: 800; color: #202124;")
+        self.status_label = QLabel("Standby")
+        self.status_label.setStyleSheet("font-size: 13px; font-weight: 800; color: #4C5A5D;")
+        self.detail_label = QLabel("Ready")
+        self.detail_label.setStyleSheet("font-size: 12px; color: #78909C; font-weight: 700;")
+        for label in (self.device_label, self.status_label, self.detail_label):
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        text_col.addWidget(self.device_label)
+        text_col.addWidget(self.pct_label)
+        text_col.addWidget(self.status_label)
+        text_col.addWidget(self.detail_label)
+        panel_layout.addLayout(text_col, 1)
+        layout.addWidget(panel)
+
+    def apply_snapshot(
+        self,
+        snapshot: _Snapshot,
+        *,
+        is_charging: bool,
+        is_full: bool,
+        is_engineering: bool,
+        show_pad: bool,
+        is_bike: bool,
+        pru_connected: bool,
+        pct: int,
+        icon_pct: int,
+        device_text: str,
+        status_text: str,
+        detail_text: str,
+    ) -> None:
+        self.stage.update_state(
+            snapshot,
+            is_charging=is_charging,
+            is_full=is_full,
+            is_engineering=is_engineering,
+            show_pad=show_pad,
+            is_bike=is_bike,
+            pru_connected=pru_connected,
+        )
+        self.battery_icon.set_pct(icon_pct)
+        self.device_label.setText(device_text)
+        self.pct_label.setText(f"{pct}%")
+        self.status_label.setText(status_text)
+        self.detail_label.setText(detail_text)
+
+
+class _MultiShowcaseDialog(QDialog):
+    def __init__(self, *, layout_mode: str, addresses: list[str], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("展場模式")
+        self.setStyleSheet("background-color: #FBFCFD;")
+        self.layout_mode = layout_mode
+        self.addresses = addresses[:4]
+        self.tiles: dict[str, _ShowcaseTile] = {}
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 18, 18, 18)
+        root.setSpacing(10)
+
+        top = QHBoxLayout()
+        self.logo_label = _make_logo_label(height=64)
+        top.addWidget(self.logo_label, 0, Qt.AlignmentFlag.AlignLeft)
+        top.addStretch(1)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setFixedWidth(112)
+        cancel_btn.clicked.connect(self.reject)
+        top.addWidget(cancel_btn)
+        root.addLayout(top)
+
+        self.grid = QGridLayout()
+        self.grid.setContentsMargins(18, 10, 18, 18)
+        self.grid.setSpacing(14)
+        root.addLayout(self.grid, 1)
+        self._build_grid()
+
+    def _grid_shape(self) -> tuple[int, int, int]:
+        count = max(1, min(4, len(self.addresses)))
+        mode = self.layout_mode
+        if mode == "single":
+            return 1, 1, 1
+        if mode == "split":
+            return 1, 2, min(count, 2)
+        if mode == "quad":
+            return 2, 2, count
+        if count == 1:
+            return 1, 1, 1
+        if count == 2:
+            return 1, 2, 2
+        return 2, 2, count
+
+    def _build_grid(self) -> None:
+        rows, cols, shown = self._grid_shape()
+        for row in range(rows):
+            self.grid.setRowStretch(row, 1)
+        for col in range(cols):
+            self.grid.setColumnStretch(col, 1)
+        for index, address in enumerate(self.addresses[:shown]):
+            tile = _ShowcaseTile()
+            self.tiles[address] = tile
+            self.grid.addWidget(tile, index // cols, index % cols)
+        for index in range(shown, rows * cols):
+            filler = QLabel("VOLTRAWARE")
+            filler.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            filler.setStyleSheet("font-size: 26px; font-weight: 800; color: #D6E6E8;")
+            self.grid.addWidget(filler, index // cols, index % cols)
+
+    def apply_payloads(self, payloads: dict[str, dict[str, object]]) -> None:
+        for address, tile in self.tiles.items():
+            payload = payloads.get(address)
+            if payload is None:
+                continue
+            tile.apply_snapshot(**payload)
+
+
+class _ShowcaseChooserDialog(QDialog):
+    def __init__(self, entries: list[tuple[str, str]], parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("展場模式設定")
+        self.setMinimumWidth(420)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(10)
+
+        title = QLabel("選擇要顯示的 PTU")
+        title.setStyleSheet("font-size: 15px; font-weight: 800; color: #102A33;")
+        root.addWidget(title)
+
+        self.checks: dict[str, QCheckBox] = {}
+        for index, (address, label) in enumerate(entries):
+            check = QCheckBox(label)
+            check.setChecked(index < 4)
+            self.checks[address] = check
+            root.addWidget(check)
+
+        self.layout_combo = QComboBox()
+        self.layout_combo.addItem("自動", "auto")
+        self.layout_combo.addItem("單台", "single")
+        self.layout_combo.addItem("左右分割", "split")
+        self.layout_combo.addItem("四宮格", "quad")
+        root.addWidget(QLabel("版面"))
+        root.addWidget(self.layout_combo)
+
+        hint = QLabel("第一版最多同時顯示 4 台。超過 4 台請先取消部分裝置。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #66757C;")
+        root.addWidget(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        start_btn = buttons.addButton("開始展場模式", QDialogButtonBox.ButtonRole.AcceptRole)
+        start_btn.clicked.connect(self._accept_if_valid)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def selected_addresses(self) -> list[str]:
+        return [address for address, check in self.checks.items() if check.isChecked()]
+
+    def selected_layout_mode(self) -> str:
+        return str(self.layout_combo.currentData() or "auto")
+
+    def _accept_if_valid(self) -> None:
+        selected = self.selected_addresses()
+        if not selected:
+            return
+        if len(selected) > 4:
+            return
+        self.accept()
+
+
 class Demo2Page(QWidget):
     def __init__(
         self,
@@ -655,6 +858,8 @@ class Demo2Page(QWidget):
         self._eng_mode = EngMode.NONE
         self._battery_flash_state = False
         self._battery_pct_cached = 0
+        self._showcase_states: dict[str, DeviceState] = {}
+        self._showcase_active_address = ""
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -674,7 +879,7 @@ class Demo2Page(QWidget):
 
         self.stage = _VehicleStage()
         root.addWidget(self.stage, 1)
-        self._showcase_dialog: _ShowcaseDialog | None = None
+        self._showcase_dialog: _ShowcaseDialog | _MultiShowcaseDialog | None = None
 
         self.panel = QFrame()
         self._panel_style = "QFrame { background: white; border: 1px solid #E8F1EF; border-radius: 8px; }"
@@ -768,9 +973,21 @@ class Demo2Page(QWidget):
         self._preview_device_number = number
         self.refresh(self._last_state)
 
+    def set_showcase_states(self, states: dict[str, DeviceState], active_address: str) -> None:
+        self._showcase_states = dict(states)
+        self._showcase_active_address = active_address
+        self._refresh_showcase()
+
     def _open_showcase(self) -> None:
         if self._showcase_dialog is not None and self._showcase_dialog.isVisible():
             self._showcase_dialog.raise_()
+            return
+        entries = self._showcase_entries()
+        if len(entries) > 1:
+            chooser = _ShowcaseChooserDialog(entries, self.window())
+            if chooser.exec() != QDialog.DialogCode.Accepted:
+                return
+            self._open_multi_showcase(chooser.selected_addresses(), chooser.selected_layout_mode())
             return
         dialog = _ShowcaseDialog(self.window())
         self._showcase_dialog = dialog
@@ -778,8 +995,26 @@ class Demo2Page(QWidget):
         self._refresh_showcase()
         dialog.showFullScreen()
 
+    def _open_multi_showcase(self, addresses: list[str], layout_mode: str = "auto") -> None:
+        selected = [address for address in addresses if address in self._showcase_states][:4]
+        if not selected:
+            return
+        dialog = _MultiShowcaseDialog(layout_mode=layout_mode, addresses=selected, parent=self.window())
+        self._showcase_dialog = dialog
+        dialog.finished.connect(self._clear_showcase_dialog)
+        self._refresh_showcase()
+        dialog.showFullScreen()
+
     def _clear_showcase_dialog(self) -> None:
         self._showcase_dialog = None
+
+    def _showcase_entries(self) -> list[tuple[str, str]]:
+        entries: list[tuple[str, str]] = []
+        for address, state in self._showcase_states.items():
+            snap = self._snapshot_for(state)
+            label = self._device_text(state, snap, self._eng_mode == EngMode.ENGINEERING)
+            entries.append((address, label))
+        return entries
 
     def _restyle_eng_buttons(self) -> None:
         for btn in self._eng_buttons.values():
@@ -911,9 +1146,26 @@ class Demo2Page(QWidget):
         self.detail_label.setText(self._vehicle_detail(snap.pru_type, is_engineering))
 
     def _refresh_showcase(self) -> None:
-        if self._showcase_dialog is None or self._last_state is None:
+        if self._showcase_dialog is None:
             return
-        state = self._last_state
+        if isinstance(self._showcase_dialog, _MultiShowcaseDialog):
+            payloads: dict[str, dict[str, object]] = {}
+            for address in self._showcase_dialog.addresses:
+                state = self._showcase_states.get(address)
+                if state is not None:
+                    payload, _show_panel = self._showcase_payload_for(state)
+                    payloads[address] = payload
+            self._showcase_dialog.apply_payloads(payloads)
+            return
+        if self._last_state is None:
+            return
+        payload, show_panel = self._showcase_payload_for(self._last_state)
+        self._showcase_dialog.apply_snapshot(
+            **payload,
+            show_panel=show_panel,
+        )
+
+    def _showcase_payload_for(self, state: DeviceState) -> tuple[dict[str, object], bool]:
         snap = self._snapshot_for(state)
         pru_connected = snap.pru_reg_state >= 4
         is_charging = pru_connected and snap.pru_iout > 0
@@ -928,20 +1180,22 @@ class Demo2Page(QWidget):
         show_pad = is_charging or is_full or (pru_connected and not is_engineering) or (
             not pru_connected and not is_engineering
         )
-        self._showcase_dialog.apply_snapshot(
-            snap,
-            is_charging=is_charging,
-            is_full=is_full,
-            is_engineering=is_engineering,
-            show_pad=show_pad,
-            is_bike=is_bike,
-            pru_connected=pru_connected,
-            pct=pct,
-            icon_pct=self._animated_battery_pct(pct),
-            show_panel=pru_connected and not is_engineering,
-            device_text=self._device_text(state, snap, is_engineering),
-            status_text=self._status_text(pru_connected, is_charging, is_full, is_engineering),
-            detail_text=self._vehicle_detail(snap.pru_type, is_engineering),
+        return (
+            {
+                "snapshot": snap,
+                "is_charging": is_charging,
+                "is_full": is_full,
+                "is_engineering": is_engineering,
+                "show_pad": show_pad,
+                "is_bike": is_bike,
+                "pru_connected": pru_connected,
+                "pct": pct,
+                "icon_pct": self._animated_battery_pct(pct),
+                "device_text": self._device_text(state, snap, is_engineering),
+                "status_text": self._status_text(pru_connected, is_charging, is_full, is_engineering),
+                "detail_text": self._vehicle_detail(snap.pru_type, is_engineering),
+            },
+            pru_connected and not is_engineering,
         )
 
     @staticmethod
