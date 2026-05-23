@@ -1,0 +1,1 @@
+"""GIOSXTR desktop application package."""

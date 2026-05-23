@@ -1,0 +1,63 @@
+# PC_GIOSXTR_Demo
+
+Windows desktop port of `Flutter_Gios040xst_Eng`, implemented with Python, PyQt6, bleak, qasync, and pyqtgraph.
+
+## Features
+
+- BLE scan, connect, disconnect, and reconnect workflow.
+- Supported-device filtering for Central and GIOS ST device names.
+- Advertising data reconstruction with raw bytes and AD structure table.
+- IOT, 20B, and 200B notify packet decoding.
+- PTU, PRU, Number, Waveform, Log, and Error pages.
+- Manual CSV recording with Start Recording and Stop Recording controls.
+- Device-number write and reset commands.
+- Live waveform plots with up to 5 selected signals.
+
+Android OTA update is intentionally not ported. PC distribution uses PyInstaller builds.
+
+## Requirements
+
+- Windows 10 1703 or newer.
+- Python 3.10 or newer.
+- BLE-capable Bluetooth adapter.
+
+## Setup
+
+```powershell
+cd D:\jerry\Python\PC_GIOSXTR_Demo
+python -m pip install -r requirements.txt
+```
+
+## Run
+
+```powershell
+python main.py
+```
+
+Internal DEMO scenario buttons are hidden by default. For development builds, enable them with either:
+
+```powershell
+python main.py --engineering
+$env:PC_GIOSXTR_ENGINEERING="1"; python main.py
+```
+
+## Tests
+
+```powershell
+python -m pytest -q
+```
+
+## BLE Smoke Tests
+
+```powershell
+python -m app.ble_manager --scan
+python -m app.ble_manager --connect <BLE_ADDRESS>
+```
+
+## Build EXE
+
+```powershell
+pyinstaller PC_GIOSXTR_Demo.spec
+```
+
+The executable will be created under `dist\`.

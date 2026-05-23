@@ -1,0 +1,451 @@
+"""Main desktop window for the GIOSXTR PyQt6 application."""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QIcon
+from PyQt6.QtWidgets import (
+    QHBoxLayout,
+    QMainWindow,
+    QMessageBox,
+    QTabWidget,
+    QToolButton,
+    QWidget,
+)
+from qasync import asyncSlot
+
+from ..ble_manager import BleManager, DeviceScanResult
+from ..constants import APP_ICON_FILENAME, APP_WINDOW_TITLE
+from ..csv_logger import CsvLogger
+from ..models import DataEvent, DeviceState
+from ..protocol import parse_notify_packet
+from ..recent_devices import RecentDevice, RecentDeviceStore
+from ..resources import resource_path
+from .data_pages import PruPage, PtuPage
+from .demo2_page import Demo2Page
+from .error_page import ErrorPage
+from .log_page import LogPage
+from .number_page import NumberPage
+from .overview_page import OverviewPage
+from .scan_panel import ScanPanel
+from .settings_dialog import SettingsDialog
+from .waveform_page import WaveformPage
+
+
+def _device_tag(state: DeviceState) -> str:
+    if state.device_number is not None:
+        return f"{state.device_number:03d}"
+    addr = state.device_address.replace(":", "").replace("-", "")
+    return addr[-6:].upper() if addr else "dev"
+
+
+class MainWindow(QMainWindow):
+    notify_received = pyqtSignal(str, str, bytes)
+    disconnected = pyqtSignal(str)
+
+    def __init__(self, *, engineering_mode: bool = False) -> None:
+        super().__init__()
+        self.setWindowTitle(APP_WINDOW_TITLE)
+        icon = QIcon(str(resource_path(APP_ICON_FILENAME)))
+        if not icon.isNull():
+            self.setWindowIcon(icon)
+        self.resize(1280, 820)
+
+        self.log_dir = Path.cwd() / "logs"
+        self.managers: dict[str, BleManager] = {}
+        self.states: dict[str, DeviceState] = {}
+        self.loggers: dict[str, CsvLogger] = {}
+        self.recent_device_store = RecentDeviceStore()
+        self._close_after_disconnect = False
+        self.engineering_mode = engineering_mode
+        self.demo_use_fake_data = True
+        self.demo_device_name = "MMEU"
+        self.demo_ebike_pct = 76
+        self.demo_escooter_pct = 81
+        self.active_address: str = ""
+        self.scan_ble = BleManager()
+        self.state = DeviceState()
+
+        self.notify_received.connect(self._handle_notify)
+        self.disconnected.connect(self._handle_disconnect)
+
+        central = QWidget()
+        layout = QHBoxLayout(central)
+        layout.setContentsMargins(8, 8, 8, 8)
+        self.scan_panel = ScanPanel(self.scan_ble)
+        self.scan_panel.setFixedWidth(380)
+        self.scan_panel.device_connect_requested.connect(self._connect_device)
+        self.scan_panel.disconnect_requested.connect(self._disconnect_active)
+        self.scan_panel.disconnect_all_requested.connect(self._disconnect_all)
+        self.scan_panel.active_changed.connect(self._set_active)
+        self.scan_panel.selected_device_changed.connect(self._set_demo_preview_device)
+        self.scan_panel.recording_start_requested.connect(self.start_csv_recording_active)
+        self.scan_panel.recording_stop_requested.connect(self.stop_csv_recording_active)
+        self.scan_panel.recording_start_all_requested.connect(self.start_csv_recording_all)
+        self.scan_panel.recording_stop_all_requested.connect(self.stop_csv_recording_all)
+        layout.addWidget(self.scan_panel)
+
+        self.tabs = QTabWidget()
+        self.settings_btn = QToolButton()
+        self.settings_btn.setText("⚙")
+        self.settings_btn.setToolTip("設定")
+        self.settings_btn.setAutoRaise(True)
+        self.settings_btn.clicked.connect(self._open_settings)
+        self.tabs.setCornerWidget(self.settings_btn, Qt.Corner.TopRightCorner)
+        self.overview_page = OverviewPage()
+        self.ptu_page = PtuPage()
+        self.pru_page = PruPage()
+        self.number_page = NumberPage(self._active_manager)
+        self.waveform_page = WaveformPage()
+        self.demo2_page = Demo2Page(
+            engineering_mode=self.engineering_mode,
+            demo_use_fake_data=self.demo_use_fake_data,
+            demo_device_name=self.demo_device_name,
+            demo_ebike_pct=self.demo_ebike_pct,
+            demo_escooter_pct=self.demo_escooter_pct,
+        )
+        self.log_page = LogPage()
+        self.error_page = ErrorPage()
+        self.number_page.log_message.connect(self._append_log)
+
+        for label, widget in (
+            ("Overview", self.overview_page),
+            ("PTU", self.ptu_page),
+            ("PRU", self.pru_page),
+            ("Number", self.number_page),
+            ("Waveform", self.waveform_page),
+            ("DEMO", self.demo2_page),
+            ("Log", self.log_page),
+            ("Error", self.error_page),
+        ):
+            self.tabs.addTab(widget, label)
+        layout.addWidget(self.tabs, 1)
+        self.setCentralWidget(central)
+        self.refresh_pages()
+        self.scan_panel.set_recent_devices(self.recent_device_store.load())
+
+    def set_engineering_mode(self, enabled: bool) -> None:
+        self.engineering_mode = enabled
+        self.demo2_page.set_engineering_mode(enabled)
+
+    def set_demo_settings(self, use_fake_data: bool, ebike_pct: int, escooter_pct: int, device_name: str) -> None:
+        self.demo_use_fake_data = use_fake_data
+        self.demo_device_name = device_name.strip() or "MMEU"
+        self.demo_ebike_pct = ebike_pct
+        self.demo_escooter_pct = escooter_pct
+        self.demo2_page.set_demo_settings(
+            use_fake_data=use_fake_data,
+            device_name=self.demo_device_name,
+            ebike_pct=ebike_pct,
+            escooter_pct=escooter_pct,
+        )
+
+    def _open_settings(self) -> None:
+        dialog = SettingsDialog(
+            engineering_mode=self.engineering_mode,
+            demo_use_fake_data=self.demo_use_fake_data,
+            demo_device_name=self.demo_device_name,
+            demo_ebike_pct=self.demo_ebike_pct,
+            demo_escooter_pct=self.demo_escooter_pct,
+            parent=self,
+        )
+        dialog.engineering_mode_changed.connect(self.set_engineering_mode)
+        dialog.demo_settings_changed.connect(self.set_demo_settings)
+        dialog.exec()
+
+    def _set_demo_preview_device(self, result: DeviceScanResult) -> None:
+        self.demo2_page.set_preview_device(result.name, result.device_number)
+
+    def _active_manager(self) -> BleManager | None:
+        return self.managers.get(self.active_address)
+
+    def _active_logger(self) -> CsvLogger | None:
+        return self.loggers.get(self.active_address)
+
+    def _make_notify_emitter(self):
+        def emit(address: str, uuid: str, data: bytes) -> None:
+            self.notify_received.emit(address, uuid, data)
+        return emit
+
+    def _make_disconnect_emitter(self):
+        def emit(address: str) -> None:
+            self.disconnected.emit(address)
+        return emit
+
+    @asyncSlot(object)
+    async def _connect_device(self, result: DeviceScanResult) -> None:
+        address = result.address
+        if address in self.managers:
+            self._set_active(address)
+            return
+        manager = BleManager()
+        manager.set_notify_callback(self._make_notify_emitter())
+        manager.set_disconnect_callback(self._make_disconnect_emitter())
+        try:
+            await manager.connect(address)
+        except Exception as exc:
+            QMessageBox.warning(self, "Connect failed", str(exc))
+            return
+
+        state = DeviceState()
+        state.is_connected = True
+        state.device_name = result.name
+        state.device_address = address
+        state.rssi = result.rssi
+        state.device_number = result.device_number
+        state.advertising_raw = result.raw_hex
+        state.advertising_rows = result.advertising_rows
+        state.add_log(f"Connected to {result.name} ({address})")
+        self._remember_recent_device(result)
+
+        self.managers[address] = manager
+        self.states[address] = state
+        self.loggers[address] = CsvLogger(self.log_dir)
+        self.active_address = address
+        self.state = state
+
+        try:
+            await manager.enable_default_notifications()
+        except Exception as exc:
+            state.add_log(f"Enable notifications failed: {exc}")
+        try:
+            await manager.request_200b()
+        except Exception as exc:
+            state.add_log(f"Initial 200B request skipped: {exc}")
+        self.refresh_pages()
+
+    def _remember_recent_device(self, result: DeviceScanResult) -> None:
+        try:
+            self.recent_device_store.remember(
+                RecentDevice(
+                    address=result.address,
+                    name=result.name,
+                    device_number=result.device_number,
+                    rssi=result.rssi,
+                )
+            )
+            self.scan_panel.set_recent_devices(self.recent_device_store.load())
+        except OSError:
+            pass
+
+    @pyqtSlot(str)
+    def _set_active(self, address: str) -> None:
+        if not address or address not in self.states:
+            return
+        self.active_address = address
+        self.state = self.states[address]
+        self.refresh_pages()
+
+    @asyncSlot()
+    async def _disconnect_active(self) -> None:
+        addr = self.active_address
+        if not addr:
+            return
+        await self._disconnect_address(addr)
+
+    @asyncSlot()
+    async def _disconnect_all(self) -> None:
+        for addr in list(self.managers.keys()):
+            await self._disconnect_address(addr)
+
+    async def _disconnect_address(self, address: str) -> None:
+        manager = self.managers.get(address)
+        if manager is None:
+            return
+        try:
+            await manager.disconnect()
+        finally:
+            self._cleanup_address(address)
+
+    def _cleanup_address(self, address: str) -> None:
+        logger = self.loggers.pop(address, None)
+        if logger is not None and logger.is_recording:
+            path = logger.stop()
+            if path is not None:
+                state = self.states.get(address)
+                if state is not None:
+                    state.add_log(f"CSV recording stopped: {path.name}")
+        state = self.states.pop(address, None)
+        if state is not None:
+            state.is_connected = False
+            state.add_log("Disconnected")
+        self.managers.pop(address, None)
+        if self.active_address == address:
+            next_addr = next(iter(self.managers), "")
+            self.active_address = next_addr
+            self.state = self.states.get(next_addr, DeviceState()) if next_addr else DeviceState()
+        self.refresh_pages()
+
+    @pyqtSlot(str)
+    def _handle_disconnect(self, address: str) -> None:
+        self._cleanup_address(address)
+
+    @pyqtSlot(str, str, bytes)
+    def _handle_notify(self, address: str, uuid: str, data: bytes) -> None:
+        state = self.states.get(address)
+        if state is None:
+            return
+        event = parse_notify_packet(data, uuid, state)
+        if event is not None:
+            self._handle_event(event, state)
+        logger = self.loggers.get(address)
+        if logger is not None and logger.is_recording:
+            logger.write_state(state)
+        if address == self.active_address:
+            self.refresh_pages()
+        else:
+            self.scan_panel.refresh_connected_devices(self._connected_summary())
+
+    def _handle_event(self, event: DataEvent, state: DeviceState | None = None) -> None:
+        if event.kind == "error":
+            self._show_error_dialog(state or self.state)
+
+    def _show_error_dialog(self, state: DeviceState) -> None:
+        from ..protocol import error_description
+
+        code = state.error_num
+        code_hex = f"0x{code:02X}"
+        desc = error_description(code)
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("錯誤通知")
+        msg.setTextFormat(Qt.TextFormat.RichText)
+        device_line = ""
+        if state.device_name or state.device_address:
+            device_line = (
+                f"<div style='color:#666; font-size:11px;'>"
+                f"裝置:{state.device_name} ({state.device_address})</div>"
+            )
+        details = ""
+        if state.error_data != 0 or state.error_limit != 0:
+            details = (
+                "<hr>"
+                "<div style='color:#555; font-size:11px;'>錯誤詳細資訊:</div>"
+                "<table cellpadding='4'>"
+                f"<tr><td>條件值 (Error Data):</td>"
+                f"<td align='right'><b>0x{state.error_data:X} ({state.error_data})</b></td></tr>"
+                f"<tr><td>限制值 (Error Limit):</td>"
+                f"<td align='right'><b>0x{state.error_limit:X} ({state.error_limit})</b></td></tr>"
+                "</table>"
+            )
+        msg.setText(
+            f"<div style='background:#FDECEA; padding:8px; border-radius:6px;'>"
+            f"<span style='font-size:20px; font-weight:700; color:#C0392B; font-family:Consolas;'>{code_hex}</span>"
+            f"&nbsp;&nbsp;<span style='color:#C0392B; font-weight:600;'>{desc}</span>"
+            f"</div>"
+            f"{device_line}"
+            f"{details}"
+        )
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.exec()
+
+    def start_csv_recording_active(self) -> Path | None:
+        addr = self.active_address
+        if not addr:
+            self.scan_panel.set_recording_state(False, False)
+            return None
+        return self._start_recording(addr)
+
+    def stop_csv_recording_active(self) -> Path | None:
+        addr = self.active_address
+        if not addr:
+            return None
+        return self._stop_recording(addr)
+
+    def start_csv_recording_all(self) -> None:
+        for addr in list(self.managers.keys()):
+            self._start_recording(addr)
+
+    def stop_csv_recording_all(self) -> None:
+        for addr in list(self.loggers.keys()):
+            self._stop_recording(addr)
+
+    def _start_recording(self, address: str) -> Path | None:
+        state = self.states.get(address)
+        logger = self.loggers.get(address)
+        if state is None or logger is None or not state.is_connected:
+            return None
+        if logger.is_recording:
+            return logger.current_path
+        path = logger.start(_device_tag(state))
+        state.add_log(f"CSV recording started: {path.name}")
+        self.refresh_pages()
+        return path
+
+    def _stop_recording(self, address: str) -> Path | None:
+        state = self.states.get(address)
+        logger = self.loggers.get(address)
+        if logger is None or not logger.is_recording:
+            return None
+        path = logger.stop()
+        if path is not None and state is not None:
+            state.add_log(f"CSV recording stopped: {path.name}")
+        self.refresh_pages()
+        return path
+
+    @pyqtSlot(str)
+    def _append_log(self, message: str) -> None:
+        if self.active_address:
+            self.state.add_log(message)
+        self.refresh_pages()
+
+    def _connected_summary(self) -> list[dict[str, str]]:
+        items: list[dict[str, str]] = []
+        for addr, state in self.states.items():
+            logger = self.loggers.get(addr)
+            items.append(
+                {
+                    "address": addr,
+                    "name": state.device_name,
+                    "device_number": "" if state.device_number is None else str(state.device_number),
+                    "recording": "1" if (logger is not None and logger.is_recording) else "0",
+                    "packets": str(state.total_packet_count),
+                }
+            )
+        return items
+
+    def refresh_pages(self) -> None:
+        state = self.state
+        pages = (
+            self.overview_page,
+            self.ptu_page,
+            self.pru_page,
+            self.waveform_page,
+            self.demo2_page,
+            self.log_page,
+            self.error_page,
+        )
+        for page in pages:
+            page.refresh(state)
+        active_logger = self._active_logger()
+        rec_active = active_logger is not None and active_logger.is_recording
+        rec_path = str(active_logger.current_path) if (active_logger and active_logger.current_path) else ""
+        self.overview_page.set_csv_recording(rec_active, rec_path)
+        self.scan_panel.refresh(state)
+        self.scan_panel.set_recording_state(state.is_connected, rec_active, rec_path)
+        self.scan_panel.refresh_connected_devices(self._connected_summary(), self.active_address)
+
+    def closeEvent(self, event) -> None:
+        if self.managers and not self._close_after_disconnect:
+            event.ignore()
+            self.setEnabled(False)
+            self.scan_panel.status.setText("正在中斷裝置連線，完成後關閉 APP ...")
+            asyncio.create_task(self._disconnect_then_close())
+            return
+
+        for logger in self.loggers.values():
+            logger.stop()
+        super().closeEvent(event)
+
+    async def _disconnect_then_close(self) -> None:
+        for addr in list(self.managers.keys()):
+            try:
+                await self._disconnect_address(addr)
+            except Exception:
+                self._cleanup_address(addr)
+        self._close_after_disconnect = True
+        self.setEnabled(True)
+        self.close()

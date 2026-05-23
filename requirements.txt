@@ -1,0 +1,6 @@
+PyQt6>=6.6
+bleak>=0.22
+qasync>=0.27
+pyqtgraph>=0.13
+pytest>=8.0
+pyinstaller>=6.0

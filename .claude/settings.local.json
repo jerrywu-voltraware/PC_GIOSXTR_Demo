@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(C:/Users/woo75/AppData/Local/Programs/Python/Python313/python.exe -m pip install qasync)",
+      "Bash(C:/Users/woo75/AppData/Local/Programs/Python/Python313/python.exe -m pip install -r d:/PC_GIOSXTR_Demo/requirements.txt)",
+      "Bash(C:/Users/woo75/AppData/Local/Programs/Python/Python313/python.exe -c \"from app.windows.main_window import MainWindow; print\\('import OK'\\)\")",
+      "Bash(git -C \"d:/PC_GIOSXTR_Demo\" status)",
+      "Bash(git -C \"d:/PC_GIOSXTR_Demo\" init)",
+      "Bash(git -C \"d:/PC_GIOSXTR_Demo\" add .)",
+      "Bash(git -C \"d:/PC_GIOSXTR_Demo\" rm -r --cached -q .)",
+      "Bash(git -C \"d:/PC_GIOSXTR_Demo\" status --short)",
+      "Bash(git -C \"d:/PC_GIOSXTR_Demo\" rm -rf --cached -q .)",
+      "Bash(measure-object -line)"
+    ]
+  }
+}
