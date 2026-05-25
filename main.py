@@ -13,6 +13,7 @@ from qasync import QEventLoop
 
 from app.constants import APP_ICON_FILENAME, APP_NAME, APP_VERSION, APP_WINDOW_TITLE, ENGINEERING_MODE_ENV
 from app.resources import resource_path
+from app.theme import apply_light_theme
 from app.windows.main_window import MainWindow
 
 
@@ -33,6 +34,7 @@ def main() -> int:
     engineering_mode = bool(args.engineering or _env_engineering_enabled())
 
     app = QApplication([sys.argv[0], *qt_args])
+    apply_light_theme(app)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_WINDOW_TITLE)
     app.setApplicationVersion(APP_VERSION.removeprefix("V"))
