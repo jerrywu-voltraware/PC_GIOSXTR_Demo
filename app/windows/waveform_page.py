@@ -54,6 +54,7 @@ class WaveformPage(QWidget):
         self._pens = ("#2BA7FF", "#29D398", "#F2C94C", "#FF7A59", "#B084F5", "#56CCF2", "#EB5757", "#6FCF97")
         self._states: dict[str, DeviceState] = {}
         self._active_address = ""
+        self._held_addresses: set[str] = set()
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
@@ -127,7 +128,7 @@ class WaveformPage(QWidget):
     def set_connected(self, connected: bool) -> None:
         if not connected:
             self._disconnected_hold = True
-            self.notice.setText("未連線")
+            self.notice.setText("未連線，波形已暫停")
         elif self._disconnected_hold:
             self.notice.setText("波形即時顯示")
             self._disconnected_hold = False
@@ -228,11 +229,18 @@ class WaveformPage(QWidget):
             self._refresh_chart_display(item)
 
     def _selected_addresses(self) -> set[str]:
+        held_with_data = {
+            address
+            for item in self.charts
+            for address, series in item.series.items()
+            if address in self._held_addresses and series.y
+        }
         if self.scope_combo.currentData() == "all":
-            return {address for address, state in self._states.items() if state.is_connected}
+            connected = {address for address, state in self._states.items() if state.is_connected}
+            return connected | held_with_data if connected else held_with_data
         active_state = self._states.get(self._active_address)
         if active_state is None or not active_state.is_connected:
-            return set()
+            return held_with_data
         return {self._active_address}
 
     def save_chart_image(self, item: ChartItem) -> None:
@@ -314,6 +322,9 @@ class WaveformPage(QWidget):
             series.curve.setData(series.x if visible else [], series.y if visible else [])
             if visible:
                 visible_series.append(series)
+        visible_with_data = {series.address for series in visible_series if series.y}
+        if visible_with_data:
+            self._held_addresses = visible_with_data
         legend = item.plot.plotItem.legend
         if legend is not None:
             legend.clear()

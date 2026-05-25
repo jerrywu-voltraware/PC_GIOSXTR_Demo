@@ -958,6 +958,63 @@ def test_waveform_page_can_overlay_all_connected_devices_in_one_chart():
     assert "PTU #10" in chart.stats_label.text()
 
 
+def test_waveform_page_preserves_last_waveform_when_device_disconnects():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.waveform_page import WaveformPage
+
+    app = QApplication.instance() or QApplication([])
+    page = WaveformPage()
+    page.add_chart()
+    state = DeviceState(is_connected=True, device_name="PTU A", device_address="A", device_number=6, ptu_input_voltage=52000)
+    page.set_devices({state.device_address: state}, state.device_address)
+    page.refresh_device(state, {state.device_address: state}, state.device_address)
+
+    chart = page.charts[0]
+    assert chart.y == [52000.0]
+    assert chart.series[state.device_address].curve.isVisible()
+
+    state.is_connected = False
+    page.set_devices({}, "")
+
+    assert chart.y == [52000.0]
+    assert chart.series[state.device_address].curve.isVisible()
+    assert "PTU #6" in chart.stats_label.text()
+    assert "samples 1" in chart.stats_label.text()
+
+
+def test_waveform_page_preserves_overlay_when_all_devices_disconnect():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.waveform_page import WaveformPage
+
+    app = QApplication.instance() or QApplication([])
+    page = WaveformPage()
+    page.add_chart()
+    first = DeviceState(is_connected=True, device_name="PTU A", device_address="A", device_number=6, ptu_input_voltage=52000)
+    second = DeviceState(is_connected=True, device_name="PTU B", device_address="B", device_number=10, ptu_input_voltage=54000)
+    states = {first.device_address: first, second.device_address: second}
+    page.set_devices(states, first.device_address)
+    page.refresh_device(first, states, first.device_address)
+    page.refresh_device(second, states, first.device_address)
+    page.scope_combo.setCurrentIndex(page.scope_combo.findData("all"))
+
+    chart = page.charts[0]
+    assert chart.series[first.device_address].curve.isVisible()
+    assert chart.series[second.device_address].curve.isVisible()
+
+    page.set_devices({}, "")
+
+    assert chart.series[first.device_address].curve.isVisible()
+    assert chart.series[second.device_address].curve.isVisible()
+    assert "PTU #6" in chart.stats_label.text()
+    assert "PTU #10" in chart.stats_label.text()
+
+
 def test_waveform_page_saves_chart_image_from_chart_button(monkeypatch, tmp_path):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication

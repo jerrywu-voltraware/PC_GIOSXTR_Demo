@@ -57,20 +57,25 @@ PC_GIOSXTR_Demo_V1.0.1.exe
 
 ## 開發者發佈流程
 
-每次發佈新版時，流程是：
+每次發佈新版只做必要流程：
 
 ```text
 更新 APP_VERSION 與 exe 名稱
--> 執行測試
 -> 使用 PyInstaller 打包
--> 在本機開啟產生的 exe 並確認可正常使用
--> 建立或更新公開 GitHub repository
+-> 提交並推送版本變更
 -> 建立 GitHub Release vX.Y.Z
--> 上傳已驗證的 PC_GIOSXTR_Demo_VX.Y.Z.exe
--> 使用者透過 APP 更新檢查取得新版
+-> 上傳 PC_GIOSXTR_Demo_VX.Y.Z.exe
+-> 舊版使用者透過 APP 更新檢查收到新版下載提示
 ```
 
-開發者必須先在本機開啟並驗證打包後的 exe，確認沒問題後，才能發布 GitHub Release。
+每次發佈只需要確認：
+
+- 版本號已更新到 `Vx.y.z`
+- `dist\PC_GIOSXTR_Demo_Vx.y.z.exe` 已產生
+- GitHub Release tag 是 `vx.y.z`
+- Release asset 名稱是 `PC_GIOSXTR_Demo_Vx.y.z.exe`
+
+不要把發佈流程擴大成重複的人工 smoke test、反覆啟動 exe、或額外 GitHub 狀態檢查。除非這次修改本身明確需要除錯，否則發佈流程以快速產出新版並讓舊版 APP 能偵測更新為準。
 
 ## APP 啟動行為
 
@@ -186,7 +191,7 @@ GitHub `404` 視為 repository 或 release 尚未建立。這符合目前 reposi
 
 ## 測試
 
-單元測試涵蓋：
+更新機制實作時的測試涵蓋：
 
 - 版本正規化與比較
 - 沒有新版
@@ -197,12 +202,9 @@ GitHub `404` 視為 repository 或 release 尚未建立。這符合目前 reposi
 - 符合命名規則的 asset 選擇
 - fallback `.exe` asset 選擇
 
-手動驗證涵蓋：
+每次發佈時不需要重跑完整更新機制測試。若只是升版發佈，照「開發者發佈流程」即可。
 
-- 執行 `python main.py`
-- repository 尚未有 release 時，開啟「設定 -> 關於 -> 檢查更新」
-- 使用 PyInstaller 打包
-- 在發布前，本機開啟打包後的 exe 並確認可正常使用
+只有在更新機制本身有改動時，才需要補跑相關測試。
 
 ## 完成條件
 
@@ -213,5 +215,4 @@ GitHub `404` 視為 repository 或 release 尚未建立。這符合目前 reposi
 - 手動檢查會顯示可理解的狀態
 - 有新版且 release 包含 `.exe` asset 時，APP 會提示使用者下載
 - 使用者可以開啟下載後的 exe
-- 測試通過
-- README 記錄發佈與本機驗證流程
+- 發佈流程保持簡短：升版本、打包 exe、提交推送、建立 Release、上傳 exe
