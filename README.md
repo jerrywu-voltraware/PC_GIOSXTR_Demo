@@ -13,7 +13,7 @@ Windows desktop port of `Flutter_Gios040xst_Eng`, implemented with Python, PyQt6
 - Device-number write and reset commands.
 - Live waveform plots with up to 5 selected signals.
 
-Android OTA update is intentionally not ported. PC distribution uses PyInstaller builds.
+Android OTA update is intentionally not ported. PC distribution uses PyInstaller builds and GitHub Releases for desktop update checks.
 
 ## Requirements
 
@@ -61,3 +61,33 @@ pyinstaller PC_GIOSXTR_Demo.spec
 ```
 
 The executable will be created under `dist\`.
+
+## Release And Auto Update
+
+Auto update checks use public GitHub Releases from:
+
+```text
+https://github.com/jerrywu-voltraware/PC_GIOSXTR_Demo
+```
+
+Release tags must use lowercase `v` semantic versions:
+
+```text
+v1.0.1
+```
+
+Release assets should use the matching PyInstaller executable name:
+
+```text
+PC_GIOSXTR_Demo_V1.0.1.exe
+```
+
+Before publishing a release:
+
+```powershell
+python -m pytest -q
+pyinstaller PC_GIOSXTR_Demo.spec
+.\dist\PC_GIOSXTR_Demo_V1.0.1.exe
+```
+
+Open and verify the packaged executable locally before creating the GitHub Release. Users only see updates after a GitHub Release is published with an `.exe` asset.
