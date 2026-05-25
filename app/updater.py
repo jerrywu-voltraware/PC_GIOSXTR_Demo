@@ -215,11 +215,16 @@ def default_update_download_dir() -> Path:
 def download_asset(
     asset: UpdateAsset,
     target_dir: Path | None = None,
+    target_path: Path | None = None,
     timeout: float = DOWNLOAD_TIMEOUT_SECONDS,
 ) -> Path:
-    destination_dir = target_dir or default_update_download_dir()
-    destination_dir.mkdir(parents=True, exist_ok=True)
-    destination = destination_dir / asset.name
+    if target_path is not None:
+        destination = target_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        destination_dir = target_dir or default_update_download_dir()
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination = destination_dir / asset.name
 
     request = Request(
         asset.download_url,

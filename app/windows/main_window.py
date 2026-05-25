@@ -6,9 +6,10 @@ import asyncio
 import os
 from pathlib import Path
 
-from PyQt6.QtCore import QTimer, Qt, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QStandardPaths, QTimer, Qt, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QDesktopServices, QIcon
 from PyQt6.QtWidgets import (
+    QFileDialog,
     QHBoxLayout,
     QMainWindow,
     QMessageBox,
@@ -43,6 +44,12 @@ def _device_tag(state: DeviceState) -> str:
         return f"{state.device_number:03d}"
     addr = state.device_address.replace(":", "").replace("-", "")
     return addr[-6:].upper() if addr else "dev"
+
+
+def _default_update_save_path(asset: UpdateAsset, downloads_dir: str | None = None) -> Path:
+    base_dir = downloads_dir or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
+    base_path = Path(base_dir) if base_dir else Path.home() / "Downloads"
+    return base_path / asset.name
 
 
 class MainWindow(QMainWindow):
@@ -239,8 +246,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, title, result.message or "The update check did not complete.")
 
     async def _download_update(self, asset: UpdateAsset) -> None:
+        target_path = self._select_update_download_path(asset)
+        if target_path is None:
+            return
+
         try:
-            path = await asyncio.to_thread(download_asset, asset)
+            path = await asyncio.to_thread(download_asset, asset, target_path=target_path)
         except Exception as exc:
             QMessageBox.warning(self, "Update download failed", str(exc))
             return
@@ -257,6 +268,20 @@ class MainWindow(QMainWindow):
         )
         if answer is QMessageBox.StandardButton.Yes:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _select_update_download_path(self, asset: UpdateAsset) -> Path | None:
+        selected_path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Save update as",
+            str(_default_update_save_path(asset)),
+            "Windows executable (*.exe);;All files (*)",
+        )
+        if not selected_path:
+            return None
+        path = Path(selected_path)
+        if not path.suffix and asset.name.lower().endswith(".exe"):
+            path = path.with_suffix(".exe")
+        return path
 
     def _set_demo_preview_device(self, result: DeviceScanResult) -> None:
         self.demo2_page.set_preview_device(result.name, result.device_number)

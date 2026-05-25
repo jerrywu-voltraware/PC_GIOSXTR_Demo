@@ -1,4 +1,5 @@
 import json
+import io
 from urllib.error import HTTPError, URLError
 
 import app.updater as updater
@@ -174,3 +175,26 @@ def test_check_for_update_maps_bad_json_to_invalid_response(monkeypatch):
     result = updater.check_for_update("V1.0.0")
 
     assert result.status is UpdateStatus.INVALID_RESPONSE
+
+
+def test_download_asset_writes_to_explicit_target_path(monkeypatch, tmp_path):
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            self.close()
+            return False
+
+    def fake_urlopen(_request, timeout: float):
+        assert timeout == 1.0
+        return FakeResponse(b"downloaded exe bytes")
+
+    monkeypatch.setattr(updater, "urlopen", fake_urlopen)
+    asset = updater.UpdateAsset(name="ignored.exe", download_url="https://example.test/app.exe")
+    target_path = tmp_path / "chosen-folder" / "custom-name.exe"
+
+    result_path = updater.download_asset(asset, target_path=target_path, timeout=1.0)
+
+    assert result_path == target_path
+    assert target_path.read_bytes() == b"downloaded exe bytes"

@@ -31,6 +31,15 @@ def test_main_window_imports_with_updater_enabled():
     assert MainWindow is not None
 
 
+def test_default_update_save_path_uses_asset_name(tmp_path):
+    from app.updater import UpdateAsset
+    from app.windows.main_window import _default_update_save_path
+
+    asset = UpdateAsset(name="PC_GIOSXTR_Demo_V1.0.2.exe", download_url="https://example.test/app.exe")
+
+    assert _default_update_save_path(asset, downloads_dir=str(tmp_path)) == tmp_path / asset.name
+
+
 def test_main_window_tabs_do_not_include_removed_pages():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication
