@@ -1,3 +1,7 @@
+import json
+from urllib.error import HTTPError, URLError
+
+import app.updater as updater
 from app.updater import (
     UpdateStatus,
     expected_asset_name,
@@ -137,3 +141,36 @@ def test_parse_release_response_rejects_missing_tag():
 
     assert result.status is UpdateStatus.INVALID_RESPONSE
     assert result.info is None
+
+
+def test_check_for_update_maps_404_to_repo_unavailable(monkeypatch):
+    def raise_404(_url: str):
+        raise HTTPError(_url, 404, "not found", hdrs=None, fp=None)
+
+    monkeypatch.setattr(updater, "_fetch_latest_release", raise_404)
+
+    result = updater.check_for_update("V1.0.0")
+
+    assert result.status is UpdateStatus.REPO_UNAVAILABLE
+
+
+def test_check_for_update_maps_url_error_to_network_error(monkeypatch):
+    def raise_url_error(_url: str):
+        raise URLError("offline")
+
+    monkeypatch.setattr(updater, "_fetch_latest_release", raise_url_error)
+
+    result = updater.check_for_update("V1.0.0")
+
+    assert result.status is UpdateStatus.NETWORK_ERROR
+
+
+def test_check_for_update_maps_bad_json_to_invalid_response(monkeypatch):
+    def raise_bad_json(_url: str):
+        raise json.JSONDecodeError("bad", "x", 0)
+
+    monkeypatch.setattr(updater, "_fetch_latest_release", raise_bad_json)
+
+    result = updater.check_for_update("V1.0.0")
+
+    assert result.status is UpdateStatus.INVALID_RESPONSE
