@@ -1,37 +1,37 @@
-# PC GIOSXTR Auto Update Design
+# PC GIOSXTR 自動更新設計
 
-## Goal
+## 目標
 
-Add a lightweight auto-update mechanism to the PyInstaller Windows desktop app so deployed users can discover and download new versions after the developer publishes a verified release.
+替目前的 PyInstaller Windows 桌面版 APP 加入輕量自動更新機制，讓已部署給使用者的版本可以在開發者發布新版後，偵測並下載新的執行檔。
 
-The app will use the public GitHub Releases feed for:
+APP 會使用公開的 GitHub Releases：
 
 ```text
 jerrywu-voltraware/PC_GIOSXTR_Demo
 ```
 
-The repository does not need to exist during implementation. Until it exists and has at least one release, update checks must fail quietly during automatic checks and show a readable explanation during manual checks.
+實作期間這個 repository 不一定要已經存在。若 repository 尚未建立，或尚未有 release，自動檢查必須安靜失敗；只有使用者手動按「檢查更新」時，才顯示可讀的說明。
 
-## Chosen Approach
+## 採用方案
 
-Use a semi-automatic update flow:
+採用半自動更新流程：
 
-1. The app checks GitHub Releases for the latest public release.
-2. If the release version is newer than the running app version, the app asks the user whether to download it.
-3. The app downloads the release executable to the user's temporary download area.
-4. After download, the app asks the user to close the current app and open the downloaded executable.
+1. APP 檢查 GitHub Releases 最新公開版本。
+2. 如果 release 版本比目前執行中的 APP 版本新，APP 詢問使用者是否下載。
+3. APP 將 release 裡的 exe 下載到使用者可寫入的位置。
+4. 下載完成後，APP 提醒使用者關閉目前版本，並開啟下載好的新版 exe。
 
-This avoids maintaining an external updater process and avoids installer-level complexity. It is the safest fit for the current single-file PyInstaller packaging flow.
+這個方案不需要額外維護 `updater.exe`，也不需要導入 installer。對目前單一 PyInstaller exe 的發佈方式來說，這是最穩定、風險最低的做法。
 
-## Release Contract
+## Release 規則
 
-The updater reads:
+更新程式讀取：
 
 ```text
 https://api.github.com/repos/jerrywu-voltraware/PC_GIOSXTR_Demo/releases/latest
 ```
 
-Release tags must use semantic versions with a leading `v`:
+Release tag 必須使用小寫 `v` 開頭的語意化版本：
 
 ```text
 v1.0.1
@@ -39,123 +39,122 @@ v1.1.0
 v2.0.0
 ```
 
-The running app version remains defined in `app/constants.py`:
+APP 執行中的版本仍由 `app/constants.py` 定義：
 
 ```python
 APP_VERSION = "V1.0.0"
 ```
 
-Version comparison ignores a leading `v` or `V`.
+版本比較時會忽略開頭的 `v` 或 `V`。
 
-Release assets must include a Windows executable named with the same version:
+Release asset 必須包含同版本的 Windows exe：
 
 ```text
 PC_GIOSXTR_Demo_V1.0.1.exe
 ```
 
-The updater may select the first `.exe` asset if the exact expected name is not found, but the release contract remains the versioned filename above.
+如果找不到完全符合命名的檔案，更新程式可以退而選擇第一個 `.exe` asset；但正式發佈規則仍以同版本檔名為準。
 
-## Developer Release Workflow
+## 開發者發佈流程
 
-The release workflow is:
+每次發佈新版時，流程是：
 
 ```text
-Update APP_VERSION and executable name
--> Run tests
--> Build with PyInstaller
--> Open the generated exe locally and verify it
--> Create or update the public GitHub repository
--> Create GitHub Release vX.Y.Z
--> Upload the verified PC_GIOSXTR_Demo_VX.Y.Z.exe asset
--> Users discover the release through the app update check
+更新 APP_VERSION 與 exe 名稱
+-> 執行測試
+-> 使用 PyInstaller 打包
+-> 在本機開啟產生的 exe 並確認可正常使用
+-> 建立或更新公開 GitHub repository
+-> 建立 GitHub Release vX.Y.Z
+-> 上傳已驗證的 PC_GIOSXTR_Demo_VX.Y.Z.exe
+-> 使用者透過 APP 更新檢查取得新版
 ```
 
-The developer must not publish a GitHub Release until the packaged executable has been opened and verified locally.
+開發者必須先在本機開啟並驗證打包後的 exe，確認沒問題後，才能發布 GitHub Release。
 
-## App Startup Behavior
+## APP 啟動行為
 
-On normal startup, the app starts a background update check after the main window is visible.
+正常啟動時，主視窗顯示後才排程一次背景更新檢查。
 
-Automatic checks must not block BLE scanning, UI rendering, or app shutdown.
+自動檢查不能阻塞 BLE 掃描、UI 顯示或 APP 關閉。
 
-Automatic checks are quiet on failure:
+自動檢查遇到下列狀況時保持安靜：
 
-- no network connection
-- GitHub API unavailable
-- repository not found
-- no releases
-- malformed release data
-- no downloadable executable asset
+- 無網路
+- GitHub API 無法連線
+- repository 不存在
+- 尚未建立 release
+- release 資料格式錯誤
+- release 裡沒有可下載的 exe asset
 
-If a newer version exists, the app shows a dialog with:
+如果發現新版，APP 顯示對話框，內容包含：
 
-- current version
-- latest version
-- release page URL
-- option to download now
-- option to skip
+- 目前版本
+- 最新版本
+- 是否立即下載
+- 略過選項
 
-## Manual Check Behavior
+## 手動檢查行為
 
-The settings dialog About tab gains a `Check for updates` button.
+設定視窗的「關於」頁加入「檢查更新」按鈕。
 
-Manual checks show a result in all cases:
+手動檢查必須在所有情況都顯示結果：
 
-- up to date
-- newer version available
-- repository or release not found
-- network failure
-- no executable asset in release
-- unexpected GitHub response
+- 目前已是最新版本
+- 有新版可下載
+- repository 或 release 尚未建立
+- 網路連線失敗
+- release 裡沒有 exe asset
+- GitHub 回傳資料格式異常
 
-Manual checks use the same update service as automatic checks.
+手動檢查與自動檢查使用同一個更新服務。
 
-## Download Behavior
+## 下載行為
 
-Downloads go to a local user-writable update directory under the system temp directory, for example:
+下載預設放在使用者可寫入的位置，例如 Windows 下載資料夾，或必要時使用系統暫存目錄：
 
 ```text
 %TEMP%\PC_GIOSXTR_Demo\updates\
 ```
 
-Downloaded filenames keep the GitHub asset name. If a file already exists, the updater may overwrite it.
+下載檔名保留 GitHub asset 名稱。若檔案已存在，更新程式可以覆蓋或由使用者重新指定儲存位置。
 
-After download completes, the app shows the downloaded path and offers to open the executable.
+下載完成後，APP 顯示下載路徑，並詢問是否開啟新版 exe。
 
-The app will not attempt to replace the currently running executable. That avoids Windows file-locking problems and keeps the first implementation reliable.
+APP 不嘗試直接替換目前正在執行的 exe。這樣可以避免 Windows 檔案鎖定問題，讓第一版更新機制更可靠。
 
-## UI Integration
+## UI 整合
 
-The existing settings button in the top-right tab corner remains the entry point.
+主視窗右上角現有設定按鈕仍是設定入口。
 
-Settings dialog changes:
+設定視窗變更：
 
-- About tab displays app name and current version.
-- About tab adds a `Check for updates` button.
-- While checking, the button is disabled and shows progress text.
-- Results are shown with QMessageBox dialogs.
+- 「關於」頁顯示 APP 名稱與目前版本。
+- 「關於」頁加入「檢查更新」按鈕。
+- 檢查中按鈕停用，文字顯示檢查中。
+- 結果使用 `QMessageBox` 顯示。
 
-Main window changes:
+主視窗變更：
 
-- After startup, schedule one automatic check.
-- If an update is available, display the update prompt from the main window.
-- If the user chooses download, run the download asynchronously and show completion/failure dialogs.
+- 啟動後排程一次自動檢查。
+- 若有新版，從主視窗顯示更新提示。
+- 若使用者選擇下載，非同步下載並顯示完成或失敗訊息。
 
-## Module Design
+## 模組設計
 
-Create `app/updater.py` with no Qt widget dependencies.
+建立 `app/updater.py`，不依賴 Qt widget。
 
-Responsibilities:
+責任：
 
-- normalize and compare versions
-- fetch latest release JSON from GitHub
-- identify an executable asset
-- return structured update results
-- download the selected asset
+- 正規化與比較版本
+- 從 GitHub 取得 latest release JSON
+- 找出可下載的 exe asset
+- 回傳結構化的更新檢查結果
+- 下載使用者選擇的 asset
 
-The UI layer handles QMessageBox prompts and button state.
+UI 層負責 `QMessageBox` 提示與按鈕狀態。
 
-Suggested data types:
+建議資料型別：
 
 ```python
 UpdateAsset(name, download_url, size)
@@ -163,7 +162,7 @@ UpdateInfo(current_version, latest_version, release_url, asset)
 UpdateCheckResult(status, info, message)
 ```
 
-Statuses:
+狀態：
 
 ```text
 up_to_date
@@ -175,44 +174,44 @@ network_error
 invalid_response
 ```
 
-## Error Handling
+## 錯誤處理
 
-Network operations use short timeouts so startup checks cannot hang the app.
+網路操作使用短 timeout，避免啟動檢查卡住 APP。
 
-The updater treats GitHub `404` as repository or release unavailable. This supports the current state where the repository has not yet been created.
+GitHub `404` 視為 repository 或 release 尚未建立。這符合目前 repository 可能還不存在的狀態。
 
-Automatic update failures are logged only if the app already has an appropriate logging surface. They do not show dialogs.
+自動更新失敗時不顯示對話框。若 APP 之後有適合的 log 介面，可以只寫入 log。
 
-Manual update failures show concise user-facing messages.
+手動更新失敗時顯示簡短、可理解的中文訊息。
 
-## Testing
+## 測試
 
-Unit tests cover:
+單元測試涵蓋：
 
-- version normalization and comparison
-- no-update result
-- update-available result
-- missing asset result
-- repository unavailable result
-- malformed response handling
-- expected asset-name selection
-- fallback `.exe` asset selection
+- 版本正規化與比較
+- 沒有新版
+- 有新版
+- release 沒有 exe asset
+- repository 不存在
+- 回應資料格式錯誤
+- 符合命名規則的 asset 選擇
+- fallback `.exe` asset 選擇
 
-Manual verification covers:
+手動驗證涵蓋：
 
-- running `python main.py`
-- opening Settings -> About -> Check for updates before the repo exists
-- building the PyInstaller exe
-- opening the packaged exe locally before publishing
+- 執行 `python main.py`
+- repository 尚未有 release 時，開啟「設定 -> 關於 -> 檢查更新」
+- 使用 PyInstaller 打包
+- 在發布前，本機開啟打包後的 exe 並確認可正常使用
 
-## Acceptance Criteria
+## 完成條件
 
-The feature is complete when:
+功能完成時必須符合：
 
-- the app can check `jerrywu-voltraware/PC_GIOSXTR_Demo` GitHub Releases
-- startup update checks do not block or break the app when the repo has no release
-- manual update checks report a useful status
-- a newer release with an `.exe` asset prompts the user to download it
-- the downloaded executable can be opened by the user
-- tests pass
-- README documents the release and verification workflow
+- APP 可以檢查 `jerrywu-voltraware/PC_GIOSXTR_Demo` GitHub Releases
+- repository 尚未有 release 時，啟動檢查不會阻塞或破壞 APP
+- 手動檢查會顯示可理解的狀態
+- 有新版且 release 包含 `.exe` asset 時，APP 會提示使用者下載
+- 使用者可以開啟下載後的 exe
+- 測試通過
+- README 記錄發佈與本機驗證流程

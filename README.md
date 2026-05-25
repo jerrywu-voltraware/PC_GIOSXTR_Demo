@@ -62,27 +62,27 @@ pyinstaller PC_GIOSXTR_Demo.spec
 
 The executable will be created under `dist\`.
 
-## Release And Auto Update
+## 發佈與自動更新
 
-Auto update checks use public GitHub Releases from:
+自動更新會檢查這個公開 GitHub Releases：
 
 ```text
 https://github.com/jerrywu-voltraware/PC_GIOSXTR_Demo
 ```
 
-Release tags must use lowercase `v` semantic versions:
+Release tag 必須使用小寫 `v` 開頭的語意化版本：
 
 ```text
 v1.0.1
 ```
 
-Release assets should use the matching PyInstaller executable name:
+Release asset 必須上傳對應版本的 PyInstaller 執行檔：
 
 ```text
 PC_GIOSXTR_Demo_V1.0.1.exe
 ```
 
-Before publishing a release:
+每次發布前請先在本機完成驗證：
 
 ```powershell
 python -m pytest -q
@@ -90,4 +90,4 @@ pyinstaller PC_GIOSXTR_Demo.spec
 .\dist\PC_GIOSXTR_Demo_V1.0.1.exe
 ```
 
-Open and verify the packaged executable locally before creating the GitHub Release. Users only see updates after a GitHub Release is published with an `.exe` asset.
+確認打包後的 exe 可以正常開啟與使用後，才建立 GitHub Release 並上傳該 exe。使用者只會在 GitHub Release 發布且包含 `.exe` asset 後收到更新提示。

@@ -65,7 +65,7 @@ def test_settings_dialog_exposes_manual_update_check_button():
     dialog.check_updates_requested.connect(lambda: emitted.append(True))
 
     buttons = dialog.findChildren(QPushButton)
-    update_buttons = [button for button in buttons if "update" in button.text().lower()]
+    update_buttons = [button for button in buttons if "檢查更新" in button.text()]
 
     assert update_buttons
     update_buttons[0].click()

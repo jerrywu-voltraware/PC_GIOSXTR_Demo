@@ -38,7 +38,7 @@ class SettingsDialog(QDialog):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Settings")
+        self.setWindowTitle("設定")
         self.setMinimumWidth(520)
         self.demo_device_battery_pcts = dict(demo_device_battery_pcts or {})
         self.connected_demo_devices = list(connected_demo_devices or [])
@@ -46,9 +46,9 @@ class SettingsDialog(QDialog):
 
         root = QVBoxLayout(self)
         tabs = QTabWidget()
-        tabs.addTab(self._about_tab(), "About")
+        tabs.addTab(self._about_tab(), "關於")
         tabs.addTab(self._demo_tab(demo_use_fake_data, demo_device_name, demo_ebike_pct, demo_escooter_pct), "DEMO")
-        tabs.addTab(self._engineering_tab(engineering_mode), "Engineering")
+        tabs.addTab(self._engineering_tab(engineering_mode), "工程模式")
         root.addWidget(tabs)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -64,17 +64,17 @@ class SettingsDialog(QDialog):
         app_label = QLabel(APP_NAME)
         app_label.setStyleSheet("font-weight: 800;")
         version_label = QLabel(APP_VERSION)
-        self.update_check_button = QPushButton("Check for updates")
+        self.update_check_button = QPushButton("檢查更新")
         self.update_check_button.clicked.connect(self.check_updates_requested.emit)
 
-        layout.addRow("Application", app_label)
-        layout.addRow("Version", version_label)
+        layout.addRow("應用程式", app_label)
+        layout.addRow("版本", version_label)
         layout.addRow("", self.update_check_button)
         return page
 
     def set_update_checking(self, checking: bool) -> None:
         self.update_check_button.setEnabled(not checking)
-        self.update_check_button.setText("Checking..." if checking else "Check for updates")
+        self.update_check_button.setText("檢查中..." if checking else "檢查更新")
 
     def _engineering_tab(self, engineering_mode: bool) -> QWidget:
         page = QWidget()
@@ -82,12 +82,12 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(8)
 
-        self.engineering_box = QCheckBox("Enable engineering controls")
+        self.engineering_box = QCheckBox("啟用工程控制項")
         self.engineering_box.setChecked(engineering_mode)
         self.engineering_box.toggled.connect(self.engineering_mode_changed.emit)
         layout.addWidget(self.engineering_box)
 
-        detail = QLabel("Engineering mode shows internal DEMO controls for development and validation.")
+        detail = QLabel("工程模式會顯示內部 DEMO 控制項，供開發與驗證使用。")
         detail.setWordWrap(True)
         detail.setStyleSheet("color: #66757C;")
         layout.addWidget(detail)
@@ -100,33 +100,33 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
 
-        self.demo_fake_data_box = QCheckBox("Use fake demo data when no live device data is available")
+        self.demo_fake_data_box = QCheckBox("沒有即時裝置資料時使用 DEMO 假資料")
         self.demo_fake_data_box.setChecked(use_fake_data)
         self.demo_fake_data_box.toggled.connect(self._emit_demo_settings)
-        layout.addRow("Data source", self.demo_fake_data_box)
+        layout.addRow("資料來源", self.demo_fake_data_box)
 
         self.demo_device_name_edit = QLineEdit()
         self.demo_device_name_edit.setText(device_name)
         self.demo_device_name_edit.setPlaceholderText("MMEU")
         self.demo_device_name_edit.textChanged.connect(self._emit_demo_settings)
-        layout.addRow("Demo device name", self.demo_device_name_edit)
+        layout.addRow("DEMO 裝置名稱", self.demo_device_name_edit)
 
         self.demo_ebike_spin = QSpinBox()
         self.demo_ebike_spin.setRange(0, 100)
         self.demo_ebike_spin.setSuffix(" %")
         self.demo_ebike_spin.setValue(ebike_pct)
         self.demo_ebike_spin.valueChanged.connect(self._emit_demo_settings)
-        layout.addRow("EBIKE battery", self.demo_ebike_spin)
+        layout.addRow("EBIKE 電量", self.demo_ebike_spin)
 
         self.demo_escooter_spin = QSpinBox()
         self.demo_escooter_spin.setRange(0, 100)
         self.demo_escooter_spin.setSuffix(" %")
         self.demo_escooter_spin.setValue(escooter_pct)
         self.demo_escooter_spin.valueChanged.connect(self._emit_demo_settings)
-        layout.addRow("ESCOOTER battery", self.demo_escooter_spin)
+        layout.addRow("ESCOOTER 電量", self.demo_escooter_spin)
 
         if self.connected_demo_devices:
-            section = QLabel("Connected device fake data")
+            section = QLabel("已連線裝置假資料")
             section.setStyleSheet("font-weight: 800; color: #40545B; padding-top: 8px;")
             layout.addRow("", section)
             for device in self.connected_demo_devices:
@@ -145,7 +145,7 @@ class SettingsDialog(QDialog):
                 layout.addRow(label, spin)
 
         detail = QLabel(
-            "Default values drive the DEMO preview. Connected-device values override them in multi-device fullscreen mode."
+            "預設值會用於 DEMO 預覽；多裝置全螢幕模式會優先使用各已連線裝置的設定值。"
         )
         detail.setWordWrap(True)
         detail.setStyleSheet("color: #66757C;")

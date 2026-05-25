@@ -1,4 +1,4 @@
-"""GitHub Releases update checks for the PC GIOSXTR app."""
+"""PC GIOSXTR GitHub Releases 更新檢查。"""
 
 from __future__ import annotations
 
@@ -121,23 +121,23 @@ def parse_release_response(payload: dict[str, Any], current_version: str) -> Upd
     if not isinstance(tag_name, str) or not tag_name.strip():
         return UpdateCheckResult(
             UpdateStatus.INVALID_RESPONSE,
-            message="GitHub release response does not include a valid version tag.",
+            message="GitHub release 回應缺少有效的版本 tag。",
         )
     if not isinstance(release_url, str):
         return UpdateCheckResult(
             UpdateStatus.INVALID_RESPONSE,
-            message="GitHub release response does not include a release URL.",
+            message="GitHub release 回應缺少 release 頁面網址。",
         )
     if not isinstance(raw_assets, list):
         return UpdateCheckResult(
             UpdateStatus.INVALID_RESPONSE,
-            message="GitHub release response does not include an assets list.",
+            message="GitHub release 回應缺少 assets 清單。",
         )
 
     if not is_newer_version(tag_name, current_version):
         return UpdateCheckResult(
             UpdateStatus.UP_TO_DATE,
-            message=f"{current_version} is already the latest version.",
+            message=f"目前版本 {current_version} 已是最新版本。",
         )
 
     executable_assets = [asset for asset in raw_assets if isinstance(asset, dict)]
@@ -145,7 +145,7 @@ def parse_release_response(payload: dict[str, Any], current_version: str) -> Upd
     if asset is None:
         return UpdateCheckResult(
             UpdateStatus.NO_ASSET,
-            message=f"Release {tag_name} does not include a Windows .exe asset.",
+            message=f"Release {tag_name} 沒有包含 Windows .exe 檔案。",
         )
 
     return UpdateCheckResult(
@@ -156,7 +156,7 @@ def parse_release_response(payload: dict[str, Any], current_version: str) -> Upd
             release_url=release_url,
             asset=asset,
         ),
-        message=f"Version {tag_name} is available.",
+        message=f"已發現新版 {tag_name}。",
     )
 
 
@@ -183,26 +183,26 @@ def check_for_update(current_version: str, url: str = GITHUB_API_URL) -> UpdateC
         if exc.code == 404:
             return UpdateCheckResult(
                 UpdateStatus.REPO_UNAVAILABLE,
-                message="GitHub repository or release was not found.",
+                message="找不到 GitHub repository 或 release。",
             )
         if exc.code == 403:
             return UpdateCheckResult(
                 UpdateStatus.NETWORK_ERROR,
-                message="GitHub API rate limit or access restriction blocked the update check.",
+                message="GitHub API 流量限制或權限限制阻擋了更新檢查。",
             )
         return UpdateCheckResult(
             UpdateStatus.NETWORK_ERROR,
-            message=f"GitHub returned HTTP {exc.code} during update check.",
+            message=f"更新檢查時 GitHub 回傳 HTTP {exc.code}。",
         )
     except URLError as exc:
         return UpdateCheckResult(
             UpdateStatus.NETWORK_ERROR,
-            message=f"Network error during update check: {exc.reason}",
+            message=f"更新檢查時發生網路錯誤：{exc.reason}",
         )
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
         return UpdateCheckResult(
             UpdateStatus.INVALID_RESPONSE,
-            message="GitHub returned an unreadable release response.",
+            message="GitHub 回傳了無法讀取的 release 資料。",
         )
 
     return parse_release_response(payload, current_version)

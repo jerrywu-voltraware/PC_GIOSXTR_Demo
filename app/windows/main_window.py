@@ -262,11 +262,11 @@ class MainWindow(QMainWindow):
             info = result.info
             answer = QMessageBox.question(
                 self,
-                "Update available",
+                "發現新版",
                 (
-                    f"Current version: {info.current_version}\n"
-                    f"Latest version: {info.latest_version}\n\n"
-                    "Download the new version now?"
+                    f"目前版本：{info.current_version}\n"
+                    f"最新版本：{info.latest_version}\n\n"
+                    "是否立即下載新版？"
                 ),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.Yes,
@@ -278,17 +278,17 @@ class MainWindow(QMainWindow):
         if automatic:
             return
 
-        title = "Update check"
+        title = "檢查更新"
         if result.status is UpdateStatus.UP_TO_DATE:
-            QMessageBox.information(self, title, result.message or "This app is already up to date.")
+            QMessageBox.information(self, title, result.message or "目前已是最新版本。")
         elif result.status is UpdateStatus.REPO_UNAVAILABLE:
             QMessageBox.information(
                 self,
                 title,
-                result.message or "The GitHub repository or release is not available yet.",
+                result.message or "GitHub repository 或 release 尚未建立。",
             )
         else:
-            QMessageBox.warning(self, title, result.message or "The update check did not complete.")
+            QMessageBox.warning(self, title, result.message or "更新檢查未完成。")
 
     async def _download_update(self, asset: UpdateAsset) -> None:
         target_path = self._select_update_download_path(asset)
@@ -298,15 +298,15 @@ class MainWindow(QMainWindow):
         try:
             path = await asyncio.to_thread(download_asset, asset, target_path=target_path)
         except Exception as exc:
-            QMessageBox.warning(self, "Update download failed", str(exc))
+            QMessageBox.warning(self, "更新下載失敗", str(exc))
             return
 
         answer = QMessageBox.question(
             self,
-            "Update downloaded",
+            "更新已下載",
             (
-                f"Downloaded:\n{path}\n\n"
-                "Open the downloaded version now? Close this version before using the new one."
+                f"已下載：\n{path}\n\n"
+                "是否現在開啟新版？使用新版前請先關閉目前版本。"
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
@@ -317,9 +317,9 @@ class MainWindow(QMainWindow):
     def _select_update_download_path(self, asset: UpdateAsset) -> Path | None:
         selected_path, _selected_filter = QFileDialog.getSaveFileName(
             self,
-            "Save update as",
+            "儲存更新檔",
             str(_default_update_save_path(asset)),
-            "Windows executable (*.exe);;All files (*)",
+            "Windows 執行檔 (*.exe);;所有檔案 (*)",
         )
         if not selected_path:
             return None
