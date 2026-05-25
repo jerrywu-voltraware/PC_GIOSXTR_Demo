@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal, pyqtSlot
-from PyQt6.QtGui import QIcon
+from PyQt6.QtCore import QTimer, Qt, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtGui import QDesktopServices, QIcon
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QMainWindow,
@@ -19,12 +20,13 @@ from PyQt6.QtWidgets import (
 from qasync import asyncSlot
 
 from ..ble_manager import BleManager, DeviceScanResult
-from ..constants import APP_ICON_FILENAME, APP_WINDOW_TITLE
+from ..constants import APP_ICON_FILENAME, APP_VERSION, APP_WINDOW_TITLE
 from ..csv_logger import CsvLogger
 from ..models import DataEvent, DeviceState
 from ..protocol import parse_notify_packet
 from ..recent_devices import RecentDevice, RecentDeviceStore
 from ..resources import resource_path
+from ..updater import UpdateAsset, UpdateCheckResult, UpdateStatus, check_for_update, download_asset
 from .data_pages import PruPage, PtuPage
 from .demo2_page import Demo2Page
 from .error_page import ErrorPage
@@ -69,6 +71,7 @@ class MainWindow(QMainWindow):
         self.active_address: str = ""
         self.scan_ble = BleManager()
         self.state = DeviceState()
+        self._update_check_running = False
 
         self.notify_received.connect(self._handle_notify)
         self.disconnected.connect(self._handle_disconnect)
@@ -140,6 +143,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self.refresh_pages()
         self.scan_panel.set_recent_devices(self.recent_device_store.load())
+        if os.getenv("QT_QPA_PLATFORM", "").lower() != "offscreen":
+            QTimer.singleShot(1500, self._start_automatic_update_check)
 
     def set_engineering_mode(self, enabled: bool) -> None:
         self.engineering_mode = enabled
@@ -168,7 +173,90 @@ class MainWindow(QMainWindow):
         )
         dialog.engineering_mode_changed.connect(self.set_engineering_mode)
         dialog.demo_settings_changed.connect(self.set_demo_settings)
+        dialog.check_updates_requested.connect(lambda: self._start_manual_update_check(dialog))
         dialog.exec()
+
+    def _start_automatic_update_check(self) -> None:
+        if self._update_check_running:
+            return
+        asyncio.create_task(self._check_for_updates(automatic=True))
+
+    def _start_manual_update_check(self, dialog: SettingsDialog) -> None:
+        if self._update_check_running:
+            return
+        dialog.set_update_checking(True)
+        asyncio.create_task(self._check_for_updates(automatic=False, settings_dialog=dialog))
+
+    async def _check_for_updates(
+        self,
+        *,
+        automatic: bool,
+        settings_dialog: SettingsDialog | None = None,
+    ) -> None:
+        self._update_check_running = True
+        try:
+            result = await asyncio.to_thread(check_for_update, APP_VERSION)
+        finally:
+            self._update_check_running = False
+            if settings_dialog is not None:
+                settings_dialog.set_update_checking(False)
+
+        if automatic and result.status is not UpdateStatus.UPDATE_AVAILABLE:
+            return
+        self._show_update_result(result, automatic=automatic)
+
+    def _show_update_result(self, result: UpdateCheckResult, *, automatic: bool) -> None:
+        if result.status is UpdateStatus.UPDATE_AVAILABLE and result.info is not None:
+            info = result.info
+            answer = QMessageBox.question(
+                self,
+                "Update available",
+                (
+                    f"Current version: {info.current_version}\n"
+                    f"Latest version: {info.latest_version}\n\n"
+                    "Download the new version now?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer is QMessageBox.StandardButton.Yes:
+                asyncio.create_task(self._download_update(info.asset))
+            return
+
+        if automatic:
+            return
+
+        title = "Update check"
+        if result.status is UpdateStatus.UP_TO_DATE:
+            QMessageBox.information(self, title, result.message or "This app is already up to date.")
+        elif result.status is UpdateStatus.REPO_UNAVAILABLE:
+            QMessageBox.information(
+                self,
+                title,
+                result.message or "The GitHub repository or release is not available yet.",
+            )
+        else:
+            QMessageBox.warning(self, title, result.message or "The update check did not complete.")
+
+    async def _download_update(self, asset: UpdateAsset) -> None:
+        try:
+            path = await asyncio.to_thread(download_asset, asset)
+        except Exception as exc:
+            QMessageBox.warning(self, "Update download failed", str(exc))
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Update downloaded",
+            (
+                f"Downloaded:\n{path}\n\n"
+                "Open the downloaded version now? Close this version before using the new one."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer is QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def _set_demo_preview_device(self, result: DeviceScanResult) -> None:
         self.demo2_page.set_preview_device(result.name, result.device_number)

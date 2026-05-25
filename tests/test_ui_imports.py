@@ -25,6 +25,12 @@ def test_ui_modules_import():
     assert SettingsDialog
 
 
+def test_main_window_imports_with_updater_enabled():
+    from app.windows.main_window import MainWindow
+
+    assert MainWindow is not None
+
+
 def test_main_window_tabs_do_not_include_removed_pages():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication
