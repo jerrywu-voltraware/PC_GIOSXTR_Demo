@@ -498,7 +498,7 @@ def _make_logo_label(*, height: int) -> QLabel:
 class _ShowcaseDialog(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("展場模式")
+        self.setWindowTitle("全螢幕模式")
         self.setStyleSheet("background-color: #FBFCFD;")
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 18, 18, 18)
@@ -715,7 +715,7 @@ class _ShowcaseTile(QFrame):
 class _MultiShowcaseDialog(QDialog):
     def __init__(self, *, layout_mode: str, addresses: list[str], parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("展場模式")
+        self.setWindowTitle("全螢幕模式")
         self.setStyleSheet("background-color: #FBFCFD;")
         self.layout_mode = layout_mode
         self.addresses = addresses[:4]
@@ -783,7 +783,7 @@ class _MultiShowcaseDialog(QDialog):
 class _ShowcaseChooserDialog(QDialog):
     def __init__(self, entries: list[tuple[str, str]], parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("展場模式設定")
+        self.setWindowTitle("全螢幕模式設定")
         self.setMinimumWidth(420)
 
         root = QVBoxLayout(self)
@@ -815,7 +815,7 @@ class _ShowcaseChooserDialog(QDialog):
         root.addWidget(hint)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
-        start_btn = buttons.addButton("開始展場模式", QDialogButtonBox.ButtonRole.AcceptRole)
+        start_btn = buttons.addButton("開始全螢幕模式", QDialogButtonBox.ButtonRole.AcceptRole)
         start_btn.clicked.connect(self._accept_if_valid)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
@@ -871,7 +871,7 @@ class Demo2Page(QWidget):
         header.addStretch(1)
         self.showcase_btn = QToolButton()
         self.showcase_btn.setText("⛶")
-        self.showcase_btn.setToolTip("展場模式")
+        self.showcase_btn.setToolTip("全螢幕模式")
         self.showcase_btn.setAutoRaise(True)
         self.showcase_btn.clicked.connect(self._open_showcase)
         header.addWidget(self.showcase_btn)

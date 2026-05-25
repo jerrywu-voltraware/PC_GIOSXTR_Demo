@@ -44,6 +44,8 @@ class ScanPanel(QWidget):
         self.results: list[DeviceScanResult] = []
         self.recent_devices: list[RecentDevice] = []
         self._is_scanning = False
+        self._connected_addresses: set[str] = set()
+        self._active_address: str = ""
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(10)
@@ -83,7 +85,9 @@ class ScanPanel(QWidget):
         self.list_widget.setObjectName("deviceList")
         self.list_widget.itemDoubleClicked.connect(self.connect_selected)
         self.list_widget.currentItemChanged.connect(self._on_selection_changed)
-        root.addWidget(self.list_widget, 2)
+        self.list_widget.setMinimumHeight(220)
+        self.list_widget.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        root.addWidget(self.list_widget, 3)
         self._show_empty_result("尚未掃描", "按下搜尋裝置後，附近可連線的裝置會出現在這裡。")
 
         self.connect_btn = QPushButton("連線所選裝置")
@@ -97,8 +101,10 @@ class ScanPanel(QWidget):
         self.connected_list = QListWidget()
         self.connected_list.setObjectName("connectedList")
         self.connected_list.currentItemChanged.connect(self._on_connected_selection_changed)
-        self.connected_list.setMaximumHeight(104)
-        root.addWidget(self.connected_list, 1)
+        self.connected_list.setMinimumHeight(140)
+        self.connected_list.setMaximumHeight(220)
+        self.connected_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        root.addWidget(self.connected_list, 2)
 
         disc_row = QHBoxLayout()
         disc_row.setSpacing(8)
@@ -307,19 +313,36 @@ class ScanPanel(QWidget):
         item.setSizeHint(QSize(320, 62))
         self.list_widget.addItem(item)
 
+        is_connected = result.address in self._connected_addresses
+        is_active = is_connected and result.address == self._active_address
+
         widget = QWidget()
+        if is_active:
+            widget.setStyleSheet("background: #DDF7F4; border-radius: 6px;")
+        elif is_connected:
+            widget.setStyleSheet("background: #EAF6F1; border-radius: 6px;")
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(10, 6, 10, 6)
         layout.setSpacing(2)
 
         name_row = QHBoxLayout()
         name_row.setSpacing(6)
-        name = QLabel(result.name or "未命名裝置")
-        name.setStyleSheet("font-size: 13px; font-weight: 800; color: #19343C;")
+        name_text = result.name or "未命名裝置"
+        name = QLabel(name_text)
+        name_color = "#0E7A5F" if is_connected else "#19343C"
+        name.setStyleSheet(f"font-size: 13px; font-weight: 800; color: {name_color};")
+        name_row.addWidget(name, 1)
+
+        if is_connected:
+            badge_text = "● 連線中" if is_active else "● 已連線"
+            badge = QLabel(badge_text)
+            badge.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            badge.setStyleSheet("font-size: 10px; color: #0E7A5F; font-weight: 800;")
+            name_row.addWidget(badge)
+
         quality = QLabel(f"{self._rssi_quality(result.rssi)}  {result.rssi} dBm")
         quality.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         quality.setStyleSheet("font-size: 10px; color: #4F6F7B; font-weight: 700;")
-        name_row.addWidget(name, 1)
         name_row.addWidget(quality)
 
         address = QLabel(result.address)
@@ -473,6 +496,14 @@ class ScanPanel(QWidget):
         devices: list[dict[str, str]],
         active_address: str = "",
     ) -> None:
+        new_connected = {dev.get("address", "") for dev in devices if dev.get("address")}
+        connected_changed = (
+            new_connected != self._connected_addresses
+            or active_address != self._active_address
+        )
+        self._connected_addresses = new_connected
+        self._active_address = active_address
+
         self.connected_list.blockSignals(True)
         self.connected_list.clear()
         for dev in devices:
@@ -486,6 +517,28 @@ class ScanPanel(QWidget):
             if dev.get("address") == active_address:
                 self.connected_list.setCurrentItem(item)
         self.connected_list.blockSignals(False)
+
+        if connected_changed and self.results and not self._is_scanning:
+            self._rebuild_scan_list()
+
+    def _rebuild_scan_list(self) -> None:
+        self.list_widget.blockSignals(True)
+        current_addr = ""
+        current = self.list_widget.currentItem()
+        if current is not None:
+            data = current.data(Qt.ItemDataRole.UserRole)
+            if isinstance(data, DeviceScanResult):
+                current_addr = data.address
+        self.list_widget.clear()
+        for result in self.results:
+            self._add_scan_result(result)
+        if current_addr:
+            for i in range(self.list_widget.count()):
+                data = self.list_widget.item(i).data(Qt.ItemDataRole.UserRole)
+                if isinstance(data, DeviceScanResult) and data.address == current_addr:
+                    self.list_widget.setCurrentRow(i)
+                    break
+        self.list_widget.blockSignals(False)
 
     def set_recording_state(self, connected: bool, recording: bool, path: str = "") -> None:
         self.start_recording_btn.setEnabled(connected and not recording)
