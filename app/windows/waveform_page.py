@@ -5,12 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import pyqtgraph as pg
+from pyqtgraph.exporters import ImageExporter
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QVBoxLayout,
@@ -37,6 +40,7 @@ class ChartItem:
     field_name: str
     plot: pg.PlotWidget
     stats_label: QLabel
+    save_button: QPushButton
     series: dict[str, DeviceSeries] = field(default_factory=dict)
     curve: pg.PlotDataItem | None = None
     x: list[float] = field(default_factory=list)
@@ -59,6 +63,10 @@ class WaveformPage(QWidget):
         self.signal_combo = QComboBox()
         for label, field_name in SIGNAL_DEFINITIONS:
             self.signal_combo.addItem(label, field_name)
+        self.scope_combo = QComboBox()
+        self.scope_combo.addItem("目前裝置", "current")
+        self.scope_combo.addItem("全部裝置", "all")
+        self.scope_combo.currentIndexChanged.connect(self._apply_device_filter)
         self.add_btn = QPushButton("新增曲線")
         self.add_btn.clicked.connect(self.add_chart)
         self.pause_box = QCheckBox("暫停")
@@ -75,6 +83,8 @@ class WaveformPage(QWidget):
         self.history_combo.currentIndexChanged.connect(self._apply_history_window)
         self.reset_btn = QPushButton("全部重設")
         self.reset_btn.clicked.connect(self.reset_all)
+        controls.addWidget(QLabel("裝置"))
+        controls.addWidget(self.scope_combo)
         controls.addWidget(QLabel("訊號"))
         controls.addWidget(self.signal_combo, 1)
         controls.addWidget(self.add_btn)
@@ -142,6 +152,9 @@ class WaveformPage(QWidget):
         plot.setMouseEnabled(x=True, y=True)
         plot.setDownsampling(auto=True, mode="peak")
         plot.setClipToView(True)
+        legend = plot.addLegend(offset=(12, 12))
+        legend.setBrush(pg.mkBrush(8, 16, 21, 190))
+        legend.setPen(pg.mkPen("#425866"))
         plot.getAxis("bottom").setPen("#8EA2AD")
         plot.getAxis("left").setPen("#8EA2AD")
         plot.getAxis("bottom").setTextPen("#B9C7CE")
@@ -149,7 +162,8 @@ class WaveformPage(QWidget):
         stats_label = QLabel("latest --   min --   max --   samples 0")
         stats_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         stats_label.setStyleSheet("color: #52616A; font-family: Consolas;")
-        item = ChartItem(label=label, field_name=field_name, plot=plot, stats_label=stats_label)
+        save_btn = QPushButton("儲存圖片")
+        item = ChartItem(label=label, field_name=field_name, plot=plot, stats_label=stats_label, save_button=save_btn)
         remove_btn = QPushButton("移除")
         reset_btn = QPushButton("重設")
         card = QWidget()
@@ -171,6 +185,7 @@ class WaveformPage(QWidget):
         title.setStyleSheet("font-weight: 700; color: #1D3038;")
         top.addWidget(title)
         top.addWidget(stats_label, 1)
+        top.addWidget(save_btn)
         top.addWidget(reset_btn)
         top.addWidget(remove_btn)
         card_layout.addLayout(top)
@@ -179,6 +194,7 @@ class WaveformPage(QWidget):
         item.plot.setProperty("card", card)
         remove_btn.clicked.connect(lambda: self.remove_chart(item))
         reset_btn.clicked.connect(lambda: self.reset_chart(item))
+        save_btn.clicked.connect(lambda: self.save_chart_image(item))
         self.charts.append(item)
 
     def remove_chart(self, item: ChartItem) -> None:
@@ -212,10 +228,28 @@ class WaveformPage(QWidget):
             self._refresh_chart_display(item)
 
     def _selected_addresses(self) -> set[str]:
+        if self.scope_combo.currentData() == "all":
+            return {address for address, state in self._states.items() if state.is_connected}
         active_state = self._states.get(self._active_address)
         if active_state is None or not active_state.is_connected:
             return set()
         return {self._active_address}
+
+    def save_chart_image(self, item: ChartItem) -> None:
+        filename, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "儲存波形圖片",
+            f"{item.field_name}.png",
+            "PNG Files (*.png)",
+        )
+        if not filename:
+            return
+        if not filename.lower().endswith(".png"):
+            filename = f"{filename}.png"
+        try:
+            ImageExporter(item.plot.plotItem).export(filename)
+        except Exception as exc:  # pragma: no cover - depends on Qt/OS exporter failures
+            QMessageBox.warning(self, "儲存失敗", f"無法儲存圖片：{exc}")
 
     def _ensure_series(self, item: ChartItem, state: DeviceState, address: str) -> DeviceSeries:
         if address in item.series:
@@ -280,11 +314,17 @@ class WaveformPage(QWidget):
             series.curve.setData(series.x if visible else [], series.y if visible else [])
             if visible:
                 visible_series.append(series)
+        legend = item.plot.plotItem.legend
+        if legend is not None:
+            legend.clear()
+            for series in visible_series:
+                legend.addItem(series.curve, series.label)
         if visible_series:
             item.curve = visible_series[0].curve
             item.x = visible_series[0].x
             item.y = visible_series[0].y
-            item.plot.setTitle(f"{item.label} - {visible_series[0].label}")
+            title_suffix = visible_series[0].label if len(visible_series) == 1 else "全部裝置"
+            item.plot.setTitle(f"{item.label} - {title_suffix}")
         else:
             item.curve = None
             item.x = []
