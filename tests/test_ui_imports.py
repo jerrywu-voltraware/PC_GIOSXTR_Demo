@@ -878,3 +878,86 @@ def test_waveform_page_keeps_rolling_scope_window():
     assert len(chart.x) == 500
     assert chart.y[-1] == 53599
     assert "samples 500" in chart.stats_label.text()
+
+
+def test_waveform_page_has_no_device_selector_inside_waveform_controls():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.windows.waveform_page import WaveformPage
+
+    app = QApplication.instance() or QApplication([])
+    page = WaveformPage()
+
+    assert not hasattr(page, "device_combo")
+
+
+def test_waveform_page_follows_active_device_tabs_and_preserves_device_history():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.waveform_page import WaveformPage
+
+    app = QApplication.instance() or QApplication([])
+    page = WaveformPage()
+    page.add_chart()
+    first = DeviceState(is_connected=True, device_name="PTU A", device_address="A", device_number=6, ptu_input_voltage=52000)
+    second = DeviceState(is_connected=True, device_name="PTU B", device_address="B", device_number=10, ptu_input_voltage=54000)
+    states = {first.device_address: first, second.device_address: second}
+    page.set_devices(states, first.device_address)
+    page.refresh_device(first, states, first.device_address)
+    page.refresh_device(second, states, first.device_address)
+
+    chart = page.charts[0]
+    assert chart.series[first.device_address].y == [52000.0]
+    assert chart.series[second.device_address].y == [54000.0]
+    assert chart.x == [0.0]
+    assert chart.y == [52000.0]
+    assert "PTU #6" in chart.stats_label.text()
+    assert "PTU #10" not in chart.stats_label.text()
+
+    page.set_devices(states, second.device_address)
+
+    assert chart.x == [0.0]
+    assert chart.y == [54000.0]
+    assert "PTU #6" not in chart.stats_label.text()
+    assert "PTU #10" in chart.stats_label.text()
+
+
+def test_main_window_waveform_stores_non_active_device_and_shows_it_when_tab_becomes_active(monkeypatch):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    import app.windows.main_window as main_window
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    first = DeviceState(is_connected=True, device_name="GIOS0403ST#6", device_address="A", device_number=6)
+    second = DeviceState(is_connected=True, device_name="GIOS0403ST#10", device_address="B", device_number=10)
+    window.states[first.device_address] = first
+    window.states[second.device_address] = second
+    window.active_address = first.device_address
+    window.state = first
+    window.waveform_page.add_chart()
+    window.waveform_page.set_devices(window.states, window.active_address)
+
+    def fake_parse(_data: bytes, _uuid: str, state: DeviceState):
+        state.ptu_input_voltage = 54123
+        return None
+
+    monkeypatch.setattr(main_window, "parse_notify_packet", fake_parse)
+
+    window._handle_notify(second.device_address, "uuid", b"packet")
+
+    chart = window.waveform_page.charts[0]
+    assert chart.series[second.device_address].y == [54123.0]
+    assert chart.y == []
+
+    window._set_active(second.device_address)
+
+    assert chart.y == [54123.0]
+    assert "PTU #10" in chart.stats_label.text()
+    window.close()

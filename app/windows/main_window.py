@@ -534,6 +534,7 @@ class MainWindow(QMainWindow):
         logger = self.loggers.get(address)
         if logger is not None and logger.is_recording:
             logger.write_state(state)
+        self.waveform_page.refresh_device(state, self.states, self.active_address)
         if address == self.active_address:
             self.refresh_pages()
         else:
@@ -656,13 +657,13 @@ class MainWindow(QMainWindow):
             self.overview_page,
             self.ptu_page,
             self.pru_page,
-            self.waveform_page,
             self.demo2_page,
             self.log_page,
             self.error_page,
         )
         for page in pages:
             page.refresh(state)
+        self.waveform_page.set_devices(self.states, self.active_address)
         active_logger = self._active_logger()
         rec_active = active_logger is not None and active_logger.is_recording
         rec_path = str(active_logger.current_path) if (active_logger and active_logger.current_path) else ""
