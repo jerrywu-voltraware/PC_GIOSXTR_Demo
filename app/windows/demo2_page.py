@@ -844,6 +844,7 @@ class Demo2Page(QWidget):
         demo_device_name: str = "MMEU",
         demo_ebike_pct: int = 76,
         demo_escooter_pct: int = 81,
+        demo_device_battery_pcts: dict[str, int] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -853,6 +854,7 @@ class Demo2Page(QWidget):
         self._demo_device_name = demo_device_name.strip() or "MMEU"
         self._demo_ebike_pct = self._clamp_pct(demo_ebike_pct)
         self._demo_escooter_pct = self._clamp_pct(demo_escooter_pct)
+        self._demo_device_battery_pcts = self._clean_device_pcts(demo_device_battery_pcts or {})
         self._preview_device_name = ""
         self._preview_device_number: int | None = None
         self._eng_mode = EngMode.NONE
@@ -961,11 +963,21 @@ class Demo2Page(QWidget):
         if not enabled:
             self._set_eng_mode(EngMode.NONE)
 
-    def set_demo_settings(self, *, use_fake_data: bool, device_name: str, ebike_pct: int, escooter_pct: int) -> None:
+    def set_demo_settings(
+        self,
+        *,
+        use_fake_data: bool,
+        device_name: str,
+        ebike_pct: int,
+        escooter_pct: int,
+        device_battery_pcts: dict[str, int] | None = None,
+    ) -> None:
         self._demo_use_fake_data = use_fake_data
         self._demo_device_name = device_name.strip() or "MMEU"
         self._demo_ebike_pct = self._clamp_pct(ebike_pct)
         self._demo_escooter_pct = self._clamp_pct(escooter_pct)
+        if device_battery_pcts is not None:
+            self._demo_device_battery_pcts = self._clean_device_pcts(device_battery_pcts)
         self.refresh(self._last_state)
 
     def set_preview_device(self, name: str, number: int | None) -> None:
@@ -1064,10 +1076,27 @@ class Demo2Page(QWidget):
     def _clamp_pct(value: int) -> int:
         return max(0, min(100, int(value)))
 
-    def _display_battery_pct(self, snap: _Snapshot, *, pru_connected: bool, is_charging: bool) -> int:
+    def _clean_device_pcts(self, values: dict[str, int]) -> dict[str, int]:
+        cleaned: dict[str, int] = {}
+        for address, pct in values.items():
+            address_text = str(address).strip()
+            if address_text:
+                cleaned[address_text] = self._clamp_pct(pct)
+        return cleaned
+
+    def _display_battery_pct(
+        self,
+        snap: _Snapshot,
+        *,
+        pru_connected: bool,
+        is_charging: bool,
+        address: str = "",
+    ) -> int:
         if not pru_connected:
             return 0
         if self._demo_use_fake_data and is_charging:
+            if address and address in self._demo_device_battery_pcts:
+                return self._demo_device_battery_pcts[address]
             if snap.pru_type == "0403V1":
                 return self._demo_ebike_pct
             if snap.pru_type == "0404V1":
@@ -1100,7 +1129,12 @@ class Demo2Page(QWidget):
         is_charging = pru_connected and snap.pru_iout > 0
         is_engineering = self._eng_mode == EngMode.ENGINEERING
         is_bike = snap.pru_type == "0403V1"
-        pct = self._display_battery_pct(snap, pru_connected=pru_connected, is_charging=is_charging)
+        pct = self._display_battery_pct(
+            snap,
+            pru_connected=pru_connected,
+            is_charging=is_charging,
+            address=state.device_address,
+        )
         is_full = (
             self._eng_mode == EngMode.FULL_BIKE
             or self._eng_mode == EngMode.FULL_SCOOTER
@@ -1171,7 +1205,12 @@ class Demo2Page(QWidget):
         is_charging = pru_connected and snap.pru_iout > 0
         is_engineering = self._eng_mode == EngMode.ENGINEERING
         is_bike = snap.pru_type == "0403V1"
-        pct = self._display_battery_pct(snap, pru_connected=pru_connected, is_charging=is_charging)
+        pct = self._display_battery_pct(
+            snap,
+            pru_connected=pru_connected,
+            is_charging=is_charging,
+            address=state.device_address,
+        )
         is_full = (
             self._eng_mode == EngMode.FULL_BIKE
             or self._eng_mode == EngMode.FULL_SCOOTER

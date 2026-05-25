@@ -385,7 +385,14 @@ class ScanPanel(QWidget):
         item.setSizeHint(QSize(320, 62))
         self.list_widget.addItem(item)
 
+        is_connected = device.address in self._connected_addresses
+        is_active = is_connected and device.address == self._active_address
+
         widget = QWidget()
+        if is_active:
+            widget.setStyleSheet("background: #DDF7F4; border-radius: 6px;")
+        elif is_connected:
+            widget.setStyleSheet("background: #EAF6F1; border-radius: 6px;")
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(10, 6, 10, 6)
         layout.setSpacing(2)
@@ -393,10 +400,13 @@ class ScanPanel(QWidget):
         name_row = QHBoxLayout()
         name_row.setSpacing(6)
         name = QLabel(device.name)
-        name.setStyleSheet("font-size: 13px; font-weight: 800; color: #19343C;")
-        badge = QLabel("最近連線")
+        name_color = "#0E7A5F" if is_connected else "#19343C"
+        name.setStyleSheet(f"font-size: 13px; font-weight: 800; color: {name_color};")
+        badge_text = "目前連線" if is_active else ("已連線" if is_connected else "最近連線")
+        badge = QLabel(badge_text)
         badge.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        badge.setStyleSheet("font-size: 10px; color: #4F6F7B; font-weight: 800;")
+        badge_color = "#0E7A5F" if is_connected else "#4F6F7B"
+        badge.setStyleSheet(f"font-size: 10px; color: {badge_color}; font-weight: 800;")
         name_row.addWidget(name, 1)
         name_row.addWidget(badge)
 
@@ -406,6 +416,25 @@ class ScanPanel(QWidget):
         layout.addLayout(name_row)
         layout.addWidget(detail)
         self.list_widget.setItemWidget(item, widget)
+
+    def _rebuild_recent_list(self) -> None:
+        self.list_widget.blockSignals(True)
+        current_addr = ""
+        current = self.list_widget.currentItem()
+        if current is not None:
+            data = current.data(Qt.ItemDataRole.UserRole)
+            if isinstance(data, DeviceScanResult):
+                current_addr = data.address
+        self.list_widget.clear()
+        for device in self.recent_devices:
+            self._add_recent_device(device)
+        if current_addr:
+            for i in range(self.list_widget.count()):
+                data = self.list_widget.item(i).data(Qt.ItemDataRole.UserRole)
+                if isinstance(data, DeviceScanResult) and data.address == current_addr:
+                    self.list_widget.setCurrentRow(i)
+                    break
+        self.list_widget.blockSignals(False)
 
     @asyncSlot()
     async def scan(self) -> None:
@@ -518,8 +547,11 @@ class ScanPanel(QWidget):
                 self.connected_list.setCurrentItem(item)
         self.connected_list.blockSignals(False)
 
-        if connected_changed and self.results and not self._is_scanning:
-            self._rebuild_scan_list()
+        if connected_changed and not self._is_scanning:
+            if self.results:
+                self._rebuild_scan_list()
+            elif self.recent_devices:
+                self._rebuild_recent_list()
 
     def _rebuild_scan_list(self) -> None:
         self.list_widget.blockSignals(True)

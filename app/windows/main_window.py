@@ -75,6 +75,7 @@ class MainWindow(QMainWindow):
         self.demo_device_name = "MMEU"
         self.demo_ebike_pct = 76
         self.demo_escooter_pct = 81
+        self.demo_device_battery_pcts: dict[str, int] = {}
         self.active_address: str = ""
         self.scan_ble = BleManager()
         self.state = DeviceState()
@@ -129,6 +130,7 @@ class MainWindow(QMainWindow):
             demo_device_name=self.demo_device_name,
             demo_ebike_pct=self.demo_ebike_pct,
             demo_escooter_pct=self.demo_escooter_pct,
+            demo_device_battery_pcts=self.demo_device_battery_pcts,
         )
         self.log_page = LogPage()
         self.error_page = ErrorPage()
@@ -157,16 +159,30 @@ class MainWindow(QMainWindow):
         self.engineering_mode = enabled
         self.demo2_page.set_engineering_mode(enabled)
 
-    def set_demo_settings(self, use_fake_data: bool, ebike_pct: int, escooter_pct: int, device_name: str) -> None:
+    def set_demo_settings(
+        self,
+        use_fake_data: bool,
+        ebike_pct: int,
+        escooter_pct: int,
+        device_name: str,
+        device_battery_pcts: dict[str, int] | None = None,
+    ) -> None:
         self.demo_use_fake_data = use_fake_data
         self.demo_device_name = device_name.strip() or "MMEU"
         self.demo_ebike_pct = ebike_pct
         self.demo_escooter_pct = escooter_pct
+        if device_battery_pcts is not None:
+            self.demo_device_battery_pcts = {
+                str(address).strip(): max(0, min(100, int(pct)))
+                for address, pct in device_battery_pcts.items()
+                if str(address).strip()
+            }
         self.demo2_page.set_demo_settings(
             use_fake_data=use_fake_data,
             device_name=self.demo_device_name,
             ebike_pct=ebike_pct,
             escooter_pct=escooter_pct,
+            device_battery_pcts=self.demo_device_battery_pcts,
         )
 
     def _open_settings(self) -> None:
@@ -176,6 +192,8 @@ class MainWindow(QMainWindow):
             demo_device_name=self.demo_device_name,
             demo_ebike_pct=self.demo_ebike_pct,
             demo_escooter_pct=self.demo_escooter_pct,
+            demo_device_battery_pcts=self.demo_device_battery_pcts,
+            connected_demo_devices=self._connected_demo_device_settings(),
             parent=self,
         )
         dialog.engineering_mode_changed.connect(self.set_engineering_mode)
@@ -285,6 +303,35 @@ class MainWindow(QMainWindow):
 
     def _set_demo_preview_device(self, result: DeviceScanResult) -> None:
         self.demo2_page.set_preview_device(result.name, result.device_number)
+
+    def _connected_demo_device_settings(self) -> list[dict[str, object]]:
+        items: list[dict[str, object]] = []
+        for address, state in self.states.items():
+            if not state.is_connected:
+                continue
+            items.append(
+                {
+                    "address": address,
+                    "label": self._demo_settings_device_label(state),
+                    "default_pct": self._default_demo_battery_pct(state),
+                }
+            )
+        return items
+
+    def _demo_settings_device_label(self, state: DeviceState) -> str:
+        number = state.device_number
+        if number is None:
+            _base, sep, suffix = state.device_name.rpartition("#")
+            if sep and suffix.strip().isdigit():
+                number = int(suffix.strip())
+        if number is not None:
+            return f"{self.demo_device_name} #{number}"
+        return state.device_name.strip() or state.device_address
+
+    def _default_demo_battery_pct(self, state: DeviceState) -> int:
+        if state.pru_type_string == "0404V1" or "0404" in state.device_name:
+            return self.demo_escooter_pct
+        return self.demo_ebike_pct
 
     def _device_tab_label(self, state: DeviceState) -> str:
         base = "PTU"

@@ -292,6 +292,50 @@ def test_demo_multi_showcase_dialog_builds_quad_tiles():
     page._showcase_dialog.reject()
 
 
+def test_demo_multi_showcase_uses_per_device_fake_battery_values():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.demo2_page import Demo2Page
+
+    app = QApplication.instance() or QApplication([])
+    page = Demo2Page(
+        demo_use_fake_data=True,
+        demo_ebike_pct=76,
+        demo_device_battery_pcts={"A": 72, "B": 84},
+    )
+    states = {
+        "A": DeviceState(
+            device_name="GIOS0801ST#4",
+            device_address="A",
+            device_number=4,
+            pru_type_string="0403V1",
+            pru_reg_item_state=4,
+            pru_dyn_vout=5097,
+            pru_dyn_iout=1200,
+        ),
+        "B": DeviceState(
+            device_name="GIOS0801ST#6",
+            device_address="B",
+            device_number=6,
+            pru_type_string="0403V1",
+            pru_reg_item_state=4,
+            pru_dyn_vout=5097,
+            pru_dyn_iout=1200,
+        ),
+    }
+    page.set_showcase_states(states, "A")
+
+    page._open_multi_showcase(["A", "B"], "split")
+
+    assert page._showcase_dialog is not None
+    assert page._showcase_dialog.tiles["A"].pct_label.text() == "72%"
+    assert page._showcase_dialog.tiles["B"].pct_label.text() == "84%"
+
+    page._showcase_dialog.reject()
+
+
 def test_demo_showcase_chooser_selects_first_four_by_default():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication
@@ -351,6 +395,59 @@ def test_settings_dialog_has_demo_defaults():
     assert dialog.demo_device_name_edit.text() == "MMEU"
     assert dialog.demo_ebike_spin.value() == 76
     assert dialog.demo_escooter_spin.value() == 81
+
+
+def test_settings_dialog_shows_connected_device_fake_battery_controls():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.windows.settings_dialog import SettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        engineering_mode=False,
+        demo_device_battery_pcts={"A": 72},
+        connected_demo_devices=[
+            {"address": "A", "label": "MMEU #4", "default_pct": 76},
+            {"address": "B", "label": "MMEU #6", "default_pct": 76},
+        ],
+    )
+
+    assert dialog.demo_device_pct_spins["A"].value() == 72
+    assert dialog.demo_device_pct_spins["B"].value() == 76
+
+
+def test_main_window_builds_connected_demo_device_fake_battery_settings():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    first = DeviceState(
+        is_connected=True,
+        device_name="GIOS0403ST#4",
+        device_address="A",
+        device_number=4,
+        pru_type_string="0403V1",
+    )
+    second = DeviceState(
+        is_connected=True,
+        device_name="GIOS0404ST#6",
+        device_address="B",
+        device_number=6,
+        pru_type_string="0404V1",
+    )
+    window.states[first.device_address] = first
+    window.states[second.device_address] = second
+
+    assert window._connected_demo_device_settings() == [
+        {"address": "A", "label": "MMEU #4", "default_pct": 76},
+        {"address": "B", "label": "MMEU #6", "default_pct": 81},
+    ]
+    window.close()
 
 
 def test_demo_fake_battery_percent_overrides_charging_values():

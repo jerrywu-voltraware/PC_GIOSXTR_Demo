@@ -22,7 +22,7 @@ from ..constants import APP_NAME, APP_VERSION
 
 class SettingsDialog(QDialog):
     engineering_mode_changed = pyqtSignal(bool)
-    demo_settings_changed = pyqtSignal(bool, int, int, str)
+    demo_settings_changed = pyqtSignal(bool, int, int, str, object)
     check_updates_requested = pyqtSignal()
 
     def __init__(
@@ -33,11 +33,16 @@ class SettingsDialog(QDialog):
         demo_device_name: str = "MMEU",
         demo_ebike_pct: int = 76,
         demo_escooter_pct: int = 81,
+        demo_device_battery_pcts: dict[str, int] | None = None,
+        connected_demo_devices: list[dict[str, object]] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(520)
+        self.demo_device_battery_pcts = dict(demo_device_battery_pcts or {})
+        self.connected_demo_devices = list(connected_demo_devices or [])
+        self.demo_device_pct_spins: dict[str, QSpinBox] = {}
 
         root = QVBoxLayout(self)
         tabs = QTabWidget()
@@ -120,11 +125,35 @@ class SettingsDialog(QDialog):
         self.demo_escooter_spin.valueChanged.connect(self._emit_demo_settings)
         layout.addRow("ESCOOTER battery", self.demo_escooter_spin)
 
-        detail = QLabel("These values drive the DEMO page preview when fake data is enabled.")
+        if self.connected_demo_devices:
+            section = QLabel("Connected device fake data")
+            section.setStyleSheet("font-weight: 800; color: #40545B; padding-top: 8px;")
+            layout.addRow("", section)
+            for device in self.connected_demo_devices:
+                address = str(device.get("address", "")).strip()
+                if not address:
+                    continue
+                label = str(device.get("label", address)).strip() or address
+                raw_default = device.get("default_pct", self.demo_ebike_spin.value())
+                default_pct = raw_default if isinstance(raw_default, int) else self.demo_ebike_spin.value()
+                spin = QSpinBox()
+                spin.setRange(0, 100)
+                spin.setSuffix(" %")
+                spin.setValue(int(self.demo_device_battery_pcts.get(address, default_pct)))
+                spin.valueChanged.connect(self._emit_demo_settings)
+                self.demo_device_pct_spins[address] = spin
+                layout.addRow(label, spin)
+
+        detail = QLabel(
+            "Default values drive the DEMO preview. Connected-device values override them in multi-device fullscreen mode."
+        )
         detail.setWordWrap(True)
         detail.setStyleSheet("color: #66757C;")
         layout.addRow("", detail)
         return page
+
+    def _device_battery_pcts(self) -> dict[str, int]:
+        return {address: spin.value() for address, spin in self.demo_device_pct_spins.items()}
 
     def _emit_demo_settings(self, *_args) -> None:
         self.demo_settings_changed.emit(
@@ -132,4 +161,5 @@ class SettingsDialog(QDialog):
             self.demo_ebike_spin.value(),
             self.demo_escooter_spin.value(),
             self.demo_device_name_edit.text().strip() or "MMEU",
+            self._device_battery_pcts(),
         )
