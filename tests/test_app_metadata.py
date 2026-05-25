@@ -45,3 +45,29 @@ def test_pyinstaller_spec_uses_versioned_exe_icon_and_version_info():
     assert "filevers=(1, 0, 0, 0)" in version_info
     assert "StringStruct('FileVersion', 'V1.0.0')" in version_info
     assert "StringStruct('ProductVersion', 'V1.0.0')" in version_info
+
+
+def test_settings_dialog_exposes_manual_update_check_button():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication, QPushButton
+
+    from app.windows.settings_dialog import SettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(
+        engineering_mode=False,
+        demo_use_fake_data=True,
+        demo_device_name="MMEU",
+        demo_ebike_pct=76,
+        demo_escooter_pct=81,
+    )
+    emitted: list[bool] = []
+    dialog.check_updates_requested.connect(lambda: emitted.append(True))
+
+    buttons = dialog.findChildren(QPushButton)
+    update_buttons = [button for button in buttons if "update" in button.text().lower()]
+
+    assert update_buttons
+    update_buttons[0].click()
+    assert emitted == [True]
+    dialog.close()
