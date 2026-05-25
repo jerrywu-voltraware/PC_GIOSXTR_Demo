@@ -19,6 +19,9 @@ dist/
 logs/
 *.log
 
+# Local worktrees
+.worktrees/
+
 # IDE
 .vscode/
 .idea/
