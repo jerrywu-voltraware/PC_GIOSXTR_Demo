@@ -20,7 +20,9 @@ from PyQt6.QtWidgets import (
 )
 from qasync import asyncSlot
 
+from ..ble_adapter import AdapterCheckResult, AdapterStatus, check_bluetooth_adapter, user_facing_message
 from ..ble_manager import BleManager, DeviceScanResult
+from ..ble_manager import _write_scan_debug
 from ..constants import APP_ICON_FILENAME, APP_VERSION, APP_WINDOW_TITLE
 from ..csv_logger import CsvLogger
 from ..models import DataEvent, DeviceState
@@ -80,6 +82,7 @@ class MainWindow(QMainWindow):
         self.scan_ble = BleManager()
         self.state = DeviceState()
         self._update_check_running = False
+        self._last_adapter_status: AdapterStatus | None = None
 
         self.notify_received.connect(self._handle_notify)
         self.disconnected.connect(self._handle_disconnect)
@@ -153,7 +156,31 @@ class MainWindow(QMainWindow):
         self.refresh_pages()
         self.scan_panel.set_recent_devices(self.recent_device_store.load())
         if os.getenv("QT_QPA_PLATFORM", "").lower() != "offscreen":
+            QTimer.singleShot(0, self._start_initial_adapter_check)
+        if os.getenv("QT_QPA_PLATFORM", "").lower() != "offscreen":
             QTimer.singleShot(1500, self._start_automatic_update_check)
+
+    def _start_initial_adapter_check(self) -> None:
+        asyncio.create_task(self._run_initial_adapter_check())
+
+    async def _run_initial_adapter_check(self) -> None:
+        result = await check_bluetooth_adapter()
+        _write_scan_debug(f"startup adapter check: {result.status.value} {result.detail}")
+        self._handle_adapter_check_result(result, show_warning=True)
+
+    def _handle_adapter_check_result(self, result: AdapterCheckResult, *, show_warning: bool) -> None:
+        self._last_adapter_status = result.status
+        if result.status in (AdapterStatus.NO_ADAPTER, AdapterStatus.DISABLED):
+            title, body = user_facing_message(result)
+            if show_warning:
+                QMessageBox.warning(self, title, body)
+            self.scan_panel.set_adapter_unavailable(result.status, body)
+            return
+        if result.status is AdapterStatus.OK:
+            self.scan_panel.set_adapter_available()
+            return
+        if result.status is AdapterStatus.UNKNOWN_ERROR:
+            self.scan_panel.status.setText(f"藍牙狀態檢測失敗: {result.detail}")
 
     def set_engineering_mode(self, enabled: bool) -> None:
         self.engineering_mode = enabled

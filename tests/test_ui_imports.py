@@ -31,6 +31,29 @@ def test_main_window_imports_with_updater_enabled():
     assert MainWindow is not None
 
 
+def test_main_window_initial_adapter_result_updates_scan_panel(monkeypatch):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+
+    from app.ble_adapter import AdapterCheckResult, AdapterStatus
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    shown: list[tuple[str, str]] = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda _parent, title, body: shown.append((title, body)))
+
+    window._handle_adapter_check_result(
+        AdapterCheckResult(AdapterStatus.DISABLED, "Bluetooth radio off"),
+        show_warning=True,
+    )
+
+    assert window._last_adapter_status is AdapterStatus.DISABLED
+    assert shown[0][0] == "藍牙已關閉"
+    assert not window.scan_panel.scan_btn.isEnabled()
+    window.close()
+
+
 def test_default_update_save_path_uses_asset_name(tmp_path):
     from app.updater import UpdateAsset
     from app.windows.main_window import _default_update_save_path

@@ -22,7 +22,9 @@ from PyQt6.QtWidgets import (
 )
 from qasync import asyncSlot
 
+from ..ble_adapter import AdapterStatus, check_bluetooth_adapter, user_facing_message
 from ..ble_manager import BleManager, DeviceScanResult
+from ..ble_manager import _write_scan_debug
 from ..models import DeviceState
 from ..recent_devices import RecentDevice
 
@@ -44,6 +46,7 @@ class ScanPanel(QWidget):
         self.results: list[DeviceScanResult] = []
         self.recent_devices: list[RecentDevice] = []
         self._is_scanning = False
+        self._adapter_available = True
         self._connected_addresses: set[str] = set()
         self._active_address: str = ""
         root = QVBoxLayout(self)
@@ -299,6 +302,28 @@ class ScanPanel(QWidget):
         layout.addWidget(detail_label)
         self.list_widget.setItemWidget(item, widget)
 
+    def set_adapter_unavailable(self, _status: AdapterStatus, hint: str) -> None:
+        """Disable scan controls and show an actionable adapter hint."""
+        self._adapter_available = False
+        self.scan_btn.setEnabled(False)
+        self.scan_btn.setText("藍牙不可用")
+        first_line = hint.splitlines()[0] if hint.splitlines() else hint
+        self._set_scan_state("藍牙不可用", first_line)
+        self._show_empty_result("藍牙不可用", hint)
+
+    def set_adapter_available(self) -> None:
+        self._adapter_available = True
+        self.scan_btn.setText("搜尋裝置")
+        self.scan_btn.setEnabled(not self._is_scanning)
+        if self._is_scanning or self.results:
+            return
+        if self.recent_devices:
+            self._show_recent_devices()
+            return
+        detail = "按下搜尋裝置後，只會顯示支援的 VOLTRAWARE 裝置。"
+        self._show_empty_result("準備搜尋", detail)
+        self._set_scan_state("準備搜尋附近裝置", detail)
+
     @staticmethod
     def _rssi_quality(rssi: int) -> str:
         if rssi >= -55:
@@ -446,6 +471,8 @@ class ScanPanel(QWidget):
         self._set_advanced_visible(False)
         self._set_scan_state("正在搜尋附近裝置", "掃描約需 5 秒，請讓裝置靠近充電板。", busy=True)
         try:
+            if not await self._adapter_ready_for_scan():
+                return
             self.results = await self.ble.scan(timeout=5.0, supported_only=True)
             for result in self.results:
                 self._add_scan_result(result)
@@ -470,8 +497,22 @@ class ScanPanel(QWidget):
             self._set_scan_state("掃描失敗", str(exc))
         finally:
             self._is_scanning = False
-            self.scan_btn.setEnabled(True)
+            self.scan_btn.setEnabled(self._adapter_available)
             self.scan_progress.hide()
+
+    async def _adapter_ready_for_scan(self) -> bool:
+        result = await check_bluetooth_adapter()
+        _write_scan_debug(f"adapter check before scan: {result.status.value} {result.detail}")
+        if result.status in (AdapterStatus.NO_ADAPTER, AdapterStatus.DISABLED):
+            title, body = user_facing_message(result)
+            QMessageBox.information(self, title, body)
+            self.set_adapter_unavailable(result.status, body)
+            return False
+        if result.status is AdapterStatus.OK:
+            self.set_adapter_available()
+        elif result.status is AdapterStatus.UNKNOWN_ERROR:
+            self.status.setText(f"藍牙狀態檢測失敗: {result.detail}")
+        return True
 
     def _on_selection_changed(self, current: QListWidgetItem | None) -> None:
         if current is None:
@@ -509,6 +550,8 @@ class ScanPanel(QWidget):
 
     def refresh(self, state: DeviceState) -> None:
         if self._is_scanning:
+            return
+        if not self._adapter_available:
             return
         if state.is_connected:
             self._set_scan_state(
