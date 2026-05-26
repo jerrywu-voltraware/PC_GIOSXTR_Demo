@@ -27,6 +27,7 @@ from ..ble_manager import BleManager, DeviceScanResult
 from ..ble_manager import _write_scan_debug
 from ..models import DeviceState
 from ..recent_devices import RecentDevice
+from ..theme import ThemeTokens, current_tokens, theme_manager
 
 
 class ScanPanel(QWidget):
@@ -39,6 +40,7 @@ class ScanPanel(QWidget):
     recording_stop_requested = pyqtSignal()
     recording_start_all_requested = pyqtSignal()
     recording_stop_all_requested = pyqtSignal()
+    open_log_folder_requested = pyqtSignal()
 
     def __init__(self, ble: BleManager, parent=None) -> None:
         super().__init__(parent)
@@ -48,12 +50,16 @@ class ScanPanel(QWidget):
         self._is_scanning = False
         self._adapter_available = True
         self._connected_addresses: set[str] = set()
+        self._reconnecting_addresses: set[str] = set()
+        self._tracked_addresses: set[str] = set()
         self._active_address: str = ""
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(10)
         self.setObjectName("scanPanel")
+        self._tokens: ThemeTokens = current_tokens()
         self._apply_style()
+        theme_manager().theme_changed.connect(self._on_theme_changed)
 
         title = QLabel("藍牙裝置")
         title.setObjectName("panelTitle")
@@ -145,6 +151,11 @@ class ScanPanel(QWidget):
         rec_all_row.addWidget(self.stop_recording_all_btn)
         root.addLayout(rec_all_row)
 
+        self.open_log_folder_btn = QPushButton("開啟錄製資料夾")
+        self.open_log_folder_btn.setObjectName("secondaryButton")
+        self.open_log_folder_btn.clicked.connect(self.open_log_folder_requested.emit)
+        root.addWidget(self.open_log_folder_btn)
+
         self.recording_status = QLabel("CSV:未錄製")
         self.recording_status.setObjectName("subtleStatus")
         self.recording_status.setWordWrap(True)
@@ -176,100 +187,111 @@ class ScanPanel(QWidget):
         self.set_recording_state(False, False)
 
     def _apply_style(self) -> None:
+        t = self._tokens
         self.setStyleSheet(
-            """
-            QWidget#scanPanel {
-                background: #F4F6F7;
-                color: #172A31;
+            f"""
+            QWidget#scanPanel {{
+                background: {t.surface_alt};
+                color: {t.text_primary};
                 font-size: 12px;
-            }
-            QLabel#panelTitle {
+            }}
+            QLabel#panelTitle {{
                 font-size: 18px;
                 font-weight: 800;
-                color: #102A33;
+                color: {t.text_primary};
                 padding: 2px 0 4px 0;
-            }
-            QLabel#sectionTitle {
+            }}
+            QLabel#sectionTitle {{
                 font-size: 12px;
                 font-weight: 800;
-                color: #40545B;
+                color: {t.text_secondary};
                 padding-top: 4px;
-            }
-            QFrame#scanState {
-                background: #FFFFFF;
-                border: 1px solid #DDE7EA;
+            }}
+            QFrame#scanState {{
+                background: {t.card_bg};
+                border: 1px solid {t.card_border};
                 border-radius: 8px;
-            }
-            QLabel#scanStateTitle {
+            }}
+            QLabel#scanStateTitle {{
                 font-size: 13px;
                 font-weight: 800;
-                color: #19343C;
-            }
-            QLabel#scanStateDetail, QLabel#subtleStatus {
-                color: #6C7F86;
+                color: {t.text_primary};
+            }}
+            QLabel#scanStateDetail, QLabel#subtleStatus {{
+                color: {t.text_muted};
                 font-size: 11px;
-            }
-            QPushButton {
+            }}
+            QPushButton {{
                 min-height: 26px;
                 border-radius: 6px;
                 padding: 4px 10px;
                 font-weight: 700;
-            }
-            QPushButton#primaryButton {
-                background: #4F6F7B;
-                color: white;
-                border: 1px solid #425F6A;
-            }
-            QPushButton#primaryButton:hover {
-                background: #45636E;
-            }
-            QPushButton#primaryButton:disabled {
-                background: #A9B7BC;
-                border-color: #A9B7BC;
-            }
-            QPushButton#secondaryButton {
-                background: #FFFFFF;
-                color: #243B43;
-                border: 1px solid #CEDBE0;
-            }
-            QPushButton#secondaryButton:hover {
-                background: #EDF4F6;
-            }
-            QPushButton#secondaryButton:disabled {
-                color: #AAB6BA;
-                background: #F6F8F9;
-            }
-            QListWidget#deviceList, QListWidget#connectedList, QTextEdit#rawData, QTableWidget#advTable {
-                background: #FFFFFF;
-                border: 1px solid #DDE7EA;
+            }}
+            QPushButton#primaryButton {{
+                background: {t.button_primary_bg};
+                color: {t.button_primary_text};
+                border: 1px solid {t.button_primary_border};
+            }}
+            QPushButton#primaryButton:hover {{
+                background: {t.button_primary_hover};
+            }}
+            QPushButton#primaryButton:disabled {{
+                background: {t.button_disabled_bg};
+                border-color: {t.button_disabled_bg};
+                color: {t.button_disabled_text};
+            }}
+            QPushButton#secondaryButton {{
+                background: {t.button_secondary_bg};
+                color: {t.button_secondary_text};
+                border: 1px solid {t.button_secondary_border};
+            }}
+            QPushButton#secondaryButton:hover {{
+                background: {t.button_secondary_hover};
+            }}
+            QPushButton#secondaryButton:disabled {{
+                color: {t.button_disabled_text};
+                background: {t.button_disabled_bg};
+            }}
+            QListWidget#deviceList, QListWidget#connectedList, QTextEdit#rawData, QTableWidget#advTable {{
+                background: {t.card_bg};
+                color: {t.text_primary};
+                border: 1px solid {t.card_border};
                 border-radius: 8px;
                 padding: 4px;
-                selection-background-color: #DDF7F4;
-                selection-color: #102A33;
-            }
-            QListWidget::item {
+                selection-background-color: {t.accent_soft};
+                selection-color: {t.accent_text};
+            }}
+            QListWidget::item {{
                 border-radius: 6px;
                 margin: 2px;
-            }
-            QProgressBar {
-                background: #E7EEF1;
+            }}
+            QProgressBar {{
+                background: {t.surface_alt};
                 border: 0;
                 border-radius: 2px;
-            }
-            QProgressBar::chunk {
-                background: #25C7B7;
+            }}
+            QProgressBar::chunk {{
+                background: {t.accent};
                 border-radius: 2px;
-            }
-            QHeaderView::section {
-                background: #F5F8F9;
+            }}
+            QHeaderView::section {{
+                background: {t.table_header_bg};
                 border: 0;
-                border-bottom: 1px solid #DDE7EA;
+                border-bottom: 1px solid {t.card_border};
                 padding: 4px;
                 font-weight: 700;
-                color: #52656C;
-            }
+                color: {t.text_secondary};
+            }}
             """
         )
+
+    def _on_theme_changed(self, tokens: ThemeTokens) -> None:
+        self._tokens = tokens
+        self._apply_style()
+        if self.results:
+            self._rebuild_scan_list()
+        elif self.recent_devices:
+            self._rebuild_recent_list()
 
     def _set_scan_state(self, title: str, detail: str, *, busy: bool = False) -> None:
         self.scan_state_title.setText(title)
@@ -293,11 +315,12 @@ class ScanPanel(QWidget):
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(2)
+        t = self._tokens
         title_label = QLabel(title)
-        title_label.setStyleSheet("font-size: 12px; font-weight: 800; color: #52656C;")
+        title_label.setStyleSheet(f"font-size: 12px; font-weight: 800; color: {t.text_secondary};")
         detail_label = QLabel(detail)
         detail_label.setWordWrap(True)
-        detail_label.setStyleSheet("font-size: 11px; color: #8A9AA0;")
+        detail_label.setStyleSheet(f"font-size: 11px; color: {t.text_muted};")
         layout.addWidget(title_label)
         layout.addWidget(detail_label)
         self.list_widget.setItemWidget(item, widget)
@@ -339,13 +362,15 @@ class ScanPanel(QWidget):
         self.list_widget.addItem(item)
 
         is_connected = result.address in self._connected_addresses
-        is_active = is_connected and result.address == self._active_address
+        is_reconnecting = result.address in self._reconnecting_addresses
+        is_active = (is_connected or is_reconnecting) and result.address == self._active_address
 
+        t = self._tokens
         widget = QWidget()
         if is_active:
-            widget.setStyleSheet("background: #DDF7F4; border-radius: 6px;")
+            widget.setStyleSheet(f"background: {t.accent_soft}; border-radius: 6px;")
         elif is_connected:
-            widget.setStyleSheet("background: #EAF6F1; border-radius: 6px;")
+            widget.setStyleSheet(f"background: {t.ok_bg}; border-radius: 6px;")
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(10, 6, 10, 6)
         layout.setSpacing(2)
@@ -354,24 +379,25 @@ class ScanPanel(QWidget):
         name_row.setSpacing(6)
         name_text = result.name or "未命名裝置"
         name = QLabel(name_text)
-        name_color = "#0E7A5F" if is_connected else "#19343C"
+        name_color = t.warning if is_reconnecting else (t.ok_fg if is_connected else t.text_primary)
         name.setStyleSheet(f"font-size: 13px; font-weight: 800; color: {name_color};")
         name_row.addWidget(name, 1)
 
-        if is_connected:
-            badge_text = "● 連線中" if is_active else "● 已連線"
+        if is_connected or is_reconnecting:
+            badge_text = "● 重新連線中" if is_reconnecting else ("● 連線中" if is_active else "● 已連線")
             badge = QLabel(badge_text)
             badge.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            badge.setStyleSheet("font-size: 10px; color: #0E7A5F; font-weight: 800;")
+            badge_color = t.warning if is_reconnecting else t.ok_fg
+            badge.setStyleSheet(f"font-size: 10px; color: {badge_color}; font-weight: 800;")
             name_row.addWidget(badge)
 
         quality = QLabel(f"{self._rssi_quality(result.rssi)}  {result.rssi} dBm")
         quality.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        quality.setStyleSheet("font-size: 10px; color: #4F6F7B; font-weight: 700;")
+        quality.setStyleSheet(f"font-size: 10px; color: {t.text_secondary}; font-weight: 700;")
         name_row.addWidget(quality)
 
         address = QLabel(result.address)
-        address.setStyleSheet("font-size: 10px; color: #7D9097;")
+        address.setStyleSheet(f"font-size: 10px; color: {t.text_muted};")
 
         layout.addLayout(name_row)
         layout.addWidget(address)
@@ -411,13 +437,15 @@ class ScanPanel(QWidget):
         self.list_widget.addItem(item)
 
         is_connected = device.address in self._connected_addresses
-        is_active = is_connected and device.address == self._active_address
+        is_reconnecting = device.address in self._reconnecting_addresses
+        is_active = (is_connected or is_reconnecting) and device.address == self._active_address
 
+        t = self._tokens
         widget = QWidget()
         if is_active:
-            widget.setStyleSheet("background: #DDF7F4; border-radius: 6px;")
+            widget.setStyleSheet(f"background: {t.accent_soft}; border-radius: 6px;")
         elif is_connected:
-            widget.setStyleSheet("background: #EAF6F1; border-radius: 6px;")
+            widget.setStyleSheet(f"background: {t.ok_bg}; border-radius: 6px;")
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(10, 6, 10, 6)
         layout.setSpacing(2)
@@ -425,18 +453,21 @@ class ScanPanel(QWidget):
         name_row = QHBoxLayout()
         name_row.setSpacing(6)
         name = QLabel(device.name)
-        name_color = "#0E7A5F" if is_connected else "#19343C"
+        name_color = t.warning if is_reconnecting else (t.ok_fg if is_connected else t.text_primary)
         name.setStyleSheet(f"font-size: 13px; font-weight: 800; color: {name_color};")
-        badge_text = "目前連線" if is_active else ("已連線" if is_connected else "最近連線")
+        if is_reconnecting:
+            badge_text = "重新連線中"
+        else:
+            badge_text = "目前連線" if is_active else ("已連線" if is_connected else "最近連線")
         badge = QLabel(badge_text)
         badge.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        badge_color = "#0E7A5F" if is_connected else "#4F6F7B"
+        badge_color = t.warning if is_reconnecting else (t.ok_fg if is_connected else t.text_secondary)
         badge.setStyleSheet(f"font-size: 10px; color: {badge_color}; font-weight: 800;")
         name_row.addWidget(name, 1)
         name_row.addWidget(badge)
 
         detail = QLabel(f"{device.address}  可直接嘗試連線")
-        detail.setStyleSheet("font-size: 10px; color: #7D9097;")
+        detail.setStyleSheet(f"font-size: 10px; color: {t.text_muted};")
 
         layout.addLayout(name_row)
         layout.addWidget(detail)
@@ -568,12 +599,26 @@ class ScanPanel(QWidget):
         devices: list[dict[str, str]],
         active_address: str = "",
     ) -> None:
-        new_connected = {dev.get("address", "") for dev in devices if dev.get("address")}
+        new_tracked = {dev.get("address", "") for dev in devices if dev.get("address")}
+        new_connected = {
+            dev.get("address", "")
+            for dev in devices
+            if dev.get("address") and dev.get("connected", "1") != "0"
+        }
+        new_reconnecting = {
+            dev.get("address", "")
+            for dev in devices
+            if dev.get("address") and dev.get("reconnecting") == "1"
+        }
         connected_changed = (
-            new_connected != self._connected_addresses
+            new_tracked != self._tracked_addresses
+            or new_connected != self._connected_addresses
+            or new_reconnecting != self._reconnecting_addresses
             or active_address != self._active_address
         )
+        self._tracked_addresses = new_tracked
         self._connected_addresses = new_connected
+        self._reconnecting_addresses = new_reconnecting
         self._active_address = active_address
 
         self.connected_list.blockSignals(True)
@@ -582,7 +627,16 @@ class ScanPanel(QWidget):
             num = dev.get("device_number", "")
             num_part = f"#{num} " if num else ""
             rec_part = "  [錄製中]" if dev.get("recording") == "1" else ""
-            label = f"{num_part}{dev.get('name', '')} ({dev.get('address', '')})  封包={dev.get('packets', '0')}{rec_part}"
+            if dev.get("reconnecting") == "1":
+                status_part = "重新連線中"
+            elif dev.get("connected", "1") == "0":
+                status_part = "已斷線"
+            else:
+                status_part = "已連線"
+            label = (
+                f"{num_part}{dev.get('name', '')} ({dev.get('address', '')})  "
+                f"{status_part}  封包={dev.get('packets', '0')}{rec_part}"
+            )
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, dev.get("address", ""))
             self.connected_list.addItem(item)
@@ -631,6 +685,7 @@ class ScanPanel(QWidget):
             self.stop_recording_btn,
             self.start_recording_all_btn,
             self.stop_recording_all_btn,
+            self.open_log_folder_btn,
             self.recording_status,
         ):
             widget.setVisible(visible)

@@ -17,6 +17,9 @@ from app.theme import apply_light_theme
 from app.windows.main_window import MainWindow
 
 
+APP_ORGANIZATION = "GIOSXTR"
+
+
 def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--engineering", action="store_true", help="Enable internal engineering controls")
@@ -34,10 +37,11 @@ def main() -> int:
     engineering_mode = bool(args.engineering or _env_engineering_enabled())
 
     app = QApplication([sys.argv[0], *qt_args])
-    apply_light_theme(app)
+    app.setOrganizationName(APP_ORGANIZATION)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(APP_WINDOW_TITLE)
     app.setApplicationVersion(APP_VERSION.removeprefix("V"))
+    apply_light_theme(app)
     icon = QIcon(str(resource_path(APP_ICON_FILENAME)))
     if not icon.isNull():
         app.setWindowIcon(icon)

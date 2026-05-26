@@ -6,7 +6,7 @@ import asyncio
 import os
 from pathlib import Path
 
-from PyQt6.QtCore import QStandardPaths, QTimer, Qt, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QSettings, QStandardPaths, QTimer, Qt, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QDesktopServices, QIcon
 from PyQt6.QtWidgets import (
     QFileDialog,
@@ -29,6 +29,7 @@ from ..models import DataEvent, DeviceState
 from ..protocol import parse_notify_packet
 from ..recent_devices import RecentDevice, RecentDeviceStore
 from ..resources import resource_path
+from ..theme import current_tokens
 from ..updater import UpdateAsset, UpdateCheckResult, UpdateStatus, check_for_update, download_asset
 from .data_pages import PruPage, PtuPage
 from .demo2_page import Demo2Page
@@ -52,6 +53,18 @@ def _default_update_save_path(asset: UpdateAsset, downloads_dir: str | None = No
     base_dir = downloads_dir or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
     base_path = Path(base_dir) if base_dir else Path.home() / "Downloads"
     return base_path / asset.name
+
+
+AUTO_RECONNECT_SETTINGS_KEY = "connection/autoReconnect"
+RECONNECT_DELAYS_SECONDS = (1.0, 3.0, 5.0, 10.0)
+RECONNECT_MAX_ATTEMPTS = 10
+
+
+def _settings_bool(key: str, default: bool = False) -> bool:
+    value = QSettings().value(key, default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class MainWindow(QMainWindow):
@@ -83,6 +96,17 @@ class MainWindow(QMainWindow):
         self.state = DeviceState()
         self._update_check_running = False
         self._last_adapter_status: AdapterStatus | None = None
+        self.auto_reconnect_enabled = _settings_bool(AUTO_RECONNECT_SETTINGS_KEY, False)
+        self._manual_disconnect_addresses: set[str] = set()
+        self._reconnect_tasks: dict[str, asyncio.Task[None]] = {}
+        self._reconnecting_addresses: set[str] = set()
+        self._reconnect_delays = RECONNECT_DELAYS_SECONDS
+        self._reconnect_max_attempts = RECONNECT_MAX_ATTEMPTS
+        # Pending error dialogs awaiting 200B data/limit values, per device.
+        # Maps address -> error_num just observed; resolved either when a 200B
+        # arrives with non-zero data/limit, or by a 2s fallback timer.
+        self._pending_error_codes: dict[str, int] = {}
+        self._error_dialog_max_wait_ms = 2000
 
         self.notify_received.connect(self._handle_notify)
         self.disconnected.connect(self._handle_disconnect)
@@ -101,6 +125,7 @@ class MainWindow(QMainWindow):
         self.scan_panel.recording_stop_requested.connect(self.stop_csv_recording_active)
         self.scan_panel.recording_start_all_requested.connect(self.start_csv_recording_all)
         self.scan_panel.recording_stop_all_requested.connect(self.stop_csv_recording_all)
+        self.scan_panel.open_log_folder_requested.connect(self._open_log_folder)
         layout.addWidget(self.scan_panel)
 
         content = QWidget()
@@ -221,10 +246,12 @@ class MainWindow(QMainWindow):
             demo_escooter_pct=self.demo_escooter_pct,
             demo_device_battery_pcts=self.demo_device_battery_pcts,
             connected_demo_devices=self._connected_demo_device_settings(),
+            auto_reconnect_enabled=self.auto_reconnect_enabled,
             parent=self,
         )
         dialog.engineering_mode_changed.connect(self.set_engineering_mode)
         dialog.demo_settings_changed.connect(self.set_demo_settings)
+        dialog.auto_reconnect_changed.connect(self.set_auto_reconnect_enabled)
         dialog.check_updates_requested.connect(lambda: self._start_manual_update_check(dialog))
         dialog.exec()
 
@@ -413,13 +440,28 @@ class MainWindow(QMainWindow):
             self.disconnected.emit(address)
         return emit
 
+    def _create_ble_manager(self) -> BleManager:
+        return BleManager()
+
+    def set_auto_reconnect_enabled(self, enabled: bool, *, persist: bool = True) -> None:
+        self.auto_reconnect_enabled = bool(enabled)
+        if persist:
+            QSettings().setValue(AUTO_RECONNECT_SETTINGS_KEY, self.auto_reconnect_enabled)
+        if not self.auto_reconnect_enabled:
+            for task in list(self._reconnect_tasks.values()):
+                if not task.done():
+                    task.cancel()
+            self._reconnect_tasks.clear()
+            self._reconnecting_addresses.clear()
+            self.refresh_pages()
+
     @asyncSlot(object)
     async def _connect_device(self, result: DeviceScanResult) -> None:
         address = result.address
         if address in self.managers:
             self._set_active(address)
             return
-        manager = BleManager()
+        manager = self._create_ble_manager()
         manager.set_notify_callback(self._make_notify_emitter())
         manager.set_disconnect_callback(self._make_disconnect_emitter())
         try:
@@ -454,6 +496,7 @@ class MainWindow(QMainWindow):
             await manager.request_200b()
         except Exception as exc:
             state.add_log(f"Initial 200B request skipped: {exc}")
+        manager.start_200b_keeper()
         self.refresh_pages()
 
     def _remember_recent_device(self, result: DeviceScanResult) -> None:
@@ -487,19 +530,37 @@ class MainWindow(QMainWindow):
 
     @asyncSlot()
     async def _disconnect_all(self) -> None:
-        for addr in list(self.managers.keys()):
+        for addr in list({*self.states.keys(), *self.managers.keys()}):
             await self._disconnect_address(addr)
 
     async def _disconnect_address(self, address: str) -> None:
+        self._manual_disconnect_addresses.add(address)
+        self._cancel_reconnect(address)
         manager = self.managers.get(address)
         if manager is None:
+            self._cleanup_address(address)
+            self._manual_disconnect_addresses.discard(address)
             return
         try:
             await manager.disconnect()
         finally:
             self._cleanup_address(address)
+            self._manual_disconnect_addresses.discard(address)
 
-    def _cleanup_address(self, address: str) -> None:
+    def _cleanup_address(self, address: str, *, allow_reconnect: bool = False) -> None:
+        if allow_reconnect:
+            self.managers.pop(address, None)
+            state = self.states.get(address)
+            if state is not None:
+                state.is_connected = False
+                state.add_log("裝置斷線，準備自動重新連線")
+                self._reconnecting_addresses.add(address)
+            self._pending_error_codes.pop(address, None)
+            self._refresh_device_tabs()
+            self.refresh_pages()
+            self._schedule_reconnect(address)
+            return
+
         logger = self.loggers.pop(address, None)
         if logger is not None and logger.is_recording:
             path = logger.stop()
@@ -512,6 +573,8 @@ class MainWindow(QMainWindow):
             state.is_connected = False
             state.add_log("Disconnected")
         self.managers.pop(address, None)
+        self._reconnecting_addresses.discard(address)
+        self._pending_error_codes.pop(address, None)
         if self.active_address == address:
             next_addr = next(iter(self.managers), "")
             self.active_address = next_addr
@@ -521,7 +584,92 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _handle_disconnect(self, address: str) -> None:
-        self._cleanup_address(address)
+        manual = address in self._manual_disconnect_addresses
+        self._manual_disconnect_addresses.discard(address)
+        self._cleanup_address(address, allow_reconnect=self.auto_reconnect_enabled and not manual)
+
+    def _cancel_reconnect(self, address: str) -> None:
+        task = self._reconnect_tasks.pop(address, None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._reconnecting_addresses.discard(address)
+
+    def _schedule_reconnect(self, address: str) -> None:
+        if not self.auto_reconnect_enabled or address not in self.states:
+            return
+        task = self._reconnect_tasks.get(address)
+        if task is not None and not task.done():
+            return
+        try:
+            self._reconnect_tasks[address] = asyncio.create_task(self._run_reconnect_loop(address))
+        except RuntimeError:
+            # No running event loop in unit tests or during teardown; keep state
+            # preserved and let the next user action handle the device.
+            pass
+
+    def _reconnect_delay(self, attempt_index: int) -> float:
+        if not self._reconnect_delays:
+            return 0.0
+        return self._reconnect_delays[min(attempt_index, len(self._reconnect_delays) - 1)]
+
+    async def _run_reconnect_loop(self, address: str) -> None:
+        try:
+            for attempt_index in range(self._reconnect_max_attempts):
+                if not self.auto_reconnect_enabled or address not in self.states:
+                    return
+                await asyncio.sleep(self._reconnect_delay(attempt_index))
+                if not self.auto_reconnect_enabled or address not in self.states:
+                    return
+                try:
+                    await self._reconnect_device(address)
+                    return
+                except Exception as exc:
+                    state = self.states.get(address)
+                    if state is not None:
+                        state.add_log(f"重新連線失敗 ({attempt_index + 1}/{self._reconnect_max_attempts}): {exc}")
+                        self.refresh_pages()
+            state = self.states.get(address)
+            if state is not None and not state.is_connected:
+                self._reconnecting_addresses.discard(address)
+                state.add_log("重新連線已停止")
+                self.refresh_pages()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._reconnect_tasks.pop(address, None)
+
+    async def _reconnect_device(self, address: str) -> None:
+        state = self.states.get(address)
+        if state is None:
+            return
+        manager = self._create_ble_manager()
+        manager.set_notify_callback(self._make_notify_emitter())
+        manager.set_disconnect_callback(self._make_disconnect_emitter())
+        try:
+            await manager.connect(address)
+            await manager.enable_default_notifications()
+            try:
+                await manager.request_200b()
+            except Exception as exc:
+                state.add_log(f"重新連線 200B 要求略過: {exc}")
+            manager.start_200b_keeper()
+        except Exception:
+            try:
+                await manager.disconnect()
+            except Exception:
+                pass
+            raise
+
+        self.managers[address] = manager
+        self._reconnecting_addresses.discard(address)
+        state.is_connected = True
+        state.add_log("已重新連線")
+        if not self.active_address:
+            self.active_address = address
+        if self.active_address == address:
+            self.state = state
+        self._refresh_device_tabs()
+        self.refresh_pages()
 
     @pyqtSlot(str, str, bytes)
     def _handle_notify(self, address: str, uuid: str, data: bytes) -> None:
@@ -531,6 +679,9 @@ class MainWindow(QMainWindow):
         event = parse_notify_packet(data, uuid, state)
         if event is not None:
             self._handle_event(event, state)
+        # After parsing, if this packet carried data/limit (200B), see whether
+        # it satisfies a pending error dialog.
+        self._maybe_resolve_pending_error(address, state)
         logger = self.loggers.get(address)
         if logger is not None and logger.is_recording:
             logger.write_state(state)
@@ -543,7 +694,52 @@ class MainWindow(QMainWindow):
 
     def _handle_event(self, event: DataEvent, state: DeviceState | None = None) -> None:
         if event.kind == "error":
-            self._show_error_dialog(state or self.state)
+            self._schedule_error_dialog(state or self.state)
+
+    def _schedule_error_dialog(self, state: DeviceState) -> None:
+        """Defer the error dialog until the matching 200B brings data/limit.
+
+        20B packets carry only error_num; data/limit only arrive in 200B.
+        Showing the dialog the moment a 20B trips the error gives the user
+        a blank details section. Wait briefly so the BLE keeper / firmware
+        push fills in the values, then fall back to showing whatever we have.
+        """
+        address = state.device_address
+        code = state.error_num
+        if code == 0:
+            return
+        # If data/limit already present (e.g. 200B triggered the event), show
+        # immediately and skip the wait.
+        if state.error_data != 0 or state.error_limit != 0:
+            self._show_error_dialog(state)
+            return
+        self._pending_error_codes[address] = code
+        QTimer.singleShot(
+            self._error_dialog_max_wait_ms,
+            lambda: self._flush_pending_error(address),
+        )
+
+    def _maybe_resolve_pending_error(self, address: str, state: DeviceState) -> None:
+        pending_code = self._pending_error_codes.get(address)
+        if pending_code is None:
+            return
+        if state.error_num != pending_code:
+            # Error cleared or changed before data arrived — drop the pending one.
+            self._pending_error_codes.pop(address, None)
+            return
+        if state.error_data == 0 and state.error_limit == 0:
+            return
+        self._pending_error_codes.pop(address, None)
+        self._show_error_dialog(state)
+
+    def _flush_pending_error(self, address: str) -> None:
+        pending_code = self._pending_error_codes.pop(address, None)
+        if pending_code is None:
+            return
+        state = self.states.get(address)
+        if state is None or state.error_num != pending_code:
+            return
+        self._show_error_dialog(state)
 
     def _show_error_dialog(self, state: DeviceState) -> None:
         from ..protocol import error_description
@@ -551,6 +747,7 @@ class MainWindow(QMainWindow):
         code = state.error_num
         code_hex = f"0x{code:02X}"
         desc = error_description(code)
+        tokens = current_tokens()
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Icon.Warning)
         msg.setWindowTitle("錯誤通知")
@@ -558,25 +755,31 @@ class MainWindow(QMainWindow):
         device_line = ""
         if state.device_name or state.device_address:
             device_line = (
-                f"<div style='color:#666; font-size:11px;'>"
+                f"<div style='color:{tokens.text_muted}; font-size:11px;'>"
                 f"裝置:{state.device_name} ({state.device_address})</div>"
             )
         details = ""
         if state.error_data != 0 or state.error_limit != 0:
+            trigger = (
+                f"<div style='color:{tokens.text_secondary}; font-size:11px;'>"
+                f"觸發條件：讀取值 {state.error_data} &gt; 條件值 {state.error_limit}"
+                f"</div>"
+            )
             details = (
                 "<hr>"
-                "<div style='color:#555; font-size:11px;'>錯誤詳細資訊:</div>"
+                f"<div style='color:{tokens.text_secondary}; font-size:11px;'>錯誤詳細資訊：</div>"
                 "<table cellpadding='4'>"
-                f"<tr><td>條件值 (Error Data):</td>"
+                f"<tr><td>讀取值 (Error Data1):</td>"
                 f"<td align='right'><b>0x{state.error_data:X} ({state.error_data})</b></td></tr>"
-                f"<tr><td>限制值 (Error Limit):</td>"
+                f"<tr><td>條件值 (Error Data2):</td>"
                 f"<td align='right'><b>0x{state.error_limit:X} ({state.error_limit})</b></td></tr>"
                 "</table>"
+                f"{trigger}"
             )
         msg.setText(
-            f"<div style='background:#FDECEA; padding:8px; border-radius:6px;'>"
-            f"<span style='font-size:20px; font-weight:700; color:#C0392B; font-family:Consolas;'>{code_hex}</span>"
-            f"&nbsp;&nbsp;<span style='color:#C0392B; font-weight:600;'>{desc}</span>"
+            f"<div style='background:{tokens.error_bg}; padding:8px; border-radius:6px;'>"
+            f"<span style='font-size:20px; font-weight:700; color:{tokens.error_fg}; font-family:Consolas;'>{code_hex}</span>"
+            f"&nbsp;&nbsp;<span style='color:{tokens.error_fg}; font-weight:600;'>{desc}</span>"
             f"</div>"
             f"{device_line}"
             f"{details}"
@@ -604,6 +807,14 @@ class MainWindow(QMainWindow):
     def stop_csv_recording_all(self) -> None:
         for addr in list(self.loggers.keys()):
             self._stop_recording(addr)
+
+    def _open_log_folder(self) -> None:
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.warning(self, "開啟錄製資料夾失敗", str(exc))
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.log_dir)))
 
     def _start_recording(self, address: str) -> Path | None:
         state = self.states.get(address)
@@ -643,6 +854,8 @@ class MainWindow(QMainWindow):
                     "address": addr,
                     "name": state.device_name,
                     "device_number": "" if state.device_number is None else str(state.device_number),
+                    "connected": "1" if state.is_connected else "0",
+                    "reconnecting": "1" if addr in self._reconnecting_addresses else "0",
                     "recording": "1" if (logger is not None and logger.is_recording) else "0",
                     "packets": str(state.total_packet_count),
                 }
@@ -682,6 +895,9 @@ class MainWindow(QMainWindow):
 
         for logger in self.loggers.values():
             logger.stop()
+        for addr in list(self._reconnect_tasks):
+            self._cancel_reconnect(addr)
+        self._reconnecting_addresses.clear()
         super().closeEvent(event)
 
     async def _disconnect_then_close(self) -> None:

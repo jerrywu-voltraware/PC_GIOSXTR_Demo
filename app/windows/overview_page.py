@@ -5,6 +5,7 @@ from __future__ import annotations
 from PyQt6.QtWidgets import QGridLayout, QLabel, QVBoxLayout, QWidget
 
 from ..models import DeviceState
+from ..theme import ThemeTokens, current_tokens, theme_manager
 
 
 class OverviewPage(QWidget):
@@ -17,6 +18,7 @@ class OverviewPage(QWidget):
         self.grid = QGridLayout()
         root.addLayout(self.grid)
         self.labels: dict[str, QLabel] = {}
+        self._caption_labels: list[QLabel] = []
         fields = [
             ("Device", "device"),
             ("Connection", "connection"),
@@ -32,15 +34,26 @@ class OverviewPage(QWidget):
         for index, (caption, key) in enumerate(fields):
             row, col = divmod(index, 2)
             label = QLabel(caption)
-            label.setStyleSheet("font-weight: 700; color: #334;")
             value = QLabel("-")
-            value.setStyleSheet(
-                "font-size: 16px; padding: 10px; border: 1px solid #cfd6df; background: #f7f9fb;"
-            )
             self.grid.addWidget(label, row * 2, col)
             self.grid.addWidget(value, row * 2 + 1, col)
             self.labels[key] = value
+            self._caption_labels.append(label)
         root.addStretch(1)
+        self._apply_theme(current_tokens())
+        theme_manager().theme_changed.connect(self._apply_theme)
+
+    def _apply_theme(self, tokens: ThemeTokens) -> None:
+        for label in self._caption_labels:
+            label.setStyleSheet(f"font-weight: 700; color: {tokens.text_secondary};")
+        value_style = (
+            f"font-size: 16px; padding: 10px;"
+            f" border: 1px solid {tokens.card_border};"
+            f" background: {tokens.surface};"
+            f" color: {tokens.text_primary};"
+        )
+        for value in self.labels.values():
+            value.setStyleSheet(value_style)
 
     def set_csv_recording(self, is_recording: bool, path: str = "") -> None:
         self.labels["csv"].setText("Recording" if is_recording else "Stopped")

@@ -40,6 +40,45 @@ def test_recent_device_item_becomes_active_after_connect_without_scan_results():
     assert "#DDF7F4" in item_widget.styleSheet()
 
 
+def test_connected_device_list_marks_reconnecting_device():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.recent_devices import RecentDevice
+    from app.windows.scan_panel import ScanPanel
+
+    app = QApplication.instance() or QApplication([])
+    panel = ScanPanel(ble=object())
+    panel.set_recent_devices(
+        [
+            RecentDevice(
+                address="90:6C:0A:C9:96:00",
+                name="GIOS0403ST#4",
+                device_number=4,
+                rssi=-55,
+            )
+        ]
+    )
+
+    panel.refresh_connected_devices(
+        [
+            {
+                "address": "90:6C:0A:C9:96:00",
+                "name": "GIOS0403ST#4",
+                "device_number": "4",
+                "connected": "0",
+                "reconnecting": "1",
+                "recording": "0",
+                "packets": "12",
+            }
+        ],
+        "90:6C:0A:C9:96:00",
+    )
+
+    assert "重新連線中" in panel.connected_list.item(0).text()
+    assert "90:6C:0A:C9:96:00" in panel._reconnecting_addresses
+
+
 def test_scan_panel_adapter_unavailable_disables_scan_button():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication

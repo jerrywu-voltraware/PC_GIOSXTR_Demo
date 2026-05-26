@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -11,6 +12,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QRadioButton,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -18,17 +20,20 @@ from PyQt6.QtWidgets import (
 )
 
 from ..constants import APP_NAME, APP_VERSION
+from ..theme import THEME_DARK, THEME_LIGHT, theme_manager
 
 
 class SettingsDialog(QDialog):
     engineering_mode_changed = pyqtSignal(bool)
     demo_settings_changed = pyqtSignal(bool, int, int, str, object)
     check_updates_requested = pyqtSignal()
+    auto_reconnect_changed = pyqtSignal(bool)
 
     def __init__(
         self,
         *,
         engineering_mode: bool,
+        auto_reconnect_enabled: bool = False,
         demo_use_fake_data: bool = True,
         demo_device_name: str = "MMEU",
         demo_ebike_pct: int = 76,
@@ -47,6 +52,8 @@ class SettingsDialog(QDialog):
         root = QVBoxLayout(self)
         tabs = QTabWidget()
         tabs.addTab(self._about_tab(), "關於")
+        tabs.addTab(self._appearance_tab(), "外觀")
+        tabs.addTab(self._connection_tab(auto_reconnect_enabled), "連線")
         tabs.addTab(self._demo_tab(demo_use_fake_data, demo_device_name, demo_ebike_pct, demo_escooter_pct), "DEMO")
         tabs.addTab(self._engineering_tab(engineering_mode), "工程模式")
         root.addWidget(tabs)
@@ -76,6 +83,55 @@ class SettingsDialog(QDialog):
         self.update_check_button.setEnabled(not checking)
         self.update_check_button.setText("檢查中..." if checking else "檢查更新")
 
+    def _appearance_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+
+        current = theme_manager().name()
+        self.theme_light_radio = QRadioButton("亮色系 (Light)")
+        self.theme_dark_radio = QRadioButton("暗色系 (Dark)")
+        self.theme_light_radio.setChecked(current != THEME_DARK)
+        self.theme_dark_radio.setChecked(current == THEME_DARK)
+
+        self._theme_group = QButtonGroup(self)
+        self._theme_group.addButton(self.theme_light_radio)
+        self._theme_group.addButton(self.theme_dark_radio)
+        self.theme_light_radio.toggled.connect(self._on_theme_radio_toggled)
+        self.theme_dark_radio.toggled.connect(self._on_theme_radio_toggled)
+
+        layout.addWidget(self.theme_light_radio)
+        layout.addWidget(self.theme_dark_radio)
+
+        detail = QLabel("切換後立即套用，設定會自動記住，下次啟動時恢復。")
+        detail.setWordWrap(True)
+        layout.addWidget(detail)
+        layout.addStretch(1)
+        return page
+
+    def _connection_tab(self, auto_reconnect_enabled: bool) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+
+        self.auto_reconnect_box = QCheckBox("斷線後自動重新連線")
+        self.auto_reconnect_box.setChecked(auto_reconnect_enabled)
+        self.auto_reconnect_box.toggled.connect(self.auto_reconnect_changed.emit)
+        layout.addWidget(self.auto_reconnect_box)
+
+        detail = QLabel("僅在裝置意外斷線時啟動；使用者手動中斷連線時不會自動連回。")
+        detail.setWordWrap(True)
+        layout.addWidget(detail)
+        layout.addStretch(1)
+        return page
+
+    def _on_theme_radio_toggled(self, _checked: bool) -> None:
+        target = THEME_DARK if self.theme_dark_radio.isChecked() else THEME_LIGHT
+        if theme_manager().name() != target:
+            theme_manager().set_theme(target)
+
     def _engineering_tab(self, engineering_mode: bool) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -89,7 +145,6 @@ class SettingsDialog(QDialog):
 
         detail = QLabel("工程模式會顯示內部 DEMO 控制項，供開發與驗證使用。")
         detail.setWordWrap(True)
-        detail.setStyleSheet("color: #66757C;")
         layout.addWidget(detail)
         layout.addStretch(1)
         return page
@@ -127,7 +182,7 @@ class SettingsDialog(QDialog):
 
         if self.connected_demo_devices:
             section = QLabel("已連線裝置假資料")
-            section.setStyleSheet("font-weight: 800; color: #40545B; padding-top: 8px;")
+            section.setStyleSheet("font-weight: 800; padding-top: 8px;")
             layout.addRow("", section)
             for device in self.connected_demo_devices:
                 address = str(device.get("address", "")).strip()
@@ -148,7 +203,6 @@ class SettingsDialog(QDialog):
             "預設值會用於 DEMO 預覽；多裝置全螢幕模式會優先使用各已連線裝置的設定值。"
         )
         detail.setWordWrap(True)
-        detail.setStyleSheet("color: #66757C;")
         layout.addRow("", detail)
         return page
 

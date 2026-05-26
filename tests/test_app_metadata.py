@@ -9,8 +9,8 @@ def test_app_metadata_uses_requested_version_and_icon():
     icon_path = resource_path(APP_ICON_FILENAME)
 
     assert APP_NAME == "PC GIOSXTR Demo"
-    assert APP_VERSION == "V1.0.9"
-    assert APP_WINDOW_TITLE == "PC GIOSXTR Demo V1.0.9"
+    assert APP_VERSION == "V1.0.10"
+    assert APP_WINDOW_TITLE == "PC GIOSXTR Demo V1.0.10"
     assert APP_ICON_FILENAME == "1024.png"
     assert icon_path.exists()
 
@@ -38,13 +38,13 @@ def test_pyinstaller_spec_uses_versioned_exe_icon_and_version_info():
     assert 'collect_submodules("numpy._core")' in spec
     assert 'collect_submodules("winrt")' in spec
     assert '("1024.png", ".")' in spec
-    assert 'name="PC_GIOSXTR_Demo_V1.0.9"' in spec
+    assert 'name="PC_GIOSXTR_Demo_V1.0.10"' in spec
     assert 'icon="app_icon.ico"' in spec
     assert 'version="version_info.txt"' in spec
     assert Path("app_icon.ico").exists()
-    assert "filevers=(1, 0, 9, 0)" in version_info
-    assert "StringStruct('FileVersion', 'V1.0.9')" in version_info
-    assert "StringStruct('ProductVersion', 'V1.0.9')" in version_info
+    assert "filevers=(1, 0, 10, 0)" in version_info
+    assert "StringStruct('FileVersion', 'V1.0.10')" in version_info
+    assert "StringStruct('ProductVersion', 'V1.0.10')" in version_info
 
 
 def test_settings_dialog_exposes_manual_update_check_button():

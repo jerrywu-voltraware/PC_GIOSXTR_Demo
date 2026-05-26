@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 APP_NAME = "PC GIOSXTR Demo"
-APP_VERSION = "V1.0.9"
+APP_VERSION = "V1.0.10"
 APP_WINDOW_TITLE = f"{APP_NAME} {APP_VERSION}"
 APP_ICON_FILENAME = "1024.png"
-APP_EXECUTABLE_NAME = "PC_GIOSXTR_Demo_V1.0.9"
+APP_EXECUTABLE_NAME = "PC_GIOSXTR_Demo_V1.0.10"
 ENGINEERING_MODE_ENV = "PC_GIOSXTR_ENGINEERING"
 
 SUPPORTED_DEVICES = (
@@ -37,7 +37,7 @@ CSV_HEADER = (
     "T_bus",
     "T_amp",
     "T_IC",
-    "I1",
+    "V1",
     "I3",
     "I1I3_Deg",
     "DCDC_Duty",
@@ -65,7 +65,7 @@ SIGNAL_DEFINITIONS = (
     ("T_bus (C)", "busTempDegC"),
     ("T_amp (C)", "ampTempDegC"),
     ("T_IC (C)", "icTempDegC"),
-    ("V1 (V)", "v1Voltage"),
+    ("V1 (mV)", "v1Voltage"),
     ("I3 (mA)", "i3Current"),
     ("I1_Deg", "i1Deg"),
     ("I3_Deg", "i3Deg"),

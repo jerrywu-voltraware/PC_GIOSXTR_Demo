@@ -42,6 +42,7 @@ from PyQt6.QtWidgets import (
 
 from ..models import DeviceState
 from ..resources import resource_path
+from ..theme import ThemeTokens, current_tokens, theme_manager
 
 _LOGO_PATH = "assets/Logo2.png"
 
@@ -290,7 +291,7 @@ class _VehicleStage(QWidget):
             self._vehicle_rect = rect
         else:
             self._vehicle_rect = None
-            p.setPen(QPen(QColor("#E67E22"), 2))
+            p.setPen(QPen(QColor(current_tokens().warning), 2))
             p.setBrush(Qt.BrushStyle.NoBrush)
             font = QFont(p.font())
             font.setPointSize(16)
@@ -446,6 +447,7 @@ class _BatteryIcon(QWidget):
         super().__init__(parent)
         self.setFixedSize(40, 90)
         self._pct = 0
+        theme_manager().theme_changed.connect(lambda _t: self.update())
 
     def set_pct(self, pct: int) -> None:
         self._pct = max(0, min(100, pct))
@@ -460,11 +462,14 @@ class _BatteryIcon(QWidget):
         cap_h = 6
         cap_rect = QRectF((w - cap_w) / 2, 0, cap_w, cap_h)
         body_rect = QRectF(2, cap_h, w - 4, h - cap_h - 2)
-        p.setBrush(QBrush(QColor("#4C5A5D")))
+        tokens = current_tokens()
+        border_color = QColor(tokens.demo_status_text)
+        body_fill = QColor(tokens.surface)
+        p.setBrush(QBrush(border_color))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRoundedRect(cap_rect, 2, 2)
-        p.setBrush(QBrush(QColor("#FFFFFF")))
-        p.setPen(QPen(QColor("#4C5A5D"), 2))
+        p.setBrush(QBrush(body_fill))
+        p.setPen(QPen(border_color, 2))
         p.drawRoundedRect(body_rect, 4, 4)
 
         inner = body_rect.adjusted(3, 3, -3, -3)
@@ -481,25 +486,57 @@ class _BatteryIcon(QWidget):
         p.drawRoundedRect(fill_rect, 3, 3)
 
 
+class _LogoLabel(QLabel):
+    """Logo with a theme-aware background plate.
+
+    The shipped logo PNG has a light background, so on dark themes a bare
+    image floats as a bright rectangle. Wrap it in a soft-tinted plate that
+    blends into dark surfaces and is invisible on light surfaces.
+    """
+
+    def __init__(self, *, height: int, parent=None) -> None:
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        pix = QPixmap(str(resource_path(_LOGO_PATH)))
+        self._has_pixmap = not pix.isNull()
+        if self._has_pixmap:
+            scaled = pix.scaledToHeight(height, Qt.TransformationMode.SmoothTransformation)
+            self.setPixmap(scaled)
+            # Reserve a bit of horizontal padding for the plate.
+            self.setFixedSize(scaled.size().width() + 16, scaled.size().height() + 8)
+            self.setContentsMargins(8, 4, 8, 4)
+        else:
+            self.setText("VOLTRAWARE")
+        self._apply_theme(current_tokens())
+        theme_manager().theme_changed.connect(self._apply_theme)
+
+    def _apply_theme(self, tokens: ThemeTokens) -> None:
+        if self._has_pixmap:
+            if tokens.name == "dark":
+                # Soft plate that matches the surrounding surface so the
+                # white-background PNG no longer floats on the dark canvas.
+                self.setStyleSheet(
+                    f"background: {tokens.surface_alt}; border-radius: 8px;"
+                )
+            else:
+                self.setStyleSheet("background: transparent;")
+        else:
+            self.setStyleSheet(
+                f"font-size: 22px; font-weight: 800; color: {tokens.accent};"
+            )
+
+
 def _make_logo_label(*, height: int) -> QLabel:
-    label = QLabel()
-    label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-    pix = QPixmap(str(resource_path(_LOGO_PATH)))
-    if not pix.isNull():
-        scaled = pix.scaledToHeight(height, Qt.TransformationMode.SmoothTransformation)
-        label.setPixmap(scaled)
-        label.setFixedSize(scaled.size())
-    else:
-        label.setText("VOLTRAWARE")
-        label.setStyleSheet("font-size: 22px; font-weight: 800; color: #1F77B4;")
-    return label
+    return _LogoLabel(height=height)
 
 
 class _ShowcaseDialog(QDialog):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("全螢幕模式")
-        self.setStyleSheet("background-color: #FBFCFD;")
+        self._tokens = current_tokens()
+        self.setStyleSheet(f"background-color: {self._tokens.surface_subtle};")
+        theme_manager().theme_changed.connect(self._on_theme_changed)
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 18, 18, 18)
         root.setSpacing(10)
@@ -520,11 +557,7 @@ class _ShowcaseDialog(QDialog):
         body_layout.setSpacing(24)
 
         self.panel = QFrame()
-        self._panel_style = (
-            "QFrame { background: rgba(255, 255, 255, 235); "
-            "border: 2px solid #DCEAE8; border-radius: 16px; }"
-        )
-        self._panel_empty_style = "QFrame { background: transparent; border: 0; }"
+        self._refresh_panel_styles()
         self.panel.setStyleSheet(self._panel_style)
         self.panel.setFixedSize(520, 190)
         panel_layout = QHBoxLayout(self.panel)
@@ -538,14 +571,11 @@ class _ShowcaseDialog(QDialog):
         self.panel_text_col = text_col
         text_col.setSpacing(8)
         self.device_label = QLabel("-")
-        self.device_label.setStyleSheet("font-size: 16px; color: #546E7A; font-weight: 800;")
         self.pct_label = QLabel("0%")
         self.pct_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.pct_label.setStyleSheet("font-size: 74px; font-weight: 800; color: #202124;")
         self.status_label = QLabel("Standby")
-        self.status_label.setStyleSheet("font-size: 20px; font-weight: 800; color: #4C5A5D;")
         self.detail_label = QLabel("Ready")
-        self.detail_label.setStyleSheet("font-size: 17px; color: #78909C; font-weight: 700;")
+        self._apply_label_theme(device_px=16, pct_px=74, status_px=20, detail_px=17)
         text_col.addWidget(self.device_label)
         text_col.addWidget(self.pct_label)
         text_col.addWidget(self.status_label)
@@ -590,12 +620,49 @@ class _ShowcaseDialog(QDialog):
         self.panel_layout.setSpacing(max(18, int(panel_w * 0.045)))
         self.panel_text_col.setSpacing(max(5, int(panel_h * 0.035)))
         self.battery_icon.setFixedSize(icon_w, icon_h)
-        self.device_label.setStyleSheet(f"font-size: {device_px}px; color: #546E7A; font-weight: 800;")
+        self._apply_label_theme(
+            device_px=device_px, pct_px=pct_px, status_px=status_px, detail_px=detail_px
+        )
         self.device_label.setMinimumHeight(int(device_px * 1.45))
-        self.pct_label.setStyleSheet(f"font-size: {pct_px}px; font-weight: 800; color: #202124;")
         self.pct_label.setMinimumHeight(int(pct_px * 1.55))
-        self.status_label.setStyleSheet(f"font-size: {status_px}px; font-weight: 800; color: #4C5A5D;")
-        self.detail_label.setStyleSheet(f"font-size: {detail_px}px; color: #78909C; font-weight: 700;")
+
+    def _refresh_panel_styles(self) -> None:
+        t = self._tokens
+        r, g, b, _ = QColor(t.surface).getRgb()
+        self._panel_style = (
+            f"QFrame {{ background: rgba({r}, {g}, {b}, 235); "
+            f"border: 2px solid {t.panel_border}; border-radius: 16px; }}"
+        )
+        self._panel_empty_style = "QFrame { background: transparent; border: 0; }"
+
+    def _apply_label_theme(
+        self,
+        *,
+        device_px: int,
+        pct_px: int,
+        status_px: int,
+        detail_px: int,
+    ) -> None:
+        t = self._tokens
+        self.device_label.setStyleSheet(
+            f"font-size: {device_px}px; color: {t.demo_device_text}; font-weight: 800;"
+        )
+        self.pct_label.setStyleSheet(
+            f"font-size: {pct_px}px; font-weight: 800; color: {t.demo_pct_text};"
+        )
+        self.status_label.setStyleSheet(
+            f"font-size: {status_px}px; font-weight: 800; color: {t.demo_status_text};"
+        )
+        self.detail_label.setStyleSheet(
+            f"font-size: {detail_px}px; color: {t.demo_detail_text}; font-weight: 700;"
+        )
+
+    def _on_theme_changed(self, tokens: ThemeTokens) -> None:
+        self._tokens = tokens
+        self.setStyleSheet(f"background-color: {tokens.surface_subtle};")
+        self._refresh_panel_styles()
+        self._resize_showcase_elements()
+        self.panel.setStyleSheet(self._panel_style)
 
     def apply_snapshot(
         self,
@@ -639,10 +706,8 @@ class _ShowcaseDialog(QDialog):
 class _ShowcaseTile(QFrame):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        self.setStyleSheet(
-            "QFrame { background: rgba(255, 255, 255, 210); "
-            "border: 1px solid #DCEAE8; border-radius: 12px; }"
-        )
+        self._tokens = current_tokens()
+        self._apply_frame_style()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
@@ -650,9 +715,9 @@ class _ShowcaseTile(QFrame):
         self.stage = _VehicleStage(showcase_mode=True)
         layout.addWidget(self.stage, 1)
 
-        panel = QFrame()
-        panel.setStyleSheet("QFrame { background: white; border: 1px solid #E8F1EF; border-radius: 8px; }")
-        panel_layout = QHBoxLayout(panel)
+        self._panel = QFrame()
+        self._apply_panel_style()
+        panel_layout = QHBoxLayout(self._panel)
         panel_layout.setContentsMargins(12, 8, 12, 8)
         panel_layout.setSpacing(12)
         self.battery_icon = _BatteryIcon()
@@ -662,15 +727,13 @@ class _ShowcaseTile(QFrame):
         text_col = QVBoxLayout()
         text_col.setSpacing(3)
         self.device_label = QLabel("-")
-        self.device_label.setStyleSheet("font-size: 17px; color: #546E7A; font-weight: 800;")
         self.pct_label = QLabel("0%")
         self.pct_label.setMinimumHeight(52)
         self.pct_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.pct_label.setStyleSheet("font-size: 42px; font-weight: 800; color: #202124;")
         self.status_label = QLabel("Standby")
-        self.status_label.setStyleSheet("font-size: 13px; font-weight: 800; color: #4C5A5D;")
         self.detail_label = QLabel("Ready")
-        self.detail_label.setStyleSheet("font-size: 12px; color: #78909C; font-weight: 700;")
+        self._apply_labels()
+        theme_manager().theme_changed.connect(self._on_theme_changed)
         for label in (self.device_label, self.status_label, self.detail_label):
             label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         text_col.addWidget(self.device_label)
@@ -678,7 +741,43 @@ class _ShowcaseTile(QFrame):
         text_col.addWidget(self.status_label)
         text_col.addWidget(self.detail_label)
         panel_layout.addLayout(text_col, 1)
-        layout.addWidget(panel)
+        layout.addWidget(self._panel)
+
+    def _apply_frame_style(self) -> None:
+        t = self._tokens
+        r, g, b, _ = QColor(t.surface).getRgb()
+        self.setStyleSheet(
+            f"QFrame {{ background: rgba({r}, {g}, {b}, 210);"
+            f" border: 1px solid {t.panel_border}; border-radius: 12px; }}"
+        )
+
+    def _apply_panel_style(self) -> None:
+        t = self._tokens
+        self._panel.setStyleSheet(
+            f"QFrame {{ background: {t.surface};"
+            f" border: 1px solid {t.panel_border}; border-radius: 8px; }}"
+        )
+
+    def _apply_labels(self) -> None:
+        t = self._tokens
+        self.device_label.setStyleSheet(
+            f"font-size: 17px; color: {t.demo_device_text}; font-weight: 800;"
+        )
+        self.pct_label.setStyleSheet(
+            f"font-size: 42px; font-weight: 800; color: {t.demo_pct_text};"
+        )
+        self.status_label.setStyleSheet(
+            f"font-size: 13px; font-weight: 800; color: {t.demo_status_text};"
+        )
+        self.detail_label.setStyleSheet(
+            f"font-size: 12px; color: {t.demo_detail_text}; font-weight: 700;"
+        )
+
+    def _on_theme_changed(self, tokens: ThemeTokens) -> None:
+        self._tokens = tokens
+        self._apply_frame_style()
+        self._apply_panel_style()
+        self._apply_labels()
 
     def apply_snapshot(
         self,
@@ -716,7 +815,10 @@ class _MultiShowcaseDialog(QDialog):
     def __init__(self, *, layout_mode: str, addresses: list[str], parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("全螢幕模式")
-        self.setStyleSheet("background-color: #FBFCFD;")
+        self._fillers: list[QLabel] = []
+        self._tokens = current_tokens()
+        self.setStyleSheet(f"background-color: {self._tokens.surface_subtle};")
+        theme_manager().theme_changed.connect(self._on_theme_changed)
         self.layout_mode = layout_mode
         self.addresses = addresses[:4]
         self.tiles: dict[str, _ShowcaseTile] = {}
@@ -769,8 +871,19 @@ class _MultiShowcaseDialog(QDialog):
         for index in range(shown, rows * cols):
             filler = QLabel("VOLTRAWARE")
             filler.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            filler.setStyleSheet("font-size: 26px; font-weight: 800; color: #D6E6E8;")
+            filler.setStyleSheet(
+                f"font-size: 26px; font-weight: 800; color: {self._tokens.demo_filler_text};"
+            )
             self.grid.addWidget(filler, index // cols, index % cols)
+            self._fillers.append(filler)
+
+    def _on_theme_changed(self, tokens: ThemeTokens) -> None:
+        self._tokens = tokens
+        self.setStyleSheet(f"background-color: {tokens.surface_subtle};")
+        for filler in self._fillers:
+            filler.setStyleSheet(
+                f"font-size: 26px; font-weight: 800; color: {tokens.demo_filler_text};"
+            )
 
     def apply_payloads(self, payloads: dict[str, dict[str, object]]) -> None:
         for address, tile in self.tiles.items():
@@ -791,7 +904,9 @@ class _ShowcaseChooserDialog(QDialog):
         root.setSpacing(10)
 
         title = QLabel("選擇要顯示的 PTU")
-        title.setStyleSheet("font-size: 15px; font-weight: 800; color: #102A33;")
+        title.setStyleSheet(
+            f"font-size: 15px; font-weight: 800; color: {current_tokens().text_primary};"
+        )
         root.addWidget(title)
 
         self.checks: dict[str, QCheckBox] = {}
@@ -811,7 +926,7 @@ class _ShowcaseChooserDialog(QDialog):
 
         hint = QLabel("第一版最多同時顯示 4 台。超過 4 台請先取消部分裝置。")
         hint.setWordWrap(True)
-        hint.setStyleSheet("color: #66757C;")
+        hint.setStyleSheet(f"color: {current_tokens().text_muted};")
         root.addWidget(hint)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
@@ -848,7 +963,8 @@ class Demo2Page(QWidget):
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self.setStyleSheet("background-color: #FBFCFD;")
+        self._tokens = current_tokens()
+        self.setStyleSheet(f"background-color: {self._tokens.surface_subtle};")
         self._engineering_mode_enabled = engineering_mode
         self._demo_use_fake_data = demo_use_fake_data
         self._demo_device_name = demo_device_name.strip() or "MMEU"
@@ -884,8 +1000,7 @@ class Demo2Page(QWidget):
         self._showcase_dialog: _ShowcaseDialog | _MultiShowcaseDialog | None = None
 
         self.panel = QFrame()
-        self._panel_style = "QFrame { background: white; border: 1px solid #E8F1EF; border-radius: 8px; }"
-        self._panel_empty_style = "QFrame { background: transparent; border: 0; }"
+        self._refresh_panel_styles()
         self.panel.setStyleSheet(self._panel_style)
         self.panel.setFixedHeight(156)
         panel_layout = QHBoxLayout(self.panel)
@@ -896,15 +1011,12 @@ class Demo2Page(QWidget):
         text_col = QVBoxLayout()
         self.device_label = QLabel("-")
         self.device_label.setMinimumHeight(24)
-        self.device_label.setStyleSheet("font-size: 16px; color: #546E7A; font-weight: 800;")
         self.pct_label = QLabel("0%")
         self.pct_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.pct_label.setMinimumHeight(60)
-        self.pct_label.setStyleSheet("font-size: 36px; font-weight: 800; color: #202124;")
         self.status_label = QLabel("Standby")
-        self.status_label.setStyleSheet("font-size: 12px; font-weight: 700; color: #4C5A5D;")
         self.detail_label = QLabel("Ready")
-        self.detail_label.setStyleSheet("font-size: 11px; color: #90A4AE; font-weight: 600;")
+        self._apply_labels_theme()
         text_col.addWidget(self.device_label)
         text_col.addWidget(self.pct_label)
         text_col.addWidget(self.status_label)
@@ -942,11 +1054,43 @@ class Demo2Page(QWidget):
         self.engineering_controls.setVisible(self._engineering_mode_enabled)
 
         self._restyle_eng_buttons()
+        theme_manager().theme_changed.connect(self._on_theme_changed)
 
         # Battery flash timer (1 Hz)
         self._flash_timer = QTimer(self)
         self._flash_timer.setInterval(1000)
         self._flash_timer.timeout.connect(self._toggle_flash)
+
+    def _refresh_panel_styles(self) -> None:
+        t = self._tokens
+        self._panel_style = (
+            f"QFrame {{ background: {t.surface};"
+            f" border: 1px solid {t.panel_border}; border-radius: 8px; }}"
+        )
+        self._panel_empty_style = "QFrame { background: transparent; border: 0; }"
+
+    def _apply_labels_theme(self) -> None:
+        t = self._tokens
+        self.device_label.setStyleSheet(
+            f"font-size: 16px; color: {t.demo_device_text}; font-weight: 800;"
+        )
+        self.pct_label.setStyleSheet(
+            f"font-size: 36px; font-weight: 800; color: {t.demo_pct_text};"
+        )
+        self.status_label.setStyleSheet(
+            f"font-size: 12px; font-weight: 700; color: {t.demo_status_text};"
+        )
+        self.detail_label.setStyleSheet(
+            f"font-size: 11px; color: {t.demo_detail_text}; font-weight: 600;"
+        )
+
+    def _on_theme_changed(self, tokens: ThemeTokens) -> None:
+        self._tokens = tokens
+        self.setStyleSheet(f"background-color: {tokens.surface_subtle};")
+        self._refresh_panel_styles()
+        self.panel.setStyleSheet(self._panel_style)
+        self._apply_labels_theme()
+        self._restyle_eng_buttons()
 
     def _set_eng_mode(self, mode: EngMode) -> None:
         if not self._engineering_mode_enabled and mode != EngMode.NONE:
@@ -1029,13 +1173,17 @@ class Demo2Page(QWidget):
         return entries
 
     def _restyle_eng_buttons(self) -> None:
+        t = self._tokens
         for btn in self._eng_buttons.values():
             sel = btn.isChecked()
+            bg = t.demo_eng_selected_bg if sel else t.demo_eng_unselected_bg
+            fg = t.demo_eng_selected_text if sel else t.demo_eng_unselected_text
+            border = t.demo_eng_selected_bg if sel else t.demo_eng_border
             btn.setStyleSheet(
                 "QPushButton {"
-                f" background: {'#546E7A' if sel else 'white'};"
-                f" color: {'white' if sel else '#37474F'};"
-                f" border: 1px solid {'#546E7A' if sel else '#CFD8DC'};"
+                f" background: {bg};"
+                f" color: {fg};"
+                f" border: 1px solid {border};"
                 " border-radius: 6px; padding: 6px 10px;"
                 " font-size: 11px; font-weight: 600;"
                 "}"

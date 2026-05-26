@@ -29,3 +29,6 @@ logs/
 # OS
 Thumbs.db
 .DS_Store
+
+# External reference (Flutter mobile app source kept locally for porting)
+Flutter_Gios040xst_Eng/

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
@@ -14,6 +15,7 @@ from PyQt6.QtWidgets import (
 )
 
 from ..models import DeviceState
+from ..theme import ThemeTokens, current_tokens, theme_manager
 
 
 class DataTablePage(QWidget):
@@ -21,9 +23,8 @@ class DataTablePage(QWidget):
         super().__init__(parent)
         self.title = title
         root = QVBoxLayout(self)
-        label = QLabel(title)
-        label.setStyleSheet("font-size: 18px; font-weight: 700;")
-        root.addWidget(label)
+        self._title_label = QLabel(title)
+        root.addWidget(self._title_label)
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["Field", "Value"])
         self.table.verticalHeader().setVisible(False)
@@ -31,15 +32,52 @@ class DataTablePage(QWidget):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         root.addWidget(self.table, 1)
+        self._last_rows: list[tuple[str, str]] = []
+        self._apply_theme(current_tokens())
+        theme_manager().theme_changed.connect(self._on_theme_changed)
+
+    def _apply_theme(self, tokens: ThemeTokens) -> None:
+        self._tokens = tokens
+        self._title_label.setStyleSheet(
+            f"font-size: 18px; font-weight: 700; color: {tokens.text_primary};"
+        )
+        self.table.setStyleSheet(
+            f"""
+            QTableWidget {{
+                background: {tokens.table_bg};
+                alternate-background-color: {tokens.table_alt};
+                border: 1px solid {tokens.card_border};
+                gridline-color: {tokens.table_grid};
+                color: {tokens.text_primary};
+            }}
+            QHeaderView::section {{
+                background: {tokens.table_header_bg};
+                border: 0;
+                border-bottom: 1px solid {tokens.table_grid};
+                padding: 6px;
+                font-weight: 800;
+                color: {tokens.text_secondary};
+            }}
+            """
+        )
+
+    def _on_theme_changed(self, tokens: ThemeTokens) -> None:
+        self._apply_theme(tokens)
+        if self._last_rows:
+            self.set_rows(self._last_rows)
 
     def set_rows(self, rows: list[tuple[str, str]]) -> None:
+        self._last_rows = list(rows)
+        field_brush = QBrush(QColor(self._tokens.accent))
+        value_brush = QBrush(QColor(self._tokens.text_primary))
         self.table.setRowCount(len(rows))
         for row, (field, value) in enumerate(rows):
             for col, text in enumerate((field, value)):
                 item = QTableWidgetItem(text)
                 if col == 0:
-                    item.setForeground(Qt.GlobalColor.darkBlue)
-                if col == 1:
+                    item.setForeground(field_brush)
+                else:
+                    item.setForeground(value_brush)
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.table.setItem(row, col, item)
 

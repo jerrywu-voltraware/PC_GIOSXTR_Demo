@@ -212,6 +212,10 @@ class BleManager:
         self._notified: set[str] = set()
         self.write_200b_uuid: str | None = None
         self.iot_write_uuid: str | None = None
+        # Loop monotonic timestamp of the most recent 200B notification.
+        # None means "no 200B received yet since this manager connected".
+        self._last_200b_at: float | None = None
+        self._keeper_task: asyncio.Task[None] | None = None
 
     @staticmethod
     async def scan(timeout: float = 5.0, supported_only: bool = True) -> list[DeviceScanResult]:
@@ -267,6 +271,7 @@ class BleManager:
         await self.client.connect()
         self.write_200b_uuid = None
         self.iot_write_uuid = None
+        self._last_200b_at = None
         await self._cache_write_characteristics()
 
     async def _cache_write_characteristics(self) -> None:
@@ -283,6 +288,7 @@ class BleManager:
 
     def _on_disconnected(self, _client: BleakClient) -> None:
         self._notified.clear()
+        self.stop_200b_keeper()
         if self._disconnect_callback is not None:
             self._disconnect_callback(self.address)
 
@@ -297,6 +303,7 @@ class BleManager:
         return self.client is not None and self.client.is_connected
 
     async def disconnect(self) -> None:
+        self.stop_200b_keeper()
         if self.client is not None and self.client.is_connected:
             try:
                 for uuid in list(self._notified):
@@ -340,19 +347,70 @@ class BleManager:
             return
 
         def handler(sender: Any, data: bytearray) -> None:
-            sender_uuid = getattr(sender, "uuid", uuid_l)
+            sender_uuid = str(getattr(sender, "uuid", uuid_l)).lower()
+            if sender_uuid == UUID_NOTIFY_200B:
+                try:
+                    self._last_200b_at = asyncio.get_running_loop().time()
+                except RuntimeError:
+                    pass
             if self._notify_callback is not None:
-                self._notify_callback(self.address, str(sender_uuid).lower(), bytes(data))
+                self._notify_callback(self.address, sender_uuid, bytes(data))
 
         await self.client.start_notify(uuid_l, handler)
         self._notified.add(uuid_l)
 
     async def enable_default_notifications(self) -> None:
-        for uuid in (UUID_IOT_NOTIFY, UUID_NOTIFY_20B, UUID_NOTIFY_200B):
+        # Skip UUID_NOTIFY_20B on purpose (mirrors the Flutter iOS strategy).
+        # With three notify streams writing the same DeviceState fields under
+        # three different unit/width conventions (notably ptu_bus_voltage:
+        # IOT=raw u16, 20B=raw u16 * 10, 200B=u32 mV), the last writer wins
+        # and values jitter visibly. Subscribing only to IOT + 200B keeps a
+        # single high-fidelity source for everything 200B carries and avoids
+        # the race entirely; the 200B keeper guarantees 200B keeps flowing.
+        for uuid in (UUID_IOT_NOTIFY, UUID_NOTIFY_200B):
             try:
                 await self.enable_notify(uuid)
             except Exception:
                 continue
+
+    def start_200b_keeper(self, *, interval: float = 2.0, stale_after: float = 3.0) -> None:
+        """Background poker that re-requests 200B when the firmware stops sending.
+
+        Mirrors the Flutter iOS strategy: every `interval` seconds, if more than
+        `stale_after` seconds have passed since the last 200B notification, send
+        0xA2 again. This guarantees error_data / error_limit stay populated when
+        the firmware otherwise sends only 20B packets.
+        """
+        if self._keeper_task is not None and not self._keeper_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._keeper_task = loop.create_task(self._run_200b_keeper(interval, stale_after))
+
+    def stop_200b_keeper(self) -> None:
+        task = self._keeper_task
+        self._keeper_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _run_200b_keeper(self, interval: float, stale_after: float) -> None:
+        try:
+            while self.is_connected:
+                await asyncio.sleep(interval)
+                if not self.is_connected:
+                    break
+                now = asyncio.get_running_loop().time()
+                last = self._last_200b_at
+                if last is None or (now - last) > stale_after:
+                    try:
+                        await self.request_200b()
+                    except Exception:
+                        # Non-fatal: firmware/connection issue, try again next tick.
+                        continue
+        except asyncio.CancelledError:
+            pass
 
     def services_text(self) -> str:
         if self.client is None:

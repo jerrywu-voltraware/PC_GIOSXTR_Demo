@@ -162,6 +162,128 @@ def test_main_window_device_tabs_hide_for_single_ptu_after_disconnect():
     window.close()
 
 
+def test_unexpected_disconnect_keeps_state_and_schedules_reconnect(monkeypatch):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    state = DeviceState(is_connected=True, device_name="A", device_address="AA:BB", device_number=45)
+    window.states[state.device_address] = state
+    window.managers[state.device_address] = object()
+    window.active_address = state.device_address
+    window.state = state
+    window.set_auto_reconnect_enabled(True, persist=False)
+    scheduled = []
+    monkeypatch.setattr(window, "_schedule_reconnect", lambda address: scheduled.append(address))
+
+    window._handle_disconnect(state.device_address)
+
+    assert state.device_address in window.states
+    assert state.device_address not in window.managers
+    assert not state.is_connected
+    assert window.active_address == state.device_address
+    assert scheduled == [state.device_address]
+    summary = window._connected_summary()[0]
+    assert summary["connected"] == "0"
+    assert summary["reconnecting"] == "1"
+    window._close_after_disconnect = True
+    window.close()
+
+
+def test_manual_disconnect_removes_state_without_reconnect(monkeypatch):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import asyncio
+
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    class FakeManager:
+        async def disconnect(self):
+            return None
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    state = DeviceState(is_connected=True, device_name="A", device_address="AA:BB", device_number=45)
+    window.states[state.device_address] = state
+    window.managers[state.device_address] = FakeManager()
+    window.active_address = state.device_address
+    window.state = state
+    window.set_auto_reconnect_enabled(True, persist=False)
+    scheduled = []
+    monkeypatch.setattr(window, "_schedule_reconnect", lambda address: scheduled.append(address))
+
+    asyncio.run(window._disconnect_address(state.device_address))
+
+    assert state.device_address not in window.states
+    assert scheduled == []
+    window._close_after_disconnect = True
+    window.close()
+
+
+def test_reconnect_device_rebuilds_manager_and_notifications():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import asyncio
+
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    class FakeManager:
+        def __init__(self):
+            self.connected_address = ""
+            self.notifications_enabled = False
+            self.requested_200b = False
+            self.keeper_started = False
+            self.notify_callback = None
+            self.disconnect_callback = None
+
+        def set_notify_callback(self, callback):
+            self.notify_callback = callback
+
+        def set_disconnect_callback(self, callback):
+            self.disconnect_callback = callback
+
+        async def connect(self, address):
+            self.connected_address = address
+
+        async def enable_default_notifications(self):
+            self.notifications_enabled = True
+
+        async def request_200b(self):
+            self.requested_200b = True
+
+        def start_200b_keeper(self):
+            self.keeper_started = True
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    state = DeviceState(is_connected=False, device_name="A", device_address="AA:BB", device_number=45)
+    window.states[state.device_address] = state
+    window.active_address = state.device_address
+    window.state = state
+    fake = FakeManager()
+    window._create_ble_manager = lambda: fake
+
+    asyncio.run(window._reconnect_device(state.device_address))
+
+    assert window.managers[state.device_address] is fake
+    assert fake.connected_address == state.device_address
+    assert fake.notifications_enabled
+    assert fake.requested_200b
+    assert fake.keeper_started
+    assert state.is_connected
+    assert "已重新連線" in state.log_messages[0]
+    window._close_after_disconnect = True
+    window.close()
+
+
 def test_data_pages_do_not_show_group_column():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication
@@ -403,6 +525,23 @@ def test_settings_dialog_shows_version_and_engineering_toggle():
 
     assert APP_VERSION in labels
     assert dialog.engineering_box.isChecked()
+
+
+def test_settings_dialog_exposes_auto_reconnect_toggle():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.windows.settings_dialog import SettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(engineering_mode=False, auto_reconnect_enabled=True)
+    received = []
+    dialog.auto_reconnect_changed.connect(received.append)
+
+    assert dialog.auto_reconnect_box.isChecked()
+    dialog.auto_reconnect_box.setChecked(False)
+
+    assert received == [False]
 
 
 def test_settings_dialog_has_demo_defaults():
@@ -842,7 +981,16 @@ def test_main_window_error_event_uses_event_device_state(tmp_path):
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
     active = DeviceState(is_connected=True, device_name="Active", device_address="AA:BB")
-    other = DeviceState(is_connected=True, device_name="Other", device_address="CC:DD", error_num=0x11)
+    # error_data/limit populated so the dialog fires immediately rather than
+    # waiting for a 200B (deferred-dialog path is covered separately).
+    other = DeviceState(
+        is_connected=True,
+        device_name="Other",
+        device_address="CC:DD",
+        error_num=0x11,
+        error_data=15,
+        error_limit=10,
+    )
     window.states[active.device_address] = active
     window.states[other.device_address] = other
     window.active_address = active.device_address
@@ -853,6 +1001,73 @@ def test_main_window_error_event_uses_event_device_state(tmp_path):
     window._handle_event(DataEvent("error", "error", 0x11), other)
 
     assert shown == [other.device_address]
+    window.close()
+
+
+def test_main_window_defers_error_dialog_until_data_limit_arrive(tmp_path):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DataEvent, DeviceState
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    device = DeviceState(
+        is_connected=True,
+        device_name="Dev",
+        device_address="EE:FF",
+        error_num=0x11,
+    )
+    window.states[device.device_address] = device
+    shown: list[DeviceState] = []
+    window._show_error_dialog = lambda state: shown.append(state)
+
+    # 20B-style trigger: error_num set but data/limit still 0 -> dialog deferred.
+    window._handle_event(DataEvent("error", "err", 0x11), device)
+    assert shown == []
+    assert window._pending_error_codes.get(device.device_address) == 0x11
+
+    # 200B arrives later and populates data/limit -> resolves the pending dialog.
+    device.error_data = 25
+    device.error_limit = 10
+    window._maybe_resolve_pending_error(device.device_address, device)
+
+    assert len(shown) == 1
+    assert shown[0] is device
+    assert device.device_address not in window._pending_error_codes
+    window.close()
+
+
+def test_main_window_pending_error_cleared_when_error_resolves_before_data(tmp_path):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DataEvent, DeviceState
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    device = DeviceState(
+        is_connected=True,
+        device_name="Dev",
+        device_address="11:22",
+        error_num=0x11,
+    )
+    window.states[device.device_address] = device
+    shown: list[DeviceState] = []
+    window._show_error_dialog = lambda state: shown.append(state)
+
+    window._handle_event(DataEvent("error", "err", 0x11), device)
+    assert window._pending_error_codes.get(device.device_address) == 0x11
+
+    # Error cleared before data/limit ever showed up; no dialog should fire.
+    device.error_num = 0
+    window._maybe_resolve_pending_error(device.device_address, device)
+    window._flush_pending_error(device.device_address)
+
+    assert shown == []
+    assert device.device_address not in window._pending_error_codes
     window.close()
 
 

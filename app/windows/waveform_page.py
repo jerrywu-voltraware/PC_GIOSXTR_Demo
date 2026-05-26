@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 
 from ..constants import SIGNAL_DEFINITIONS
 from ..models import DeviceState
+from ..theme import ThemeTokens, current_tokens, theme_manager
 
 
 @dataclass
@@ -96,8 +97,12 @@ class WaveformPage(QWidget):
         root.addLayout(controls)
 
         self.notice = QLabel("波形即時顯示")
-        self.notice.setStyleSheet("color: #52616A;")
         root.addWidget(self.notice)
+        self._chart_cards: list[QWidget] = []
+        self._chart_titles: list[QLabel] = []
+        self._tokens: ThemeTokens = current_tokens()
+        self._apply_theme(self._tokens)
+        theme_manager().theme_changed.connect(self._on_theme_changed)
 
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -146,7 +151,7 @@ class WaveformPage(QWidget):
             return
         plot = pg.PlotWidget(title=label)
         plot.setMinimumHeight(230)
-        plot.setBackground("#081015")
+        self._style_plot(plot)
         plot.showGrid(x=True, y=True, alpha=0.28)
         plot.setLabel("bottom", "Sample")
         plot.setLabel("left", label)
@@ -154,36 +159,25 @@ class WaveformPage(QWidget):
         plot.setDownsampling(auto=True, mode="peak")
         plot.setClipToView(True)
         legend = plot.addLegend(offset=(12, 12))
-        legend.setBrush(pg.mkBrush(8, 16, 21, 190))
-        legend.setPen(pg.mkPen("#425866"))
-        plot.getAxis("bottom").setPen("#8EA2AD")
-        plot.getAxis("left").setPen("#8EA2AD")
-        plot.getAxis("bottom").setTextPen("#B9C7CE")
-        plot.getAxis("left").setTextPen("#B9C7CE")
+        self._style_legend(legend)
         stats_label = QLabel("latest --   min --   max --   samples 0")
         stats_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        stats_label.setStyleSheet("color: #52616A; font-family: Consolas;")
+        stats_label.setStyleSheet(f"color: {self._tokens.text_secondary}; font-family: Consolas;")
         save_btn = QPushButton("儲存圖片")
         item = ChartItem(label=label, field_name=field_name, plot=plot, stats_label=stats_label, save_button=save_btn)
         remove_btn = QPushButton("移除")
         reset_btn = QPushButton("重設")
         card = QWidget()
         card.setObjectName("waveformCard")
-        card.setStyleSheet(
-            """
-            QWidget#waveformCard {
-                background: #F5F7F8;
-                border: 1px solid #DCE5E9;
-                border-radius: 6px;
-            }
-            """
-        )
+        self._style_card(card)
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(10, 8, 10, 10)
         card_layout.setSpacing(8)
         top = QHBoxLayout()
         title = QLabel(label)
-        title.setStyleSheet("font-weight: 700; color: #1D3038;")
+        title.setStyleSheet(f"font-weight: 700; color: {self._tokens.text_primary};")
+        self._chart_cards.append(card)
+        self._chart_titles.append(title)
         top.addWidget(title)
         top.addWidget(stats_label, 1)
         top.addWidget(save_btn)
@@ -203,6 +197,11 @@ class WaveformPage(QWidget):
             self.charts.remove(item)
         card = item.plot.property("card")
         if card is not None:
+            if card in self._chart_cards:
+                idx = self._chart_cards.index(card)
+                self._chart_cards.pop(idx)
+                if idx < len(self._chart_titles):
+                    self._chart_titles.pop(idx)
             card.deleteLater()
 
     def reset_chart(self, item: ChartItem) -> None:
@@ -352,6 +351,56 @@ class WaveformPage(QWidget):
         max_samples = self._history_limit()
         left = max(0.0, right - max_samples + 1)
         item.plot.setXRange(left, max(right, left + 1), padding=0.01)
+
+    def _style_plot(self, plot: pg.PlotWidget) -> None:
+        t = self._tokens
+        plot.setBackground(t.plot_bg)
+        plot.getAxis("bottom").setPen(t.plot_axis)
+        plot.getAxis("left").setPen(t.plot_axis)
+        plot.getAxis("bottom").setTextPen(t.plot_axis_text)
+        plot.getAxis("left").setTextPen(t.plot_axis_text)
+
+    def _style_legend(self, legend) -> None:
+        t = self._tokens
+        bg = pg.mkColor(t.plot_bg)
+        bg.setAlpha(200)
+        legend.setBrush(pg.mkBrush(bg))
+        legend.setPen(pg.mkPen(t.plot_legend_pen))
+
+    def _style_card(self, card: QWidget) -> None:
+        t = self._tokens
+        card.setStyleSheet(
+            f"""
+            QWidget#waveformCard {{
+                background: {t.surface_alt};
+                border: 1px solid {t.card_border};
+                border-radius: 6px;
+            }}
+            """
+        )
+
+    def _apply_theme(self, tokens: ThemeTokens) -> None:
+        self._tokens = tokens
+        self.notice.setStyleSheet(f"color: {tokens.text_secondary};")
+
+    def _on_theme_changed(self, tokens: ThemeTokens) -> None:
+        self._apply_theme(tokens)
+        for card in self._chart_cards:
+            self._style_card(card)
+        for title in self._chart_titles:
+            title.setStyleSheet(f"font-weight: 700; color: {tokens.text_primary};")
+        for item in self.charts:
+            self._style_plot(item.plot)
+            # Recreate the legend so its colors update.
+            try:
+                legend = item.plot.plotItem.legend
+            except AttributeError:
+                legend = None
+            if legend is not None:
+                self._style_legend(legend)
+            item.stats_label.setStyleSheet(
+                f"color: {tokens.text_secondary}; font-family: Consolas;"
+            )
 
     def _update_stats(self, item: ChartItem, visible_series: list[DeviceSeries] | None = None) -> None:
         if visible_series is None:
