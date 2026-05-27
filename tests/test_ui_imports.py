@@ -1,3 +1,4 @@
+import math
 import os
 from pathlib import Path
 
@@ -1228,6 +1229,45 @@ def test_waveform_page_preserves_overlay_when_all_devices_disconnect():
     assert chart.series[second.device_address].curve.isVisible()
     assert "PTU #6" in chart.stats_label.text()
     assert "PTU #10" in chart.stats_label.text()
+
+
+def test_waveform_page_resumes_reconnected_device_at_latest_sample():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.waveform_page import WaveformPage
+
+    app = QApplication.instance() or QApplication([])
+    page = WaveformPage()
+    page.add_chart()
+    page.scope_combo.setCurrentIndex(page.scope_combo.findData("all"))
+    first = DeviceState(is_connected=True, device_name="PTU A", device_address="A", device_number=6, ptu_input_voltage=52000)
+    second = DeviceState(is_connected=True, device_name="PTU B", device_address="B", device_number=10, ptu_input_voltage=54000)
+    states = {first.device_address: first, second.device_address: second}
+    page.set_devices(states, first.device_address)
+    page.refresh_device(first, states, first.device_address)
+    page.refresh_device(second, states, first.device_address)
+
+    first.is_connected = False
+    states = {second.device_address: second}
+    page.set_devices(states, second.device_address)
+    for index in range(5):
+        second.ptu_input_voltage = 54001 + index
+        page.refresh_device(second, states, second.device_address)
+
+    first.is_connected = True
+    first.ptu_input_voltage = 53000
+    states = {first.device_address: first, second.device_address: second}
+    page.refresh_device(first, states, first.device_address)
+
+    chart = page.charts[0]
+    first_series = chart.series[first.device_address]
+    assert chart.series[second.device_address].x[-1] == 5.0
+    assert first_series.x == [0.0, 5.0, 6.0]
+    assert math.isnan(first_series.y[-2])
+    assert first_series.y[-1] == 53000.0
+    assert "samples 2" in chart.stats_label.text()
 
 
 def test_waveform_page_saves_chart_image_from_chart_button(monkeypatch, tmp_path):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 import pyqtgraph as pg
@@ -56,6 +57,9 @@ class WaveformPage(QWidget):
         self._states: dict[str, DeviceState] = {}
         self._active_address = ""
         self._held_addresses: set[str] = set()
+        self._connected_addresses: set[str] = set()
+        self._seen_addresses: set[str] = set()
+        self._resumed_addresses: set[str] = set()
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
@@ -125,6 +129,15 @@ class WaveformPage(QWidget):
         return name or state.device_address or "目前裝置"
 
     def set_devices(self, states: dict[str, DeviceState], active_address: str) -> None:
+        connected_addresses = {address for address, state in states.items() if state.is_connected}
+        resumed_addresses = {
+            address
+            for address in connected_addresses
+            if address in self._seen_addresses and address not in self._connected_addresses
+        }
+        self._resumed_addresses.update(resumed_addresses)
+        self._connected_addresses = connected_addresses
+        self._seen_addresses.update(connected_addresses)
         self._states = dict(states)
         self._active_address = active_address
         self._apply_device_filter()
@@ -268,8 +281,42 @@ class WaveformPage(QWidget):
         item.series[address] = series
         return series
 
-    def _append_sample(self, item: ChartItem, state: DeviceState, address: str) -> None:
+    @staticmethod
+    def _finite_values(values: list[float]) -> list[float]:
+        return [value for value in values if math.isfinite(value)]
+
+    def _latest_chart_x(self, item: ChartItem) -> float | None:
+        latest_values = [
+            x_value
+            for series in item.series.values()
+            for x_value in series.x
+            if math.isfinite(x_value)
+        ]
+        return max(latest_values) if latest_values else None
+
+    def _align_series_to_latest(self, item: ChartItem, series: DeviceSeries) -> None:
+        latest_x = self._latest_chart_x(item)
+        if latest_x is None:
+            return
+        target_index = int(latest_x) + 1
+        if target_index <= series.sample_index:
+            return
+        if series.x and target_index - 1 > series.x[-1]:
+            series.x.append(float(target_index - 1))
+            series.y.append(math.nan)
+        series.sample_index = target_index
+
+    def _append_sample(
+        self,
+        item: ChartItem,
+        state: DeviceState,
+        address: str,
+        *,
+        align_to_latest: bool = False,
+    ) -> None:
         series = self._ensure_series(item, state, address)
+        if align_to_latest:
+            self._align_series_to_latest(item, series)
         try:
             value = float(state.get_value(item.field_name))
         except ValueError:
@@ -301,8 +348,10 @@ class WaveformPage(QWidget):
         if not state.is_connected:
             return
         self.notice.setText("波形即時顯示")
+        align_to_latest = address in self._resumed_addresses
         for item in self.charts:
-            self._append_sample(item, state, address)
+            self._append_sample(item, state, address, align_to_latest=align_to_latest)
+        self._resumed_addresses.discard(address)
 
     def refresh(self, state: DeviceState) -> None:
         address = self._state_address(state)
@@ -407,15 +456,16 @@ class WaveformPage(QWidget):
             visible_series = [
                 series for address, series in item.series.items() if address in self._selected_addresses()
             ]
-        visible_with_data = [series for series in visible_series if series.y]
+        visible_with_data = [series for series in visible_series if self._finite_values(series.y)]
         if not visible_with_data:
             item.stats_label.setText("latest --   min --   max --   samples 0")
             return
         lines = []
         for series in visible_with_data:
-            latest = series.y[-1]
+            values = self._finite_values(series.y)
+            latest = values[-1]
             lines.append(
-                f"{series.label}: latest {latest:.2f}   min {min(series.y):.2f}   "
-                f"max {max(series.y):.2f}   samples {len(series.y)}"
+                f"{series.label}: latest {latest:.2f}   min {min(values):.2f}   "
+                f"max {max(values):.2f}   samples {len(values)}"
             )
         item.stats_label.setText("\n".join(lines))
