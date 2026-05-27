@@ -543,6 +543,7 @@ class _ShowcaseDialog(QDialog):
         top = QHBoxLayout()
         top.setSpacing(8)
         self.logo_label = _make_logo_label(height=64)
+        self.logo_label.setVisible(False)
         top.addWidget(self.logo_label, 0, Qt.AlignmentFlag.AlignLeft)
         top.addStretch(1)
         cancel_btn = QPushButton("Cancel")
@@ -829,6 +830,7 @@ class _MultiShowcaseDialog(QDialog):
 
         top = QHBoxLayout()
         self.logo_label = _make_logo_label(height=64)
+        self.logo_label.setVisible(False)
         top.addWidget(self.logo_label, 0, Qt.AlignmentFlag.AlignLeft)
         top.addStretch(1)
         cancel_btn = QPushButton("Cancel")
@@ -956,7 +958,7 @@ class Demo2Page(QWidget):
         *,
         engineering_mode: bool = False,
         demo_use_fake_data: bool = True,
-        demo_device_name: str = "MMEU",
+        demo_device_name: str = "Demo",
         demo_ebike_pct: int = 76,
         demo_escooter_pct: int = 81,
         demo_device_battery_pcts: dict[str, int] | None = None,
@@ -967,7 +969,7 @@ class Demo2Page(QWidget):
         self.setStyleSheet(f"background-color: {self._tokens.surface_subtle};")
         self._engineering_mode_enabled = engineering_mode
         self._demo_use_fake_data = demo_use_fake_data
-        self._demo_device_name = demo_device_name.strip() or "MMEU"
+        self._demo_device_name = demo_device_name.strip() or "Demo"
         self._demo_ebike_pct = self._clamp_pct(demo_ebike_pct)
         self._demo_escooter_pct = self._clamp_pct(demo_escooter_pct)
         self._demo_device_battery_pcts = self._clean_device_pcts(demo_device_battery_pcts or {})
@@ -985,6 +987,7 @@ class Demo2Page(QWidget):
         header = QHBoxLayout()
         header.setSpacing(8)
         self.logo_label = _make_logo_label(height=48)
+        self.logo_label.setVisible(False)
         header.addWidget(self.logo_label, 0, Qt.AlignmentFlag.AlignLeft)
         header.addStretch(1)
         self.showcase_btn = QToolButton()
@@ -1117,7 +1120,7 @@ class Demo2Page(QWidget):
         device_battery_pcts: dict[str, int] | None = None,
     ) -> None:
         self._demo_use_fake_data = use_fake_data
-        self._demo_device_name = device_name.strip() or "MMEU"
+        self._demo_device_name = device_name.strip() or "Demo"
         self._demo_ebike_pct = self._clamp_pct(ebike_pct)
         self._demo_escooter_pct = self._clamp_pct(escooter_pct)
         if device_battery_pcts is not None:

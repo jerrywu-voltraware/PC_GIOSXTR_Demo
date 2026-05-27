@@ -35,7 +35,7 @@ class SettingsDialog(QDialog):
         engineering_mode: bool,
         auto_reconnect_enabled: bool = False,
         demo_use_fake_data: bool = True,
-        demo_device_name: str = "MMEU",
+        demo_device_name: str = "Demo",
         demo_ebike_pct: int = 76,
         demo_escooter_pct: int = 81,
         demo_device_battery_pcts: dict[str, int] | None = None,
@@ -162,7 +162,7 @@ class SettingsDialog(QDialog):
 
         self.demo_device_name_edit = QLineEdit()
         self.demo_device_name_edit.setText(device_name)
-        self.demo_device_name_edit.setPlaceholderText("MMEU")
+        self.demo_device_name_edit.setPlaceholderText("Demo")
         self.demo_device_name_edit.textChanged.connect(self._emit_demo_settings)
         layout.addRow("DEMO 裝置名稱", self.demo_device_name_edit)
 
@@ -214,6 +214,6 @@ class SettingsDialog(QDialog):
             self.demo_fake_data_box.isChecked(),
             self.demo_ebike_spin.value(),
             self.demo_escooter_spin.value(),
-            self.demo_device_name_edit.text().strip() or "MMEU",
+            self.demo_device_name_edit.text().strip() or "Demo",
             self._device_battery_pcts(),
         )

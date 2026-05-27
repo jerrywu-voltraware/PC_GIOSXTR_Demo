@@ -29,10 +29,10 @@ from ..models import DataEvent, DeviceState
 from ..protocol import parse_notify_packet
 from ..recent_devices import RecentDevice, RecentDeviceStore
 from ..resources import resource_path
-from ..theme import current_tokens
 from ..updater import UpdateAsset, UpdateCheckResult, UpdateStatus, check_for_update, download_asset
 from .data_pages import PruPage, PtuPage
 from .demo2_page import Demo2Page
+from .error_log_dialog import ErrorLogDialog
 from .error_page import ErrorPage
 from .log_page import LogPage
 from .number_page import NumberPage
@@ -86,8 +86,8 @@ class MainWindow(QMainWindow):
         self.recent_device_store = RecentDeviceStore()
         self._close_after_disconnect = False
         self.engineering_mode = engineering_mode
-        self.demo_use_fake_data = True
-        self.demo_device_name = "MMEU"
+        self.demo_use_fake_data = False
+        self.demo_device_name = "Demo"
         self.demo_ebike_pct = 76
         self.demo_escooter_pct = 81
         self.demo_device_battery_pcts: dict[str, int] = {}
@@ -107,6 +107,7 @@ class MainWindow(QMainWindow):
         # arrives with non-zero data/limit, or by a 2s fallback timer.
         self._pending_error_codes: dict[str, int] = {}
         self._error_dialog_max_wait_ms = 2000
+        self._error_log_dialog: ErrorLogDialog | None = None
 
         self.notify_received.connect(self._handle_notify)
         self.disconnected.connect(self._handle_disconnect)
@@ -220,7 +221,7 @@ class MainWindow(QMainWindow):
         device_battery_pcts: dict[str, int] | None = None,
     ) -> None:
         self.demo_use_fake_data = use_fake_data
-        self.demo_device_name = device_name.strip() or "MMEU"
+        self.demo_device_name = device_name.strip() or "Demo"
         self.demo_ebike_pct = ebike_pct
         self.demo_escooter_pct = escooter_pct
         if device_battery_pcts is not None:
@@ -741,51 +742,14 @@ class MainWindow(QMainWindow):
             return
         self._show_error_dialog(state)
 
-    def _show_error_dialog(self, state: DeviceState) -> None:
-        from ..protocol import error_description
+    def _ensure_error_log_dialog(self) -> ErrorLogDialog:
+        if self._error_log_dialog is None:
+            self._error_log_dialog = ErrorLogDialog(self)
+        return self._error_log_dialog
 
-        code = state.error_num
-        code_hex = f"0x{code:02X}"
-        desc = error_description(code)
-        tokens = current_tokens()
-        msg = QMessageBox(self)
-        msg.setIcon(QMessageBox.Icon.Warning)
-        msg.setWindowTitle("錯誤通知")
-        msg.setTextFormat(Qt.TextFormat.RichText)
-        device_line = ""
-        if state.device_name or state.device_address:
-            device_line = (
-                f"<div style='color:{tokens.text_muted}; font-size:11px;'>"
-                f"裝置:{state.device_name} ({state.device_address})</div>"
-            )
-        details = ""
-        if state.error_data != 0 or state.error_limit != 0:
-            trigger = (
-                f"<div style='color:{tokens.text_secondary}; font-size:11px;'>"
-                f"觸發條件：讀取值 {state.error_data} &gt; 條件值 {state.error_limit}"
-                f"</div>"
-            )
-            details = (
-                "<hr>"
-                f"<div style='color:{tokens.text_secondary}; font-size:11px;'>錯誤詳細資訊：</div>"
-                "<table cellpadding='4'>"
-                f"<tr><td>讀取值 (Error Data1):</td>"
-                f"<td align='right'><b>0x{state.error_data:X} ({state.error_data})</b></td></tr>"
-                f"<tr><td>條件值 (Error Data2):</td>"
-                f"<td align='right'><b>0x{state.error_limit:X} ({state.error_limit})</b></td></tr>"
-                "</table>"
-                f"{trigger}"
-            )
-        msg.setText(
-            f"<div style='background:{tokens.error_bg}; padding:8px; border-radius:6px;'>"
-            f"<span style='font-size:20px; font-weight:700; color:{tokens.error_fg}; font-family:Consolas;'>{code_hex}</span>"
-            f"&nbsp;&nbsp;<span style='color:{tokens.error_fg}; font-weight:600;'>{desc}</span>"
-            f"</div>"
-            f"{device_line}"
-            f"{details}"
-        )
-        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
-        msg.exec()
+    def _show_error_dialog(self, state: DeviceState) -> None:
+        dialog = self._ensure_error_log_dialog()
+        dialog.append_error(state)
 
     def start_csv_recording_active(self) -> Path | None:
         addr = self.active_address
