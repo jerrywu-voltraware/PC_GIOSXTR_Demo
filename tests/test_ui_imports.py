@@ -1311,6 +1311,38 @@ def test_waveform_page_reset_chart_clears_markers():
     assert chart.markers == []
 
 
+def test_waveform_page_crosshair_reports_nearest_sample_value():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.waveform_page import WaveformPage
+
+    app = QApplication.instance() or QApplication([])
+    page = WaveformPage()
+    page.add_chart()
+    state = DeviceState(is_connected=True, device_name="PTU A", device_address="A", device_number=6)
+    for value in (100, 200, 300):
+        state.ptu_input_voltage = value
+        page.refresh_device(state, {state.device_address: state}, state.device_address)
+
+    chart = page.charts[0]
+    page.crosshair_box.setChecked(True)
+    page._broadcast_crosshair(chart, 1.6, 250.0)
+
+    assert chart.vline is not None and chart.vline.isVisible()
+    assert chart.hline is not None and chart.hline.isVisible()
+    assert chart.cursor_label is not None
+    assert "Sample 1.6" in chart.cursor_label.text()
+    assert "PTU #6: 300.00" in chart.cursor_label.text()
+    assert "y=250.00" in chart.cursor_label.text()
+
+    page.crosshair_box.setChecked(False)
+
+    assert not chart.vline.isVisible()
+    assert not chart.hline.isVisible()
+
+
 def test_waveform_page_saves_chart_image_from_chart_button(monkeypatch, tmp_path):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication

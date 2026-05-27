@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import math
 from dataclasses import dataclass, field
 
@@ -59,6 +60,10 @@ class ChartItem:
     x: list[float] = field(default_factory=list)
     y: list[float] = field(default_factory=list)
     markers: list[WaveformMarker] = field(default_factory=list)
+    cursor_label: QLabel | None = None
+    vline: pg.InfiniteLine | None = None
+    hline: pg.InfiniteLine | None = None
+    mouse_proxy: object | None = None
 
 
 class WaveformPage(QWidget):
@@ -88,6 +93,8 @@ class WaveformPage(QWidget):
         self.add_btn = QPushButton("新增曲線")
         self.add_btn.clicked.connect(self.add_chart)
         self.pause_box = QCheckBox("暫停")
+        self.crosshair_box = QCheckBox("十字準線")
+        self.crosshair_box.toggled.connect(self._on_crosshair_toggled)
         self.history_combo = QComboBox()
         for label, value in (
             ("500 samples", 500),
@@ -107,6 +114,7 @@ class WaveformPage(QWidget):
         controls.addWidget(self.signal_combo, 1)
         controls.addWidget(self.add_btn)
         controls.addWidget(self.pause_box)
+        controls.addWidget(self.crosshair_box)
         controls.addWidget(QLabel("歷史"))
         controls.addWidget(self.history_combo)
         controls.addWidget(self.reset_btn)
@@ -180,6 +188,7 @@ class WaveformPage(QWidget):
         plot.showGrid(x=True, y=True, alpha=0.28)
         plot.setLabel("bottom", "Sample")
         plot.setLabel("left", label)
+        plot.getAxis("left").setWidth(72)
         plot.setMouseEnabled(x=True, y=True)
         plot.setDownsampling(auto=True, mode="peak")
         plot.setClipToView(True)
@@ -188,8 +197,13 @@ class WaveformPage(QWidget):
         stats_label = QLabel("latest --   min --   max --   samples 0")
         stats_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         stats_label.setStyleSheet(f"color: {self._tokens.text_secondary}; font-family: Consolas;")
+        cursor_label = QLabel("游標 --")
+        cursor_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        cursor_label.setStyleSheet(f"color: {self._tokens.text_secondary}; font-family: Consolas;")
+        cursor_label.setVisible(self.crosshair_box.isChecked())
         save_btn = QPushButton("儲存圖片")
         item = ChartItem(label=label, field_name=field_name, plot=plot, stats_label=stats_label, save_button=save_btn)
+        item.cursor_label = cursor_label
         remove_btn = QPushButton("移除")
         reset_btn = QPushButton("重設")
         clear_markers_btn = QPushButton("清除標籤")
@@ -205,6 +219,7 @@ class WaveformPage(QWidget):
         self._chart_cards.append(card)
         self._chart_titles.append(title)
         top.addWidget(title)
+        top.addWidget(cursor_label, 1)
         top.addWidget(stats_label, 1)
         top.addWidget(save_btn)
         top.addWidget(reset_btn)
@@ -219,10 +234,20 @@ class WaveformPage(QWidget):
         clear_markers_btn.clicked.connect(lambda: self.clear_markers(item))
         save_btn.clicked.connect(lambda: self.save_chart_image(item))
         plot.scene().sigMouseClicked.connect(lambda event, chart=item: self._handle_plot_click(chart, event))
+        self._install_crosshair(item)
         self.charts.append(item)
 
     def remove_chart(self, item: ChartItem) -> None:
         self.clear_markers(item)
+        for graphics_item in (item.vline, item.hline):
+            if graphics_item is not None:
+                try:
+                    item.plot.removeItem(graphics_item)
+                except Exception:
+                    pass
+        item.vline = None
+        item.hline = None
+        item.mouse_proxy = None
         if item in self.charts:
             self.charts.remove(item)
         card = item.plot.property("card")
@@ -248,6 +273,113 @@ class WaveformPage(QWidget):
     def reset_all(self) -> None:
         for item in self.charts:
             self.reset_chart(item)
+
+    def _install_crosshair(self, item: ChartItem) -> None:
+        pen = pg.mkPen(self._tokens.plot_axis_text, width=1, style=Qt.PenStyle.DashLine)
+        vline = pg.InfiniteLine(angle=90, movable=False, pen=pen)
+        hline = pg.InfiniteLine(angle=0, movable=False, pen=pen)
+        vline.setZValue(15)
+        hline.setZValue(15)
+        visible = self.crosshair_box.isChecked()
+        vline.setVisible(False)
+        hline.setVisible(False)
+        item.plot.addItem(vline, ignoreBounds=True)
+        item.plot.addItem(hline, ignoreBounds=True)
+        item.vline = vline
+        item.hline = hline
+        if item.cursor_label is not None:
+            item.cursor_label.setVisible(visible)
+        item.mouse_proxy = pg.SignalProxy(
+            item.plot.scene().sigMouseMoved,
+            rateLimit=60,
+            slot=lambda event, chart=item: self._on_crosshair_mouse_moved(chart, event),
+        )
+
+    def _on_crosshair_toggled(self, enabled: bool) -> None:
+        for item in self.charts:
+            if item.cursor_label is not None:
+                item.cursor_label.setVisible(enabled)
+            if not enabled:
+                if item.vline is not None:
+                    item.vline.setVisible(False)
+                if item.hline is not None:
+                    item.hline.setVisible(False)
+                if item.cursor_label is not None:
+                    item.cursor_label.setText("游標 --")
+
+    def _on_crosshair_mouse_moved(self, item: ChartItem, event) -> None:
+        if not self.crosshair_box.isChecked():
+            return
+        if not event:
+            return
+        scene_pos = event[0]
+        view_box = item.plot.plotItem.vb
+        if not view_box.sceneBoundingRect().contains(scene_pos):
+            self._hide_all_crosshairs()
+            return
+        point = view_box.mapSceneToView(scene_pos)
+        x_value = float(point.x())
+        y_value = float(point.y())
+        self._broadcast_crosshair(item, x_value, y_value)
+
+    def _hide_all_crosshairs(self) -> None:
+        for chart in self.charts:
+            if chart.vline is not None:
+                chart.vline.setVisible(False)
+            if chart.hline is not None:
+                chart.hline.setVisible(False)
+            if chart.cursor_label is not None:
+                chart.cursor_label.setText("游標 --")
+
+    def _broadcast_crosshair(self, source: ChartItem, x_value: float, y_value: float) -> None:
+        selected_addresses = self._selected_addresses()
+        source_latest = self._latest_chart_x(source)
+        offset_from_right = (source_latest - x_value) if source_latest is not None else 0.0
+        for chart in self.charts:
+            is_source = chart is source
+            if is_source:
+                target_x = x_value
+            else:
+                chart_latest = self._latest_chart_x(chart)
+                target_x = (chart_latest - offset_from_right) if chart_latest is not None else x_value
+            if chart.vline is not None:
+                chart.vline.setPos(target_x)
+                chart.vline.setVisible(True)
+            if chart.hline is not None:
+                if is_source:
+                    chart.hline.setPos(y_value)
+                    chart.hline.setVisible(True)
+                else:
+                    chart.hline.setVisible(False)
+            if chart.cursor_label is None:
+                continue
+            visible_series = [
+                series
+                for address, series in chart.series.items()
+                if address in selected_addresses and series.x
+            ]
+            parts = [f"Sample {target_x:.1f}"]
+            for series in visible_series:
+                yv = self._sample_value_at(series, target_x)
+                if yv is None or not math.isfinite(yv):
+                    parts.append(f"{series.label}: --")
+                else:
+                    parts.append(f"{series.label}: {yv:.2f}")
+            if is_source:
+                parts.append(f"y={y_value:.2f}")
+            chart.cursor_label.setText("   ".join(parts))
+
+    @staticmethod
+    def _sample_value_at(series: DeviceSeries, x_value: float) -> float | None:
+        if not series.x:
+            return None
+        idx = bisect.bisect_left(series.x, x_value)
+        if idx >= len(series.x):
+            idx = len(series.x) - 1
+        elif idx > 0:
+            if abs(series.x[idx - 1] - x_value) <= abs(series.x[idx] - x_value):
+                idx -= 1
+        return series.y[idx]
 
     def _handle_plot_click(self, item: ChartItem, event) -> None:
         is_double_click = getattr(event, "double", lambda: False)()
@@ -531,6 +663,15 @@ class WaveformPage(QWidget):
             item.stats_label.setStyleSheet(
                 f"color: {tokens.text_secondary}; font-family: Consolas;"
             )
+            if item.cursor_label is not None:
+                item.cursor_label.setStyleSheet(
+                    f"color: {tokens.text_secondary}; font-family: Consolas;"
+                )
+            crosshair_pen = pg.mkPen(tokens.plot_axis_text, width=1, style=Qt.PenStyle.DashLine)
+            if item.vline is not None:
+                item.vline.setPen(crosshair_pen)
+            if item.hline is not None:
+                item.hline.setPen(crosshair_pen)
 
     def _update_stats(self, item: ChartItem, visible_series: list[DeviceSeries] | None = None) -> None:
         if visible_series is None:

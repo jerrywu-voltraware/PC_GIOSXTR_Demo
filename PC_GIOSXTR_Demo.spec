@@ -83,7 +83,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name="PC_GIOSXTR_Demo_V1.0.13",
+    name="PC_GIOSXTR_Demo_V1.0.14",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
