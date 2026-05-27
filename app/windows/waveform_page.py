@@ -13,7 +13,9 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -37,6 +39,15 @@ class DeviceSeries:
 
 
 @dataclass
+class WaveformMarker:
+    x: float
+    y: float
+    text: str
+    line: pg.InfiniteLine
+    label: pg.TextItem
+
+
+@dataclass
 class ChartItem:
     label: str
     field_name: str
@@ -47,6 +58,7 @@ class ChartItem:
     curve: pg.PlotDataItem | None = None
     x: list[float] = field(default_factory=list)
     y: list[float] = field(default_factory=list)
+    markers: list[WaveformMarker] = field(default_factory=list)
 
 
 class WaveformPage(QWidget):
@@ -180,6 +192,7 @@ class WaveformPage(QWidget):
         item = ChartItem(label=label, field_name=field_name, plot=plot, stats_label=stats_label, save_button=save_btn)
         remove_btn = QPushButton("移除")
         reset_btn = QPushButton("重設")
+        clear_markers_btn = QPushButton("清除標籤")
         card = QWidget()
         card.setObjectName("waveformCard")
         self._style_card(card)
@@ -195,6 +208,7 @@ class WaveformPage(QWidget):
         top.addWidget(stats_label, 1)
         top.addWidget(save_btn)
         top.addWidget(reset_btn)
+        top.addWidget(clear_markers_btn)
         top.addWidget(remove_btn)
         card_layout.addLayout(top)
         card_layout.addWidget(plot)
@@ -202,10 +216,13 @@ class WaveformPage(QWidget):
         item.plot.setProperty("card", card)
         remove_btn.clicked.connect(lambda: self.remove_chart(item))
         reset_btn.clicked.connect(lambda: self.reset_chart(item))
+        clear_markers_btn.clicked.connect(lambda: self.clear_markers(item))
         save_btn.clicked.connect(lambda: self.save_chart_image(item))
+        plot.scene().sigMouseClicked.connect(lambda event, chart=item: self._handle_plot_click(chart, event))
         self.charts.append(item)
 
     def remove_chart(self, item: ChartItem) -> None:
+        self.clear_markers(item)
         if item in self.charts:
             self.charts.remove(item)
         card = item.plot.property("card")
@@ -223,6 +240,7 @@ class WaveformPage(QWidget):
             series.y.clear()
             series.sample_index = 0
             series.curve.setData([], [])
+        self.clear_markers(item)
         item.x = []
         item.y = []
         item.stats_label.setText("latest --   min --   max --   samples 0")
@@ -230,6 +248,69 @@ class WaveformPage(QWidget):
     def reset_all(self) -> None:
         for item in self.charts:
             self.reset_chart(item)
+
+    def _handle_plot_click(self, item: ChartItem, event) -> None:
+        is_double_click = getattr(event, "double", lambda: False)()
+        if not is_double_click:
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        view_box = item.plot.plotItem.vb
+        scene_pos = event.scenePos()
+        if not view_box.sceneBoundingRect().contains(scene_pos):
+            return
+        point = view_box.mapSceneToView(scene_pos)
+        x_value = float(point.x())
+        y_value = float(point.y())
+        default_text = f"標記 {len(item.markers) + 1}"
+        text, accepted = QInputDialog.getText(
+            self,
+            "新增波形標籤",
+            "標籤內容",
+            QLineEdit.EchoMode.Normal,
+            default_text,
+        )
+        if not accepted or not text.strip():
+            return
+        self.add_marker(item, x_value, y_value, text.strip())
+        event.accept()
+
+    def add_marker(self, item: ChartItem, x_value: float, y_value: float, text: str) -> WaveformMarker:
+        y_min, y_max = item.plot.plotItem.vb.viewRange()[1]
+        y_top = y_min + (y_max - y_min) * 0.93
+        if not math.isfinite(y_value):
+            y_value = y_top
+        else:
+            y_value = min(max(y_value, y_min), y_top)
+        display_text = f"{text}\nSample {x_value:.0f}"
+        marker_color = "#FFEA00"
+        marker_pen = pg.mkPen(marker_color, width=2.2, style=Qt.PenStyle.DashLine)
+        line = pg.InfiniteLine(pos=x_value, angle=90, movable=False, pen=marker_pen)
+        line.setZValue(20)
+        label = pg.TextItem(
+            text=display_text,
+            color="#FFFFFF",
+            anchor=(0, 1),
+            fill=pg.mkBrush(0, 0, 0, 245),
+            border=pg.mkPen(marker_color, width=2),
+        )
+        label.setFont(pg.Qt.QtGui.QFont("Consolas", 10, 700))
+        label.setPos(x_value, y_value)
+        label.setZValue(21)
+        item.plot.addItem(line, ignoreBounds=True)
+        item.plot.addItem(label, ignoreBounds=True)
+        marker = WaveformMarker(x=x_value, y=y_value, text=text, line=line, label=label)
+        item.markers.append(marker)
+        return marker
+
+    def clear_markers(self, item: ChartItem) -> None:
+        for marker in item.markers:
+            for graphics_item in (marker.line, marker.label):
+                try:
+                    item.plot.removeItem(graphics_item)
+                except Exception:
+                    pass
+        item.markers.clear()
 
     def _apply_history_window(self) -> None:
         max_samples = self._history_limit()

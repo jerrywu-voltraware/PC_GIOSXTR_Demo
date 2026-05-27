@@ -1270,6 +1270,47 @@ def test_waveform_page_resumes_reconnected_device_at_latest_sample():
     assert "samples 2" in chart.stats_label.text()
 
 
+def test_waveform_page_can_add_and_clear_markers():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.windows.waveform_page import WaveformPage
+
+    app = QApplication.instance() or QApplication([])
+    page = WaveformPage()
+    page.add_chart()
+    chart = page.charts[0]
+
+    first = page.add_marker(chart, 12.4, 53000.0, "開始測試")
+    second = page.add_marker(chart, 24.0, 53500.0, "切換狀態")
+
+    assert chart.markers == [first, second]
+    assert first.text == "開始測試"
+    assert "Sample 12" in first.label.toPlainText()
+    assert "Sample 24" in second.label.toPlainText()
+
+    page.clear_markers(chart)
+
+    assert chart.markers == []
+
+
+def test_waveform_page_reset_chart_clears_markers():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.windows.waveform_page import WaveformPage
+
+    app = QApplication.instance() or QApplication([])
+    page = WaveformPage()
+    page.add_chart()
+    chart = page.charts[0]
+    page.add_marker(chart, 10.0, 1.0, "note")
+
+    page.reset_chart(chart)
+
+    assert chart.markers == []
+
+
 def test_waveform_page_saves_chart_image_from_chart_button(monkeypatch, tmp_path):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication
