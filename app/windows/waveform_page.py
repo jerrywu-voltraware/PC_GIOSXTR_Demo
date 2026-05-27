@@ -12,7 +12,11 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -64,6 +68,16 @@ class ChartItem:
     vline: pg.InfiniteLine | None = None
     hline: pg.InfiniteLine | None = None
     mouse_proxy: object | None = None
+    a_line: pg.InfiniteLine | None = None
+    b_line: pg.InfiniteLine | None = None
+    a_label: pg.TextItem | None = None
+    b_label: pg.TextItem | None = None
+    a_x: float | None = None
+    b_x: float | None = None
+    a_dots: dict[str, pg.ScatterPlotItem] = field(default_factory=dict)
+    b_dots: dict[str, pg.ScatterPlotItem] = field(default_factory=dict)
+    delta_links: dict[str, pg.PlotDataItem] = field(default_factory=dict)
+    last_mouse_x: float | None = None
 
 
 class WaveformPage(QWidget):
@@ -95,6 +109,27 @@ class WaveformPage(QWidget):
         self.pause_box = QCheckBox("暫停")
         self.crosshair_box = QCheckBox("十字準線")
         self.crosshair_box.toggled.connect(self._on_crosshair_toggled)
+        self.delta_box = QCheckBox("Δ 游標 (A/B)")
+        self.delta_box.toggled.connect(self._on_delta_toggled)
+        self.delta_clear_btn = QPushButton("清除 A/B")
+        self.delta_clear_btn.setEnabled(False)
+        self.delta_clear_btn.clicked.connect(self._clear_delta)
+        self.delta_highlight_box = QCheckBox("醒目顯示 Δ")
+        self.delta_highlight_box.setChecked(True)
+        self.delta_highlight_box.toggled.connect(self._refresh_all_delta_labels)
+        self.delta_percent_box = QCheckBox("顯示百分比")
+        self.delta_percent_box.setChecked(True)
+        self.delta_percent_box.toggled.connect(self._refresh_all_delta_labels)
+        self.delta_visual_box = QCheckBox("Δ 視覺輔助")
+        self.delta_visual_box.setChecked(True)
+        self.delta_visual_box.toggled.connect(self._on_delta_visual_toggled)
+        self.delta_preview_box = QCheckBox("即時預覽 vs A")
+        self.delta_preview_box.setChecked(True)
+        self.delta_preview_box.toggled.connect(self._refresh_all_delta_labels)
+        self._delta_pending: str = "A"
+        self._delta_a_color = "#FFEA00"
+        self._delta_b_color = "#29D398"
+        self._delta_aux_color = "#B084F5"
         self.history_combo = QComboBox()
         for label, value in (
             ("500 samples", 500),
@@ -115,6 +150,13 @@ class WaveformPage(QWidget):
         controls.addWidget(self.add_btn)
         controls.addWidget(self.pause_box)
         controls.addWidget(self.crosshair_box)
+        controls.addWidget(self.delta_box)
+        controls.addWidget(self.delta_clear_btn)
+        self.settings_btn = QPushButton("波形設定⚙")
+        self.settings_btn.setToolTip("Δ 游標顯示與量測選項")
+        self.settings_btn.clicked.connect(self._open_settings_dialog)
+        self._settings_dialog: QDialog | None = None
+        controls.addWidget(self.settings_btn)
         controls.addWidget(QLabel("歷史"))
         controls.addWidget(self.history_combo)
         controls.addWidget(self.reset_btn)
@@ -200,7 +242,7 @@ class WaveformPage(QWidget):
         cursor_label = QLabel("游標 --")
         cursor_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         cursor_label.setStyleSheet(f"color: {self._tokens.text_secondary}; font-family: Consolas;")
-        cursor_label.setVisible(self.crosshair_box.isChecked())
+        cursor_label.setVisible(self.crosshair_box.isChecked() or self.delta_box.isChecked())
         save_btn = QPushButton("儲存圖片")
         item = ChartItem(label=label, field_name=field_name, plot=plot, stats_label=stats_label, save_button=save_btn)
         item.cursor_label = cursor_label
@@ -235,11 +277,13 @@ class WaveformPage(QWidget):
         save_btn.clicked.connect(lambda: self.save_chart_image(item))
         plot.scene().sigMouseClicked.connect(lambda event, chart=item: self._handle_plot_click(chart, event))
         self._install_crosshair(item)
+        self._install_delta_lines(item)
         self.charts.append(item)
 
     def remove_chart(self, item: ChartItem) -> None:
         self.clear_markers(item)
-        for graphics_item in (item.vline, item.hline):
+        self._clear_delta_visuals(item)
+        for graphics_item in (item.vline, item.hline, item.a_line, item.b_line, item.a_label, item.b_label):
             if graphics_item is not None:
                 try:
                     item.plot.removeItem(graphics_item)
@@ -247,6 +291,12 @@ class WaveformPage(QWidget):
                     pass
         item.vline = None
         item.hline = None
+        item.a_line = None
+        item.b_line = None
+        item.a_label = None
+        item.b_label = None
+        item.a_x = None
+        item.b_x = None
         item.mouse_proxy = None
         if item in self.charts:
             self.charts.remove(item)
@@ -274,6 +324,49 @@ class WaveformPage(QWidget):
         for item in self.charts:
             self.reset_chart(item)
 
+    def _open_settings_dialog(self) -> None:
+        dialog = self._settings_dialog
+        if dialog is not None and dialog.isVisible():
+            dialog.raise_()
+            dialog.activateWindow()
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("波形設定")
+        dialog.setModal(False)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        delta_group = QGroupBox("Δ 游標顯示")
+        delta_layout = QVBoxLayout(delta_group)
+        delta_layout.setSpacing(6)
+        for box in (
+            self.delta_highlight_box,
+            self.delta_percent_box,
+            self.delta_visual_box,
+            self.delta_preview_box,
+        ):
+            delta_layout.addWidget(box)
+        hint = QLabel(
+            "提示：「即時預覽 vs A」只在「已放下 A、尚未放下 B」時顯示。\n"
+            "已放下 B 之後會改顯示固定的 Δ 行；按「清除 A/B」可重新試。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {self._tokens.text_secondary};")
+        delta_layout.addWidget(hint)
+        layout.addWidget(delta_group)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.close)
+        buttons.accepted.connect(dialog.close)
+        for button in buttons.buttons():
+            button.setText("關閉")
+        layout.addWidget(buttons)
+
+        dialog.setMinimumWidth(320)
+        self._settings_dialog = dialog
+        dialog.show()
+
     def _install_crosshair(self, item: ChartItem) -> None:
         pen = pg.mkPen(self._tokens.plot_axis_text, width=1, style=Qt.PenStyle.DashLine)
         vline = pg.InfiniteLine(angle=90, movable=False, pen=pen)
@@ -295,20 +388,338 @@ class WaveformPage(QWidget):
             slot=lambda event, chart=item: self._on_crosshair_mouse_moved(chart, event),
         )
 
+    def _install_delta_lines(self, item: ChartItem) -> None:
+        a_pen = pg.mkPen(self._delta_a_color, width=2, style=Qt.PenStyle.SolidLine)
+        b_pen = pg.mkPen(self._delta_b_color, width=2, style=Qt.PenStyle.SolidLine)
+        a_line = pg.InfiniteLine(angle=90, movable=False, pen=a_pen)
+        b_line = pg.InfiniteLine(angle=90, movable=False, pen=b_pen)
+        a_line.setZValue(18)
+        b_line.setZValue(18)
+        a_line.setVisible(False)
+        b_line.setVisible(False)
+        a_label = pg.TextItem(
+            text="A",
+            color="#000000",
+            anchor=(0.5, 1),
+            fill=pg.mkBrush(self._delta_a_color),
+        )
+        b_label = pg.TextItem(
+            text="B",
+            color="#000000",
+            anchor=(0.5, 1),
+            fill=pg.mkBrush(self._delta_b_color),
+        )
+        a_label.setFont(pg.Qt.QtGui.QFont("Consolas", 10, 700))
+        b_label.setFont(pg.Qt.QtGui.QFont("Consolas", 10, 700))
+        a_label.setZValue(19)
+        b_label.setZValue(19)
+        a_label.setVisible(False)
+        b_label.setVisible(False)
+        item.plot.addItem(a_line, ignoreBounds=True)
+        item.plot.addItem(b_line, ignoreBounds=True)
+        item.plot.addItem(a_label, ignoreBounds=True)
+        item.plot.addItem(b_label, ignoreBounds=True)
+        item.a_line = a_line
+        item.b_line = b_line
+        item.a_label = a_label
+        item.b_label = b_label
+
+    def _on_delta_toggled(self, enabled: bool) -> None:
+        self.delta_clear_btn.setEnabled(enabled)
+        cursor_visible = enabled or self.crosshair_box.isChecked()
+        for chart in self.charts:
+            self._set_delta_visible(chart, enabled)
+            if chart.cursor_label is not None:
+                chart.cursor_label.setVisible(cursor_visible)
+        if enabled:
+            self._refresh_all_delta_labels()
+        else:
+            for chart in self.charts:
+                if chart.cursor_label is not None and not self.crosshair_box.isChecked():
+                    chart.cursor_label.setText("游標 --")
+
+    def _on_delta_visual_toggled(self, _enabled: bool) -> None:
+        self._refresh_all_delta_labels()
+
+    def _set_delta_visible(self, chart: ChartItem, enabled: bool) -> None:
+        show_a = enabled and chart.a_x is not None
+        show_b = enabled and chart.b_x is not None
+        if chart.a_line is not None:
+            chart.a_line.setVisible(show_a)
+        if chart.b_line is not None:
+            chart.b_line.setVisible(show_b)
+        if chart.a_label is not None:
+            chart.a_label.setVisible(show_a)
+        if chart.b_label is not None:
+            chart.b_label.setVisible(show_b)
+
+    def _clear_delta(self) -> None:
+        for chart in self.charts:
+            chart.a_x = None
+            chart.b_x = None
+            self._set_delta_visible(chart, False)
+            self._clear_delta_visuals(chart)
+        self._delta_pending = "A"
+        self._refresh_all_delta_labels()
+
+    def _place_delta_cursor(self, source: ChartItem, x_value: float) -> None:
+        source_latest = self._latest_chart_x(source)
+        offset_from_right = (source_latest - x_value) if source_latest is not None else 0.0
+        slot = self._delta_pending
+        for chart in self.charts:
+            if chart is source:
+                target_x = x_value
+            else:
+                chart_latest = self._latest_chart_x(chart)
+                target_x = (chart_latest - offset_from_right) if chart_latest is not None else x_value
+            if slot == "A":
+                chart.a_x = target_x
+                if chart.a_line is not None:
+                    chart.a_line.setPos(target_x)
+            else:
+                chart.b_x = target_x
+                if chart.b_line is not None:
+                    chart.b_line.setPos(target_x)
+        self._delta_pending = "B" if slot == "A" else "A"
+        self._refresh_all_delta_labels()
+
+    def _refresh_all_delta_labels(self) -> None:
+        if not self.delta_box.isChecked():
+            return
+        for chart in self.charts:
+            self._set_delta_visible(chart, True)
+            self._update_delta_labels_for(chart)
+            self._render_chart_delta_text(chart)
+
+    def _update_delta_labels_for(self, chart: ChartItem) -> None:
+        y_min, y_max = chart.plot.plotItem.vb.viewRange()[1]
+        y_top = y_min + (y_max - y_min) * 0.97
+        if chart.a_label is not None and chart.a_x is not None:
+            chart.a_label.setPos(chart.a_x, y_top)
+        if chart.b_label is not None and chart.b_x is not None:
+            chart.b_label.setPos(chart.b_x, y_top)
+
+    @staticmethod
+    def _format_delta_pct(base: float, delta: float) -> str:
+        if not math.isfinite(base) or abs(base) < 1e-9:
+            return ""
+        return f" ({delta / base * 100:+.1f}%)"
+
+    def _render_chart_delta_text(self, chart: ChartItem) -> None:
+        if chart.cursor_label is None:
+            return
+        selected_addresses = self._selected_addresses()
+        visible_series = [
+            series
+            for address, series in chart.series.items()
+            if address in selected_addresses and series.x
+        ]
+        if chart.a_x is None and chart.b_x is None:
+            chart.cursor_label.setText("Δ: 點擊圖上設定 A，再點擊設定 B")
+            self._clear_delta_visuals(chart)
+            return
+        show_pct = self.delta_percent_box.isChecked()
+        highlight = self.delta_highlight_box.isChecked()
+        preview = self.delta_preview_box.isChecked()
+        lines: list[str] = []
+        a_values: dict[str, float] = {}
+        b_values: dict[str, float] = {}
+        if chart.a_x is not None:
+            parts = [f"A Sample {chart.a_x:.1f}"]
+            for series in visible_series:
+                yv = self._sample_value_at(series, chart.a_x)
+                if yv is None or not math.isfinite(yv):
+                    parts.append(f"{series.label}: --")
+                else:
+                    a_values[series.address] = yv
+                    parts.append(f"{series.label}: {yv:.2f}")
+            lines.append("   ".join(parts))
+        if chart.b_x is not None:
+            parts = [f"B Sample {chart.b_x:.1f}"]
+            for series in visible_series:
+                yv = self._sample_value_at(series, chart.b_x)
+                if yv is None or not math.isfinite(yv):
+                    parts.append(f"{series.label}: --")
+                else:
+                    b_values[series.address] = yv
+                    parts.append(f"{series.label}: {yv:.2f}")
+            lines.append("   ".join(parts))
+        if chart.a_x is not None and chart.b_x is not None:
+            dx = chart.b_x - chart.a_x
+            parts = [f"Δ Sample {dx:+.1f}"]
+            for series in visible_series:
+                ay = a_values.get(series.address)
+                by = b_values.get(series.address)
+                if ay is None or by is None:
+                    parts.append(f"Δ{series.label}: --")
+                else:
+                    dy = by - ay
+                    suffix = self._format_delta_pct(ay, dy) if show_pct else ""
+                    parts.append(f"Δ{series.label}: {dy:+.2f}{suffix}")
+            delta_line = "   ".join(parts)
+            if highlight:
+                delta_line = f"⟦ {delta_line} ⟧"
+            lines.append(delta_line)
+            if preview:
+                lines.append("（預覽：A/B 已放下，目前顯示固定 Δ；按「清除 A/B」可重設）")
+        elif chart.a_x is not None and preview and chart.last_mouse_x is not None:
+            mx = chart.last_mouse_x
+            parts = [f"vs A @Sample {mx:.1f}"]
+            for series in visible_series:
+                ay = a_values.get(series.address)
+                cy = self._sample_value_at(series, mx)
+                if ay is None or cy is None or not math.isfinite(cy):
+                    parts.append(f"Δ{series.label}: --")
+                else:
+                    dy = cy - ay
+                    suffix = self._format_delta_pct(ay, dy) if show_pct else ""
+                    parts.append(f"Δ{series.label}: {dy:+.2f}{suffix}")
+            preview_line = "   ".join(parts)
+            if highlight:
+                preview_line = f"⟦ {preview_line} ⟧"
+            lines.append(preview_line)
+            lines.append(f"(下一個點擊放 {self._delta_pending})")
+        else:
+            lines.append(f"(下一個點擊放 {self._delta_pending})")
+        chart.cursor_label.setText("\n".join(lines))
+        self._apply_delta_highlight_style(chart)
+        self._update_delta_visuals(chart, visible_series, a_values, b_values)
+
+    def _apply_delta_highlight_style(self, chart: ChartItem) -> None:
+        if chart.cursor_label is None:
+            return
+        if self.delta_box.isChecked() and self.delta_highlight_box.isChecked() and (
+            chart.a_x is not None or chart.b_x is not None
+        ):
+            chart.cursor_label.setStyleSheet(
+                f"color: {self._tokens.text_primary}; font-family: Consolas; "
+                f"font-weight: 700; font-size: 11pt; "
+                f"background: rgba(176,132,245,0.18); padding: 4px 6px; border-radius: 4px;"
+            )
+        else:
+            chart.cursor_label.setStyleSheet(
+                f"color: {self._tokens.text_secondary}; font-family: Consolas;"
+            )
+
+    def _clear_delta_visuals(self, chart: ChartItem) -> None:
+        for dot in list(chart.a_dots.values()) + list(chart.b_dots.values()):
+            try:
+                chart.plot.removeItem(dot)
+            except Exception:
+                pass
+        chart.a_dots.clear()
+        chart.b_dots.clear()
+        for link in chart.delta_links.values():
+            try:
+                chart.plot.removeItem(link)
+            except Exception:
+                pass
+        chart.delta_links.clear()
+
+    def _update_delta_visuals(
+        self,
+        chart: ChartItem,
+        visible_series: list[DeviceSeries],
+        a_values: dict[str, float],
+        b_values: dict[str, float],
+    ) -> None:
+        if not self.delta_box.isChecked() or not self.delta_visual_box.isChecked():
+            self._clear_delta_visuals(chart)
+            return
+        wanted_addresses = {series.address for series in visible_series}
+        for addr in list(chart.a_dots.keys()):
+            if addr not in wanted_addresses:
+                try:
+                    chart.plot.removeItem(chart.a_dots.pop(addr))
+                except Exception:
+                    chart.a_dots.pop(addr, None)
+        for addr in list(chart.b_dots.keys()):
+            if addr not in wanted_addresses:
+                try:
+                    chart.plot.removeItem(chart.b_dots.pop(addr))
+                except Exception:
+                    chart.b_dots.pop(addr, None)
+        for addr in list(chart.delta_links.keys()):
+            if addr not in wanted_addresses:
+                try:
+                    chart.plot.removeItem(chart.delta_links.pop(addr))
+                except Exception:
+                    chart.delta_links.pop(addr, None)
+        for series in visible_series:
+            addr = series.address
+            ay = a_values.get(addr)
+            by = b_values.get(addr)
+            if chart.a_x is not None and ay is not None and math.isfinite(ay):
+                dot = chart.a_dots.get(addr)
+                if dot is None:
+                    dot = pg.ScatterPlotItem(
+                        size=11,
+                        brush=pg.mkBrush(self._delta_a_color),
+                        pen=pg.mkPen("#000000", width=1),
+                    )
+                    dot.setZValue(17)
+                    chart.plot.addItem(dot, ignoreBounds=True)
+                    chart.a_dots[addr] = dot
+                dot.setData([chart.a_x], [ay])
+                dot.setVisible(True)
+            elif addr in chart.a_dots:
+                chart.a_dots[addr].setVisible(False)
+            if chart.b_x is not None and by is not None and math.isfinite(by):
+                dot = chart.b_dots.get(addr)
+                if dot is None:
+                    dot = pg.ScatterPlotItem(
+                        size=11,
+                        brush=pg.mkBrush(self._delta_b_color),
+                        pen=pg.mkPen("#000000", width=1),
+                    )
+                    dot.setZValue(17)
+                    chart.plot.addItem(dot, ignoreBounds=True)
+                    chart.b_dots[addr] = dot
+                dot.setData([chart.b_x], [by])
+                dot.setVisible(True)
+            elif addr in chart.b_dots:
+                chart.b_dots[addr].setVisible(False)
+            if (
+                chart.a_x is not None
+                and chart.b_x is not None
+                and ay is not None
+                and by is not None
+                and math.isfinite(ay)
+                and math.isfinite(by)
+            ):
+                link = chart.delta_links.get(addr)
+                if link is None:
+                    link = chart.plot.plot(
+                        [],
+                        [],
+                        pen=pg.mkPen(self._delta_aux_color, width=1.5, style=Qt.PenStyle.DashLine),
+                    )
+                    link.setZValue(16)
+                    chart.delta_links[addr] = link
+                link.setData([chart.a_x, chart.b_x], [ay, by])
+                link.setVisible(True)
+            elif addr in chart.delta_links:
+                chart.delta_links[addr].setVisible(False)
+
     def _on_crosshair_toggled(self, enabled: bool) -> None:
+        cursor_visible = enabled or self.delta_box.isChecked()
         for item in self.charts:
             if item.cursor_label is not None:
-                item.cursor_label.setVisible(enabled)
+                item.cursor_label.setVisible(cursor_visible)
             if not enabled:
                 if item.vline is not None:
                     item.vline.setVisible(False)
                 if item.hline is not None:
                     item.hline.setVisible(False)
-                if item.cursor_label is not None:
+                if item.cursor_label is not None and not self.delta_box.isChecked():
                     item.cursor_label.setText("游標 --")
+        if self.delta_box.isChecked():
+            self._refresh_all_delta_labels()
 
     def _on_crosshair_mouse_moved(self, item: ChartItem, event) -> None:
-        if not self.crosshair_box.isChecked():
+        crosshair_on = self.crosshair_box.isChecked()
+        delta_on = self.delta_box.isChecked()
+        if not crosshair_on and not delta_on:
             return
         if not event:
             return
@@ -320,15 +731,32 @@ class WaveformPage(QWidget):
         point = view_box.mapSceneToView(scene_pos)
         x_value = float(point.x())
         y_value = float(point.y())
-        self._broadcast_crosshair(item, x_value, y_value)
+        if crosshair_on:
+            self._broadcast_crosshair(item, x_value, y_value)
+        elif delta_on and self.delta_preview_box.isChecked():
+            source_latest = self._latest_chart_x(item)
+            offset_from_right = (source_latest - x_value) if source_latest is not None else 0.0
+            for chart in self.charts:
+                if chart is item:
+                    chart.last_mouse_x = x_value
+                else:
+                    chart_latest = self._latest_chart_x(chart)
+                    chart.last_mouse_x = (
+                        chart_latest - offset_from_right if chart_latest is not None else x_value
+                    )
+                self._render_chart_delta_text(chart)
 
     def _hide_all_crosshairs(self) -> None:
+        crosshair_on = self.crosshair_box.isChecked()
         for chart in self.charts:
             if chart.vline is not None:
                 chart.vline.setVisible(False)
             if chart.hline is not None:
                 chart.hline.setVisible(False)
-            if chart.cursor_label is not None:
+            chart.last_mouse_x = None
+            if not crosshair_on and self.delta_box.isChecked():
+                self._render_chart_delta_text(chart)
+            elif chart.cursor_label is not None and not self.delta_box.isChecked():
                 chart.cursor_label.setText("游標 --")
 
     def _broadcast_crosshair(self, source: ChartItem, x_value: float, y_value: float) -> None:
@@ -342,6 +770,7 @@ class WaveformPage(QWidget):
             else:
                 chart_latest = self._latest_chart_x(chart)
                 target_x = (chart_latest - offset_from_right) if chart_latest is not None else x_value
+            chart.last_mouse_x = target_x
             if chart.vline is not None:
                 chart.vline.setPos(target_x)
                 chart.vline.setVisible(True)
@@ -352,6 +781,9 @@ class WaveformPage(QWidget):
                 else:
                     chart.hline.setVisible(False)
             if chart.cursor_label is None:
+                continue
+            if self.delta_box.isChecked():
+                self._render_chart_delta_text(chart)
                 continue
             visible_series = [
                 series
@@ -383,13 +815,18 @@ class WaveformPage(QWidget):
 
     def _handle_plot_click(self, item: ChartItem, event) -> None:
         is_double_click = getattr(event, "double", lambda: False)()
-        if not is_double_click:
-            return
         if event.button() != Qt.MouseButton.LeftButton:
             return
         view_box = item.plot.plotItem.vb
         scene_pos = event.scenePos()
         if not view_box.sceneBoundingRect().contains(scene_pos):
+            return
+        if self.delta_box.isChecked() and not is_double_click:
+            point = view_box.mapSceneToView(scene_pos)
+            self._place_delta_cursor(item, float(point.x()))
+            event.accept()
+            return
+        if not is_double_click:
             return
         point = view_box.mapSceneToView(scene_pos)
         x_value = float(point.x())
@@ -604,6 +1041,9 @@ class WaveformPage(QWidget):
             item.plot.setTitle(item.label)
         self._update_plot_window(item)
         self._update_stats(item, visible_series)
+        if self.delta_box.isChecked() and (item.a_x is not None or item.b_x is not None):
+            self._update_delta_labels_for(item)
+            self._render_chart_delta_text(item)
 
     def _update_plot_window(self, item: ChartItem) -> None:
         visible = [series for address, series in item.series.items() if address in self._selected_addresses() and series.x]
@@ -672,6 +1112,7 @@ class WaveformPage(QWidget):
                 item.vline.setPen(crosshair_pen)
             if item.hline is not None:
                 item.hline.setPen(crosshair_pen)
+            self._apply_delta_highlight_style(item)
 
     def _update_stats(self, item: ChartItem, visible_series: list[DeviceSeries] | None = None) -> None:
         if visible_series is None:

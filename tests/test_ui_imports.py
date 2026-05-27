@@ -1343,6 +1343,45 @@ def test_waveform_page_crosshair_reports_nearest_sample_value():
     assert not chart.hline.isVisible()
 
 
+def test_waveform_page_delta_cursor_reports_ab_difference():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.waveform_page import WaveformPage
+
+    app = QApplication.instance() or QApplication([])
+    page = WaveformPage()
+    page.add_chart()
+    state = DeviceState(is_connected=True, device_name="PTU A", device_address="A", device_number=6)
+    for value in (100, 150, 200):
+        state.ptu_input_voltage = value
+        page.refresh_device(state, {state.device_address: state}, state.device_address)
+
+    chart = page.charts[0]
+    page.delta_box.setChecked(True)
+    page._place_delta_cursor(chart, 0.0)
+    page._place_delta_cursor(chart, 2.0)
+
+    assert chart.a_x == 0.0
+    assert chart.b_x == 2.0
+    assert chart.a_line is not None and chart.a_line.isVisible()
+    assert chart.b_line is not None and chart.b_line.isVisible()
+    assert chart.cursor_label is not None
+    assert "A Sample 0.0" in chart.cursor_label.text()
+    assert "B Sample 2.0" in chart.cursor_label.text()
+    assert "Delta" not in chart.cursor_label.text()
+    assert "Δ Sample +2.0" in chart.cursor_label.text()
+    assert "ΔPTU #6: +100.00 (+100.0%)" in chart.cursor_label.text()
+
+    page._clear_delta()
+
+    assert chart.a_x is None
+    assert chart.b_x is None
+    assert not chart.a_line.isVisible()
+    assert not chart.b_line.isVisible()
+
+
 def test_waveform_page_saves_chart_image_from_chart_button(monkeypatch, tmp_path):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication
