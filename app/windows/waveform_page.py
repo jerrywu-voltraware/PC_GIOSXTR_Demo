@@ -78,6 +78,7 @@ class ChartItem:
     b_dots: dict[str, pg.ScatterPlotItem] = field(default_factory=dict)
     delta_links: dict[str, pg.PlotDataItem] = field(default_factory=dict)
     last_mouse_x: float | None = None
+    region: pg.LinearRegionItem | None = None
 
 
 class WaveformPage(QWidget):
@@ -114,6 +115,13 @@ class WaveformPage(QWidget):
         self.delta_clear_btn = QPushButton("清除 A/B")
         self.delta_clear_btn.setEnabled(False)
         self.delta_clear_btn.clicked.connect(self._clear_delta)
+        self.region_box = QCheckBox("框選統計")
+        self.region_box.toggled.connect(self._on_region_toggled)
+        self.region_clear_btn = QPushButton("清除框選")
+        self.region_clear_btn.setEnabled(False)
+        self.region_clear_btn.clicked.connect(self._clear_region)
+        self._region_color = "#FF7A59"
+        self._region_syncing = False
         self.delta_highlight_box = QCheckBox("醒目顯示 Δ")
         self.delta_highlight_box.setChecked(True)
         self.delta_highlight_box.toggled.connect(self._refresh_all_delta_labels)
@@ -152,6 +160,8 @@ class WaveformPage(QWidget):
         controls.addWidget(self.crosshair_box)
         controls.addWidget(self.delta_box)
         controls.addWidget(self.delta_clear_btn)
+        controls.addWidget(self.region_box)
+        controls.addWidget(self.region_clear_btn)
         self.settings_btn = QPushButton("波形設定⚙")
         self.settings_btn.setToolTip("Δ 游標顯示與量測選項")
         self.settings_btn.clicked.connect(self._open_settings_dialog)
@@ -278,12 +288,13 @@ class WaveformPage(QWidget):
         plot.scene().sigMouseClicked.connect(lambda event, chart=item: self._handle_plot_click(chart, event))
         self._install_crosshair(item)
         self._install_delta_lines(item)
+        self._install_region(item)
         self.charts.append(item)
 
     def remove_chart(self, item: ChartItem) -> None:
         self.clear_markers(item)
         self._clear_delta_visuals(item)
-        for graphics_item in (item.vline, item.hline, item.a_line, item.b_line, item.a_label, item.b_label):
+        for graphics_item in (item.vline, item.hline, item.a_line, item.b_line, item.a_label, item.b_label, item.region):
             if graphics_item is not None:
                 try:
                     item.plot.removeItem(graphics_item)
@@ -295,6 +306,7 @@ class WaveformPage(QWidget):
         item.b_line = None
         item.a_label = None
         item.b_label = None
+        item.region = None
         item.a_x = None
         item.b_x = None
         item.mouse_proxy = None
@@ -423,6 +435,73 @@ class WaveformPage(QWidget):
         item.b_line = b_line
         item.a_label = a_label
         item.b_label = b_label
+
+    def _install_region(self, item: ChartItem) -> None:
+        brush = pg.mkBrush(255, 122, 89, 55)
+        hover_brush = pg.mkBrush(255, 122, 89, 95)
+        pen = pg.mkPen(self._region_color, width=2)
+        region = pg.LinearRegionItem(
+            values=(0.0, 0.0),
+            orientation="vertical",
+            brush=brush,
+            hoverBrush=hover_brush,
+            pen=pen,
+            movable=True,
+        )
+        region.setZValue(14)
+        region.setVisible(False)
+        item.plot.addItem(region, ignoreBounds=True)
+        item.region = region
+        region.sigRegionChanged.connect(lambda _r, chart=item: self._on_region_changed(chart))
+
+    def _on_region_toggled(self, enabled: bool) -> None:
+        self.region_clear_btn.setEnabled(enabled)
+        if enabled:
+            x1: float | None = None
+            x2: float | None = None
+            for chart in self.charts:
+                latest = self._latest_chart_x(chart)
+                if latest is None or latest < 2:
+                    continue
+                left = max(0.0, latest * 0.6)
+                right = max(left + 1.0, latest * 0.85)
+                x1, x2 = left, right
+                break
+            if x1 is None:
+                x1, x2 = 0.0, 100.0
+            self._region_syncing = True
+            try:
+                for chart in self.charts:
+                    if chart.region is None:
+                        continue
+                    chart.region.setRegion((x1, x2))
+                    chart.region.setVisible(True)
+            finally:
+                self._region_syncing = False
+        else:
+            for chart in self.charts:
+                if chart.region is not None:
+                    chart.region.setVisible(False)
+        for chart in self.charts:
+            self._update_stats(chart)
+
+    def _on_region_changed(self, source: ChartItem) -> None:
+        if self._region_syncing or source.region is None:
+            return
+        x1, x2 = source.region.getRegion()
+        self._region_syncing = True
+        try:
+            for chart in self.charts:
+                if chart is source or chart.region is None:
+                    continue
+                chart.region.setRegion((x1, x2))
+        finally:
+            self._region_syncing = False
+        for chart in self.charts:
+            self._update_stats(chart)
+
+    def _clear_region(self) -> None:
+        self.region_box.setChecked(False)
 
     def _on_delta_toggled(self, enabled: bool) -> None:
         self.delta_clear_btn.setEnabled(enabled)
@@ -1123,12 +1202,37 @@ class WaveformPage(QWidget):
         if not visible_with_data:
             item.stats_label.setText("latest --   min --   max --   samples 0")
             return
+        show_region = (
+            self.region_box.isChecked()
+            and item.region is not None
+            and item.region.isVisible()
+        )
+        region_lo = region_hi = None
+        if show_region and item.region is not None:
+            r1, r2 = item.region.getRegion()
+            region_lo, region_hi = (r1, r2) if r1 <= r2 else (r2, r1)
         lines = []
         for series in visible_with_data:
             values = self._finite_values(series.y)
             latest = values[-1]
-            lines.append(
+            line = (
                 f"{series.label}: latest {latest:.2f}   min {min(values):.2f}   "
                 f"max {max(values):.2f}   samples {len(values)}"
             )
+            if region_lo is not None and region_hi is not None:
+                in_range = [
+                    series.y[i]
+                    for i, xv in enumerate(series.x)
+                    if region_lo <= xv <= region_hi and math.isfinite(series.y[i])
+                ]
+                if in_range:
+                    rmin = min(in_range)
+                    rmax = max(in_range)
+                    line += (
+                        f"   框選[{region_lo:.0f}~{region_hi:.0f}]: "
+                        f"min {rmin:.2f}  max {rmax:.2f}  Δ {rmax - rmin:.2f}  n={len(in_range)}"
+                    )
+                else:
+                    line += f"   框選[{region_lo:.0f}~{region_hi:.0f}]: --"
+            lines.append(line)
         item.stats_label.setText("\n".join(lines))
