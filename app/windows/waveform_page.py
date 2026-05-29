@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 
 import pyqtgraph as pg
 from pyqtgraph.exporters import ImageExporter
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -41,6 +41,7 @@ class DeviceSeries:
     x: list[float] = field(default_factory=list)
     y: list[float] = field(default_factory=list)
     sample_index: int = 0
+    visible: bool = True
 
 
 @dataclass
@@ -79,6 +80,8 @@ class ChartItem:
     delta_links: dict[str, pg.PlotDataItem] = field(default_factory=dict)
     last_mouse_x: float | None = None
     region: pg.LinearRegionItem | None = None
+    dirty: bool = False
+    legend_key: tuple = ()
 
 
 class WaveformPage(QWidget):
@@ -188,6 +191,14 @@ class WaveformPage(QWidget):
         self.scroll.setWidget(self.container)
         root.addWidget(self.scroll, 1)
         self._disconnected_hold = False
+
+        # Decouple data ingestion from rendering: samples only update buffers and
+        # mark their chart dirty; this timer batches the actual redraw at a fixed
+        # frame rate so cost scales with frames, not with sample count.
+        self._render_timer = QTimer(self)
+        self._render_timer.setInterval(50)  # ~20 fps
+        self._render_timer.timeout.connect(self._flush_dirty)
+        self._render_timer.start()
 
     @staticmethod
     def _state_address(state: DeviceState, fallback: str = "") -> str:
@@ -995,6 +1006,8 @@ class WaveformPage(QWidget):
             return
         if not filename.lower().endswith(".png"):
             filename = f"{filename}.png"
+        # Make sure any batched samples are drawn before exporting (WYSIWYG).
+        self._flush_dirty()
         try:
             ImageExporter(item.plot.plotItem).export(filename)
         except Exception as exc:  # pragma: no cover - depends on Qt/OS exporter failures
@@ -1053,10 +1066,10 @@ class WaveformPage(QWidget):
         series.x.append(float(series.sample_index))
         series.y.append(value)
         series.sample_index += 1
-        max_samples = self._history_limit()
-        if len(series.x) > max_samples:
-            series.x = series.x[-max_samples:]
-            series.y = series.y[-max_samples:]
+        self._trim_series(item)
+        # Buffers, trimming and stats stay synchronous (no sample is ever
+        # skipped); only the heavy pyqtgraph polyline redraw is batched onto the
+        # render timer via the dirty flag set in _refresh_chart_display.
         self._refresh_chart_display(item)
 
     def refresh_device(
@@ -1090,23 +1103,48 @@ class WaveformPage(QWidget):
         for item in self.charts:
             self._refresh_chart_display(item)
 
+    def _flush_dirty(self) -> None:
+        # Apply the batched, expensive pyqtgraph operations (full-polyline
+        # setData + x-range repaint) at most once per timer tick.
+        for item in self.charts:
+            if not item.dirty:
+                continue
+            item.dirty = False
+            for series in item.series.values():
+                if series.visible:
+                    series.curve.setData(series.x, series.y)
+                else:
+                    series.curve.setData([], [])
+            self._update_plot_window(item)
+
+    def _trim_series(self, item: ChartItem) -> None:
+        max_samples = self._history_limit()
+        for series in item.series.values():
+            overflow = len(series.x) - max_samples
+            if overflow > 0:
+                del series.x[:overflow]
+                del series.y[:overflow]
+
     def _refresh_chart_display(self, item: ChartItem) -> None:
         selected_addresses = self._selected_addresses()
         visible_series: list[DeviceSeries] = []
         for address, series in item.series.items():
             visible = address in selected_addresses
             series.curve.setVisible(visible)
-            series.curve.setData(series.x if visible else [], series.y if visible else [])
+            series.visible = visible
+            # Defer the heavy setData to the render timer (see _flush_dirty).
             if visible:
                 visible_series.append(series)
         visible_with_data = {series.address for series in visible_series if series.y}
         if visible_with_data:
             self._held_addresses = visible_with_data
         legend = item.plot.plotItem.legend
-        if legend is not None:
+        legend_key = tuple((series.address, series.label) for series in visible_series)
+        if legend is not None and legend_key != item.legend_key:
             legend.clear()
             for series in visible_series:
                 legend.addItem(series.curve, series.label)
+            item.legend_key = legend_key
         if visible_series:
             item.curve = visible_series[0].curve
             item.x = visible_series[0].x
@@ -1118,11 +1156,12 @@ class WaveformPage(QWidget):
             item.x = []
             item.y = []
             item.plot.setTitle(item.label)
-        self._update_plot_window(item)
         self._update_stats(item, visible_series)
         if self.delta_box.isChecked() and (item.a_x is not None or item.b_x is not None):
             self._update_delta_labels_for(item)
             self._render_chart_delta_text(item)
+        # The x-range repaint and curve setData are batched onto the render timer.
+        item.dirty = True
 
     def _update_plot_window(self, item: ChartItem) -> None:
         visible = [series for address, series in item.series.items() if address in self._selected_addresses() and series.x]
