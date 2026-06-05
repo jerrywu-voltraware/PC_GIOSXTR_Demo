@@ -40,6 +40,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..constants import DEFAULT_DEMO_DEVICE_NAME
 from ..models import DeviceState
 from ..resources import resource_path
 from ..theme import ThemeTokens, current_tokens, theme_manager
@@ -958,7 +959,7 @@ class Demo2Page(QWidget):
         *,
         engineering_mode: bool = False,
         demo_use_fake_data: bool = True,
-        demo_device_name: str = "Demo",
+        demo_device_name: str = DEFAULT_DEMO_DEVICE_NAME,
         demo_ebike_pct: int = 76,
         demo_escooter_pct: int = 81,
         demo_device_battery_pcts: dict[str, int] | None = None,
@@ -969,7 +970,7 @@ class Demo2Page(QWidget):
         self.setStyleSheet(f"background-color: {self._tokens.surface_subtle};")
         self._engineering_mode_enabled = engineering_mode
         self._demo_use_fake_data = demo_use_fake_data
-        self._demo_device_name = demo_device_name.strip() or "Demo"
+        self._demo_device_name = demo_device_name.strip() or DEFAULT_DEMO_DEVICE_NAME
         self._demo_ebike_pct = self._clamp_pct(demo_ebike_pct)
         self._demo_escooter_pct = self._clamp_pct(demo_escooter_pct)
         self._demo_device_battery_pcts = self._clean_device_pcts(demo_device_battery_pcts or {})
@@ -1120,7 +1121,7 @@ class Demo2Page(QWidget):
         device_battery_pcts: dict[str, int] | None = None,
     ) -> None:
         self._demo_use_fake_data = use_fake_data
-        self._demo_device_name = device_name.strip() or "Demo"
+        self._demo_device_name = device_name.strip() or DEFAULT_DEMO_DEVICE_NAME
         self._demo_ebike_pct = self._clamp_pct(ebike_pct)
         self._demo_escooter_pct = self._clamp_pct(escooter_pct)
         if device_battery_pcts is not None:

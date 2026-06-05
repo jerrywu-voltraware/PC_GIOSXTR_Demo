@@ -25,7 +25,7 @@ from ..ble_adapter import AdapterCheckResult, AdapterStatus, check_bluetooth_ada
 from ..ble_manager import BleManager, DeviceScanResult
 from ..ble_manager import _write_scan_debug
 from ..device_source import DeviceManager, DeviceSource, PcBleSource
-from ..constants import APP_ICON_FILENAME, APP_VERSION, APP_WINDOW_TITLE
+from ..constants import APP_ICON_FILENAME, APP_VERSION, APP_WINDOW_TITLE, DEFAULT_DEMO_DEVICE_NAME
 from ..csv_logger import CsvLogger
 from ..models import DataEvent, DeviceState
 from ..protocol import parse_notify_packet
@@ -91,8 +91,8 @@ class MainWindow(QMainWindow):
         self.recent_device_store = RecentDeviceStore()
         self._close_after_disconnect = False
         self.engineering_mode = engineering_mode
-        self.demo_use_fake_data = False
-        self.demo_device_name = "Demo"
+        self.demo_use_fake_data = True
+        self.demo_device_name = DEFAULT_DEMO_DEVICE_NAME
         self.demo_ebike_pct = 76
         self.demo_escooter_pct = 81
         self.demo_device_battery_pcts: dict[str, int] = {}
@@ -233,7 +233,7 @@ class MainWindow(QMainWindow):
         device_battery_pcts: dict[str, int] | None = None,
     ) -> None:
         self.demo_use_fake_data = use_fake_data
-        self.demo_device_name = device_name.strip() or "Demo"
+        self.demo_device_name = device_name.strip() or DEFAULT_DEMO_DEVICE_NAME
         self.demo_ebike_pct = ebike_pct
         self.demo_escooter_pct = escooter_pct
         if device_battery_pcts is not None:
