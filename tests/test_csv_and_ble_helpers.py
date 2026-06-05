@@ -88,5 +88,7 @@ def test_supported_device_accepts_split_eeee_manufacturer_record():
     assert is_supported_device_advertisement("", manufacturer_data)
 
 
-def test_supported_device_rejects_unlisted_gios_gateway_without_number_record():
-    assert not is_supported_device_advertisement("GIOS-S20-GW01", {})
+def test_supported_device_accepts_any_gios_prefix_name():
+    assert is_supported_device_advertisement("GIOS-S20-GW01", {})
+    assert is_supported_device_advertisement("GIOS9999ST#71", {})
+    assert not is_supported_device_advertisement("OTHER-S20-GW01", {})

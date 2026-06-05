@@ -10,7 +10,18 @@
       "Bash(git -C \"d:/PC_GIOSXTR_Demo\" rm -r --cached -q .)",
       "Bash(git -C \"d:/PC_GIOSXTR_Demo\" status --short)",
       "Bash(git -C \"d:/PC_GIOSXTR_Demo\" rm -rf --cached -q .)",
-      "Bash(measure-object -line)"
+      "Bash(measure-object -line)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('app/windows/waveform_page.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -m pytest tests/test_app_metadata.py -x -q)",
+      "Bash(set QT_QPA_PLATFORM=offscreen)",
+      "Bash(python -c ' *)",
+      "Bash(python -m PyInstaller PC_GIOSXTR_Demo.spec --noconfirm)",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('tag:', d['tagName']\\); print\\('name:', d['name']\\); print\\('assets:'\\); [print\\(' -', a['name'], a['size'], 'bytes'\\) for a in d['assets']]\")",
+      "Bash(python -m pytest tests/test_ui_imports.py -q -k waveform)",
+      "Bash(python -m pytest tests/test_ui_imports.py -q)",
+      "Bash(python -m pytest tests/test_ui_imports.py -q -k \"demo or settings\")",
+      "Bash(python -m pytest tests/test_app_metadata.py -q)",
+      "Bash(python -m PyInstaller --noconfirm --clean PC_GIOSXTR_Demo.spec)"
     ]
   }
 }

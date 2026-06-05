@@ -28,6 +28,7 @@ class SettingsDialog(QDialog):
     demo_settings_changed = pyqtSignal(bool, int, int, str, object)
     check_updates_requested = pyqtSignal()
     auto_reconnect_changed = pyqtSignal(bool)
+    switch_source_requested = pyqtSignal()
 
     def __init__(
         self,
@@ -40,9 +41,11 @@ class SettingsDialog(QDialog):
         demo_escooter_pct: int = 81,
         demo_device_battery_pcts: dict[str, int] | None = None,
         connected_demo_devices: list[dict[str, object]] | None = None,
+        source_display_name: str = "",
         parent=None,
     ) -> None:
         super().__init__(parent)
+        self._source_display_name = source_display_name
         self.setWindowTitle("設定")
         self.setMinimumWidth(520)
         self.demo_device_battery_pcts = dict(demo_device_battery_pcts or {})
@@ -115,6 +118,26 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(8)
+
+        # -- Data source (PC built-in Bluetooth vs Nordic dongle) -----------
+        source_name = self._source_display_name or "未知"
+        source_label = QLabel(f"目前連線方式：{source_name}")
+        source_label.setStyleSheet("font-weight: 700;")
+        layout.addWidget(source_label)
+
+        self.switch_source_button = QPushButton("切換連線方式…")
+        self.switch_source_button.clicked.connect(self.switch_source_requested.emit)
+        layout.addWidget(self.switch_source_button)
+
+        source_detail = QLabel("切換 PC 內建藍牙 / Nordic dongle 需要重新啟動程式，目前連線會中斷。")
+        source_detail.setWordWrap(True)
+        source_detail.setStyleSheet("color: #666;")
+        layout.addWidget(source_detail)
+
+        line = QLabel()
+        line.setFixedHeight(1)
+        line.setStyleSheet("background: #ddd;")
+        layout.addWidget(line)
 
         self.auto_reconnect_box = QCheckBox("斷線後自動重新連線")
         self.auto_reconnect_box.setChecked(auto_reconnect_enabled)

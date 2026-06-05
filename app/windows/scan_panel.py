@@ -290,8 +290,6 @@ class ScanPanel(QWidget):
         self._apply_style()
         if self.results:
             self._rebuild_scan_list()
-        elif self.recent_devices:
-            self._rebuild_recent_list()
 
     def _set_scan_state(self, title: str, detail: str, *, busy: bool = False) -> None:
         self.scan_state_title.setText(title)
@@ -339,9 +337,6 @@ class ScanPanel(QWidget):
         self.scan_btn.setText("搜尋裝置")
         self.scan_btn.setEnabled(not self._is_scanning)
         if self._is_scanning or self.results:
-            return
-        if self.recent_devices:
-            self._show_recent_devices()
             return
         detail = "按下搜尋裝置後，只會顯示支援的 VOLTRAWARE 裝置。"
         self._show_empty_result("準備搜尋", detail)
@@ -417,8 +412,6 @@ class ScanPanel(QWidget):
 
     def set_recent_devices(self, devices: list[RecentDevice]) -> None:
         self.recent_devices = devices[:8]
-        if not self.results and not self._is_scanning:
-            self._show_recent_devices()
 
     def _show_recent_devices(self) -> None:
         if not self.recent_devices:
@@ -513,15 +506,8 @@ class ScanPanel(QWidget):
                     f"找到 {len(self.results)} 個支援裝置，選擇後即可連線。",
                 )
             else:
-                if self.recent_devices:
-                    self._show_recent_devices()
-                    self._set_scan_state(
-                        "沒有掃到新廣播",
-                        "可能仍維持在上一個連線狀態。請選擇最近連線裝置嘗試重新連線。",
-                    )
-                else:
-                    self._show_empty_result("沒有找到支援裝置", "請確認裝置已開機，並靠近充電板後再搜尋一次。")
-                    self._set_scan_state("沒有找到支援裝置", "請確認裝置已開機，並靠近充電板後再搜尋一次。")
+                self._show_empty_result("沒有找到支援裝置", "請確認裝置已開機，並靠近充電板後再搜尋一次。")
+                self._set_scan_state("沒有找到支援裝置", "請確認裝置已開機，並靠近充電板後再搜尋一次。")
         except Exception as exc:
             QMessageBox.warning(self, "掃描失敗", str(exc))
             self._show_empty_result("掃描失敗", "藍牙掃描未完成，請確認藍牙已開啟後重試。")
@@ -532,7 +518,11 @@ class ScanPanel(QWidget):
             self.scan_progress.hide()
 
     async def _adapter_ready_for_scan(self) -> bool:
-        result = await check_bluetooth_adapter()
+        # Route the readiness check through the data source when available so the
+        # dongle can report serial-port readiness instead of the OS Bluetooth
+        # adapter. Falls back to the OS check for plain BleManager / test stubs.
+        check_ready = getattr(self.ble, "check_ready", None)
+        result = await check_ready() if callable(check_ready) else await check_bluetooth_adapter()
         _write_scan_debug(f"adapter check before scan: {result.status.value} {result.detail}")
         if result.status in (AdapterStatus.NO_ADAPTER, AdapterStatus.DISABLED):
             title, body = user_facing_message(result)
@@ -647,8 +637,6 @@ class ScanPanel(QWidget):
         if connected_changed and not self._is_scanning:
             if self.results:
                 self._rebuild_scan_list()
-            elif self.recent_devices:
-                self._rebuild_recent_list()
 
     def _rebuild_scan_list(self) -> None:
         self.list_widget.blockSignals(True)

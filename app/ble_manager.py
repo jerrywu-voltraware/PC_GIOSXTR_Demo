@@ -81,6 +81,8 @@ def is_supported_device_advertisement(
     manufacturer_data: dict[int, bytes | bytearray | list[int]],
 ) -> bool:
     clean_name = str(name or "")
+    if clean_name.startswith("GIOS"):
+        return True
     if clean_name in SUPPORTED_DEVICES:
         return True
     if any(clean_name.startswith(f"{supported}#") for supported in SUPPORTED_DEVICES):

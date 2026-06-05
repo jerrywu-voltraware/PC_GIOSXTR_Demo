@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pyinstaller PC_GIOSXTR_Demo.spec --noconfirm)",
+      "Bash(gh --version)",
+      "Bash(git log *)",
+      "Read(//tmp/**)"
+    ]
+  }
+}

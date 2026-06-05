@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from pathlib import Path
 
 from PyQt6.QtCore import QSettings, QStandardPaths, QTimer, Qt, QUrl, pyqtSignal, pyqtSlot
@@ -23,6 +24,7 @@ from qasync import asyncSlot
 from ..ble_adapter import AdapterCheckResult, AdapterStatus, check_bluetooth_adapter, user_facing_message
 from ..ble_manager import BleManager, DeviceScanResult
 from ..ble_manager import _write_scan_debug
+from ..device_source import DeviceManager, DeviceSource, PcBleSource
 from ..constants import APP_ICON_FILENAME, APP_VERSION, APP_WINDOW_TITLE
 from ..csv_logger import CsvLogger
 from ..models import DataEvent, DeviceState
@@ -71,8 +73,11 @@ class MainWindow(QMainWindow):
     notify_received = pyqtSignal(str, str, bytes)
     disconnected = pyqtSignal(str)
 
-    def __init__(self, *, engineering_mode: bool = False) -> None:
+    def __init__(self, *, source: DeviceSource | None = None, engineering_mode: bool = False) -> None:
         super().__init__()
+        # Data-source backend (PC built-in Bluetooth by default). The dongle
+        # source is injected from main(); everything below is source-agnostic.
+        self.source: DeviceSource = source or PcBleSource()
         self.setWindowTitle(APP_WINDOW_TITLE)
         icon = QIcon(str(resource_path(APP_ICON_FILENAME)))
         if not icon.isNull():
@@ -80,7 +85,7 @@ class MainWindow(QMainWindow):
         self.resize(1280, 820)
 
         self.log_dir = Path.cwd() / "logs"
-        self.managers: dict[str, BleManager] = {}
+        self.managers: dict[str, DeviceManager] = {}
         self.states: dict[str, DeviceState] = {}
         self.loggers: dict[str, CsvLogger] = {}
         self.recent_device_store = RecentDeviceStore()
@@ -92,12 +97,16 @@ class MainWindow(QMainWindow):
         self.demo_escooter_pct = 81
         self.demo_device_battery_pcts: dict[str, int] = {}
         self.active_address: str = ""
-        self.scan_ble = BleManager()
         self.state = DeviceState()
         self._update_check_running = False
         self._last_adapter_status: AdapterStatus | None = None
         self.auto_reconnect_enabled = _settings_bool(AUTO_RECONNECT_SETTINGS_KEY, False)
         self._manual_disconnect_addresses: set[str] = set()
+        # Addresses that are connecting OR connected-but-not-yet-streaming.
+        # The dongle cannot start a new connection while a previous link is
+        # still in GATT discovery, so we block new connects until the current
+        # device's first packet arrives (see requires_ready_before_next_connect).
+        self._connect_in_progress: set[str] = set()
         self._reconnect_tasks: dict[str, asyncio.Task[None]] = {}
         self._reconnecting_addresses: set[str] = set()
         self._reconnect_delays = RECONNECT_DELAYS_SECONDS
@@ -115,7 +124,7 @@ class MainWindow(QMainWindow):
         central = QWidget()
         layout = QHBoxLayout(central)
         layout.setContentsMargins(8, 8, 8, 8)
-        self.scan_panel = ScanPanel(self.scan_ble)
+        self.scan_panel = ScanPanel(self.source)
         self.scan_panel.setFixedWidth(380)
         self.scan_panel.device_connect_requested.connect(self._connect_device)
         self.scan_panel.disconnect_requested.connect(self._disconnect_active)
@@ -190,7 +199,10 @@ class MainWindow(QMainWindow):
         asyncio.create_task(self._run_initial_adapter_check())
 
     async def _run_initial_adapter_check(self) -> None:
-        result = await check_bluetooth_adapter()
+        # Route through the data source so the dongle reports serial-port
+        # readiness instead of the OS Bluetooth adapter. PcBleSource.check_ready
+        # delegates to check_bluetooth_adapter, so the PC path is unchanged.
+        result = await self.source.check_ready()
         _write_scan_debug(f"startup adapter check: {result.status.value} {result.detail}")
         self._handle_adapter_check_result(result, show_warning=True)
 
@@ -248,13 +260,45 @@ class MainWindow(QMainWindow):
             demo_device_battery_pcts=self.demo_device_battery_pcts,
             connected_demo_devices=self._connected_demo_device_settings(),
             auto_reconnect_enabled=self.auto_reconnect_enabled,
+            source_display_name=getattr(self.source, "display_name", ""),
             parent=self,
         )
         dialog.engineering_mode_changed.connect(self.set_engineering_mode)
         dialog.demo_settings_changed.connect(self.set_demo_settings)
         dialog.auto_reconnect_changed.connect(self.set_auto_reconnect_enabled)
         dialog.check_updates_requested.connect(lambda: self._start_manual_update_check(dialog))
+        dialog.switch_source_requested.connect(lambda: self._handle_switch_source(dialog))
         dialog.exec()
+
+    def _handle_switch_source(self, dialog: SettingsDialog) -> None:
+        reply = QMessageBox.question(
+            self,
+            "切換連線方式",
+            "切換連線方式需要重新啟動程式，目前的連線會中斷。\n\n要繼續嗎？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        dialog.accept()
+        # Release the serial port so the relaunched instance can open it.
+        try:
+            self.source.shutdown()
+        except Exception:
+            pass
+        self._relaunch_app()
+
+    def _relaunch_app(self) -> None:
+        from PyQt6.QtCore import QProcess
+        from PyQt6.QtWidgets import QApplication
+
+        if getattr(sys, "frozen", False):
+            # PyInstaller bundle: sys.argv[0] is the exe itself.
+            QProcess.startDetached(sys.executable, sys.argv[1:])
+        else:
+            # Script mode: re-run "python main.py ...".
+            QProcess.startDetached(sys.executable, sys.argv)
+        QApplication.quit()
 
     def _start_automatic_update_check(self) -> None:
         if self._update_check_running:
@@ -425,7 +469,7 @@ class MainWindow(QMainWindow):
         if isinstance(address, str) and address and address != self.active_address:
             self._set_active(address)
 
-    def _active_manager(self) -> BleManager | None:
+    def _active_manager(self) -> DeviceManager | None:
         return self.managers.get(self.active_address)
 
     def _active_logger(self) -> CsvLogger | None:
@@ -441,8 +485,19 @@ class MainWindow(QMainWindow):
             self.disconnected.emit(address)
         return emit
 
-    def _create_ble_manager(self) -> BleManager:
-        return BleManager()
+    def _create_ble_manager(self) -> DeviceManager:
+        return self.source.create_manager()
+
+    def _show_warning(self, title: str, message: str) -> None:
+        box = QMessageBox(
+            QMessageBox.Icon.Warning,
+            title,
+            message,
+            QMessageBox.StandardButton.Ok,
+            self,
+        )
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.open()
 
     def set_auto_reconnect_enabled(self, enabled: bool, *, persist: bool = True) -> None:
         self.auto_reconnect_enabled = bool(enabled)
@@ -462,13 +517,29 @@ class MainWindow(QMainWindow):
         if address in self.managers:
             self._set_active(address)
             return
+
+        # 防呆：dongle 無法在前一個連線仍在 GATT discovery 時發起新連線，否則會
+        # 卡住。若目前有裝置「連線中／已連線但尚未開始收資料」，擋下這次連線。
+        if (
+            getattr(self.source, "requires_ready_before_next_connect", False)
+            and self._connect_in_progress
+        ):
+            self._show_warning(
+                "請稍候",
+                "目前有裝置正在連線中（尚未開始接收資料）。\n\n"
+                "請等資料開始進來後，再連線下一台裝置。",
+            )
+            return
+
         manager = self._create_ble_manager()
         manager.set_notify_callback(self._make_notify_emitter())
         manager.set_disconnect_callback(self._make_disconnect_emitter())
+        self._connect_in_progress.add(address)
         try:
             await manager.connect(address)
         except Exception as exc:
-            QMessageBox.warning(self, "Connect failed", str(exc))
+            self._connect_in_progress.discard(address)
+            self._show_warning("Connect failed", str(exc))
             return
 
         state = DeviceState()
@@ -488,6 +559,13 @@ class MainWindow(QMainWindow):
         self.active_address = address
         self.state = state
         self._refresh_device_tabs()
+
+        # 連上了但還在等第一個封包；_handle_notify 收到資料時會解除。安全網：
+        # 萬一連上卻一直沒資料，10 秒後自動解除，避免永久擋住後續連線。
+        if address in self._connect_in_progress:
+            QTimer.singleShot(
+                10000, lambda a=address: self._connect_in_progress.discard(a)
+            )
 
         try:
             await manager.enable_default_notifications()
@@ -549,6 +627,8 @@ class MainWindow(QMainWindow):
             self._manual_disconnect_addresses.discard(address)
 
     def _cleanup_address(self, address: str, *, allow_reconnect: bool = False) -> None:
+        # A disconnect (or failed setup) clears the connect-in-progress guard.
+        self._connect_in_progress.discard(address)
         if allow_reconnect:
             self.managers.pop(address, None)
             state = self.states.get(address)
@@ -674,6 +754,9 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str, str, bytes)
     def _handle_notify(self, address: str, uuid: str, data: bytes) -> None:
+        # First packet arrived → this device is now streaming, so it is safe to
+        # connect the next device (clears the connect-in-progress guard).
+        self._connect_in_progress.discard(address)
         state = self.states.get(address)
         if state is None:
             return

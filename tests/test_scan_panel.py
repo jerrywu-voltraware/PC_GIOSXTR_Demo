@@ -1,10 +1,13 @@
 import os
 
 
-def test_recent_device_item_becomes_active_after_connect_without_scan_results():
+def test_recent_devices_are_not_shown_in_scan_results():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication
 
+    from PyQt6.QtCore import Qt
+
+    from app.ble_manager import DeviceScanResult
     from app.recent_devices import RecentDevice
     from app.windows.scan_panel import ScanPanel
 
@@ -21,23 +24,49 @@ def test_recent_device_item_becomes_active_after_connect_without_scan_results():
         ]
     )
 
-    panel.refresh_connected_devices(
+    item = panel.list_widget.item(0)
+    assert item is not None
+    assert not isinstance(item.data(Qt.ItemDataRole.UserRole), DeviceScanResult)
+
+
+def test_empty_scan_does_not_fall_back_to_recent_devices():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import asyncio
+
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QApplication
+
+    from app.ble_adapter import AdapterCheckResult, AdapterStatus
+    from app.ble_manager import DeviceScanResult
+    from app.recent_devices import RecentDevice
+    from app.windows.scan_panel import ScanPanel
+
+    class FakeBle:
+        async def check_ready(self):
+            return AdapterCheckResult(AdapterStatus.OK, "ok")
+
+        async def scan(self, *, timeout: float, supported_only: bool):
+            return []
+
+    app = QApplication.instance() or QApplication([])
+    panel = ScanPanel(ble=FakeBle())
+    panel.set_recent_devices(
         [
-            {
-                "address": "90:6C:0A:C9:96:00",
-                "name": "GIOS0403ST#4",
-                "device_number": "4",
-                "recording": "0",
-                "packets": "0",
-            }
-        ],
-        "90:6C:0A:C9:96:00",
+            RecentDevice(
+                address="90:6C:0A:C9:96:00",
+                name="GIOS0403ST#4",
+                device_number=4,
+                rssi=-55,
+            )
+        ]
     )
 
-    item_widget = panel.list_widget.itemWidget(panel.list_widget.item(0))
+    asyncio.run(panel.scan.__wrapped__(panel))
 
-    assert item_widget is not None
-    assert "#DDF7F4" in item_widget.styleSheet()
+    item = panel.list_widget.item(0)
+    assert item is not None
+    assert not isinstance(item.data(Qt.ItemDataRole.UserRole), DeviceScanResult)
+    assert panel.scan_state_title.text() == "沒有找到支援裝置"
 
 
 def test_connected_device_list_marks_reconnecting_device():

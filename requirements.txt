@@ -1,5 +1,6 @@
 PyQt6>=6.6
 bleak>=0.22
+pyserial>=3.5
 winrt-Windows.Devices.Radios>=2.3
 qasync>=0.27
 pyqtgraph>=0.13
