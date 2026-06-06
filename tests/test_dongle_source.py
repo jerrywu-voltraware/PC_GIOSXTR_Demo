@@ -211,3 +211,37 @@ def test_scan_name_not_double_numbered_when_firmware_includes_hash():
     )
     assert results[0].name == "GIOS0403ST#4"  # no double "#4#4"
     assert results[0].device_number == 4
+
+
+def test_scan_results_parsed_from_live_found_update_lines():
+    results = DongleSource._parse_scan_results(
+        [
+            "FOUND 1: #0 GIOS0403ST RSSI=-73 MAC=2F:F7:DD:71:B4:81",
+            "UPDATE 1: #71 GIOS0403ST RSSI=-73 MAC=2F:F7:DD:71:B4:81",
+            "FOUND 2: #0 GIOS-S20-GW01 RSSI=-38 MAC=A0:DD:6C:A3:70:F2",
+            "FOUND 3: #0 GIOS0801ST RSSI=-31 MAC=90:04:22:B6:96:00",
+            "UPDATE 3: #45 GIOS0801ST RSSI=-31 MAC=90:04:22:B6:96:00",
+        ]
+    )
+
+    assert [(result.address, result.name, result.device_number) for result in results] == [
+        ("2F:F7:DD:71:B4:81", "GIOS0403ST#71", 71),
+        ("A0:DD:6C:A3:70:F2", "GIOS-S20-GW01#0", 0),
+        ("90:04:22:B6:96:00", "GIOS0801ST#45", 45),
+    ]
+
+
+def test_scan_collects_live_found_update_before_at_list():
+    src = _make_source()
+    future = src._loop.create_future()  # type: ignore[attr-defined]
+    src._scan_debug = True  # type: ignore[attr-defined]
+
+    src._on_line("FOUND 3: #0 GIOS0801ST RSSI=-31 MAC=90:04:22:B6:96:00")  # type: ignore[attr-defined]
+    src._on_line("UPDATE 3: #45 GIOS0801ST RSSI=-31 MAC=90:04:22:B6:96:00")  # type: ignore[attr-defined]
+    src._scan_future = future  # type: ignore[attr-defined]
+    src._on_line("SCAN LIST: 0")  # type: ignore[attr-defined]
+
+    results = DongleSource._parse_scan_results(src._scan_lines)  # type: ignore[attr-defined]
+    assert [(result.address, result.name, result.device_number) for result in results] == [
+        ("90:04:22:B6:96:00", "GIOS0801ST#45", 45),
+    ]

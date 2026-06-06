@@ -5,7 +5,15 @@ from __future__ import annotations
 from typing import Callable
 
 from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (
+    QComboBox,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 from qasync import asyncSlot
 
 from ..ble_manager import BleManager
@@ -57,6 +65,11 @@ class NumberPage(QWidget):
             await ble.write_device_number(number)
             self.status.setText(f"Number set to {number}")
             self.log_message.emit(f"Device number set to {number}")
+            QMessageBox.information(
+                self,
+                "裝置編號已更新",
+                f"裝置編號已設定為 {number}。\n將在下次掃描後看到新的編號。",
+            )
         except Exception as exc:
             self.status.setText(f"Write failed: {exc}")
             self.log_message.emit(f"Device number write failed: {exc}")

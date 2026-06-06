@@ -142,6 +142,9 @@ _SCAN_LIST_HDR = re.compile(r"^SCAN LIST:\s+(\d+)")
 _SCAN_LINE = re.compile(
     r"^\s*(\d+):\s+#(\d+|-)\s+(.+?)\s+RSSI=(-?\d+)\s+MAC=([0-9A-Fa-f:]{17})\s*$"
 )
+_SCAN_EVENT_LINE = re.compile(
+    r"^\s*(?:FOUND|UPDATE)\s+(\d+):\s+#(\d+|-)\s+(.+?)\s+RSSI=(-?\d+)\s+MAC=([0-9A-Fa-f:]{17})\s*$"
+)
 _CONNECTED = re.compile(
     r"^CONNECTED handle=(\d+)\s+#(\d+|-)\s+(.+?)\s+MAC=([0-9A-Fa-f:]{17})"
 )
@@ -315,6 +318,8 @@ class DongleSource(DeviceSource):
         self, timeout: float = 5.0, supported_only: bool = True
     ) -> list[DeviceScanResult]:
         # Start scanning, let advertisements accumulate, then pull the list.
+        self._scan_lines = []
+        self._scan_expect = None
         _write_scan_debug("dongle scan: AT+SCAN")
         self._scan_debug = True
         self._send_command("AT+SCAN")
@@ -324,7 +329,6 @@ class DongleSource(DeviceSource):
 
         future: asyncio.Future[bool] = self._loop.create_future()
         self._scan_future = future
-        self._scan_lines = []
         self._scan_expect = None
         _write_scan_debug("dongle scan: AT+LIST")
         self._send_command("AT+LIST")
@@ -395,9 +399,9 @@ class DongleSource(DeviceSource):
 
     @staticmethod
     def _parse_scan_results(lines: list[str]) -> list[DeviceScanResult]:
-        results: list[DeviceScanResult] = []
+        results_by_mac: dict[str, DeviceScanResult] = {}
         for line in lines:
-            match = _SCAN_LINE.match(line)
+            match = _SCAN_LINE.match(line) or _SCAN_EVENT_LINE.match(line)
             if not match:
                 continue
             dev_id_text = match.group(2)
@@ -410,18 +414,17 @@ class DongleSource(DeviceSource):
                 display_name = f"{base_name}#{device_number}"
             else:
                 display_name = base_name
-            results.append(
-                DeviceScanResult(
-                    address=match.group(5).upper(),
-                    name=display_name,
-                    rssi=int(match.group(4)),
-                    raw_hex="",
-                    advertising_rows=[],
-                    device_number=device_number,
-                    firmware_revision=None,
-                )
+            mac = match.group(5).upper()
+            results_by_mac[mac] = DeviceScanResult(
+                address=mac,
+                name=display_name,
+                rssi=int(match.group(4)),
+                raw_hex="",
+                advertising_rows=[],
+                device_number=device_number,
+                firmware_revision=None,
             )
-        return results
+        return list(results_by_mac.values())
 
     # -- reader thread -------------------------------------------------------
 
@@ -507,7 +510,7 @@ class DongleSource(DeviceSource):
     def _on_line(self, line: str) -> None:
         if self._scan_debug:
             _write_scan_debug(f"dongle rx: {line!r}")
-        if self._scan_future is not None and self._collect_scan_line(line):
+        if self._scan_debug and self._collect_scan_line(line):
             return
 
         match = _CONNECTED.match(line)
@@ -549,9 +552,11 @@ class DongleSource(DeviceSource):
         header = _SCAN_LIST_HDR.match(line)
         if header:
             self._scan_expect = int(header.group(1))
-            self._scan_lines = []
             if self._scan_expect == 0 and self._scan_future and not self._scan_future.done():
                 self._scan_future.set_result(True)
+            return True
+        if _SCAN_EVENT_LINE.match(line):
+            self._scan_lines.append(line)
             return True
         if self._scan_expect is not None and _SCAN_LINE.match(line):
             self._scan_lines.append(line)
