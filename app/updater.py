@@ -18,7 +18,10 @@ GITHUB_REPO = "PC_GIOSXTR_Demo"
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 APP_EXECUTABLE_PREFIX = "PC_GIOSXTR_Demo"
 DEFAULT_TIMEOUT_SECONDS = 8.0
-DOWNLOAD_TIMEOUT_SECONDS = 60.0
+# Applies to each socket read, not the whole download. A large exe streamed in
+# small chunks keeps every read well under this, so slow links no longer time out.
+DOWNLOAD_TIMEOUT_SECONDS = 300.0
+DOWNLOAD_CHUNK_BYTES = 256 * 1024
 
 
 class UpdateStatus(str, Enum):
@@ -230,7 +233,9 @@ def download_asset(
         asset.download_url,
         headers={"User-Agent": f"{APP_EXECUTABLE_PREFIX}-updater"},
     )
+    # Stream in small chunks so the timeout applies to each read rather than the
+    # whole transfer; a large exe over a slow link would otherwise time out.
     with urlopen(request, timeout=timeout) as response:
         with destination.open("wb") as output:
-            shutil.copyfileobj(response, output)
+            shutil.copyfileobj(response, output, DOWNLOAD_CHUNK_BYTES)
     return destination
