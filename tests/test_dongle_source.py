@@ -188,6 +188,54 @@ def test_disconnected_line_dispatches_to_manager():
     assert events == [mac]
 
 
+def test_dongle_disconnect_waits_for_disconnected_line_before_unregistering():
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    events: list[str] = []
+    mgr = src.create_manager()
+    mgr.set_disconnect_callback(lambda addr: events.append(addr))
+    mac = "AA:BB:CC:01:10:90"
+    mgr.address = mac  # connect() sets this in the real flow
+    src._register_manager(mac, mgr)  # type: ignore[attr-defined]
+    src._handle_to_mac[2] = mac  # type: ignore[attr-defined]
+    src._devid_to_mac[7] = mac  # type: ignore[attr-defined]
+
+    task = loop.create_task(mgr.disconnect())
+    loop.run_until_complete(asyncio.sleep(0))
+
+    assert serial.writes == [f"AT+DISC={mac}"]
+    assert src._managers.get(mac) is mgr  # type: ignore[attr-defined]
+    assert src._handle_to_mac.get(2) == mac  # type: ignore[attr-defined]
+
+    src._on_line("DISCONNECTED handle=2 #7 GIOS0403ST#7 reason=0x13")  # type: ignore[attr-defined]
+    loop.run_until_complete(task)
+
+    assert events == [mac]
+    assert mac not in src._managers  # type: ignore[attr-defined]
+    assert 2 not in src._handle_to_mac  # type: ignore[attr-defined]
+    assert 7 not in src._devid_to_mac  # type: ignore[attr-defined]
+
+
+def test_dongle_scan_waits_for_pending_disconnect_before_starting():
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+    future = loop.create_future()
+    src._disconnect_futures[mac] = future  # type: ignore[attr-defined]
+
+    task = loop.create_task(src.scan(timeout=0.01))
+    loop.run_until_complete(asyncio.sleep(0))
+
+    assert serial.writes == []
+
+    future.set_result(True)
+    loop.run_until_complete(asyncio.sleep(0.05))
+    assert serial.writes == ["AT+SCAN", "AT+STOP", "AT+LIST"]
+
+    src._on_line("SCAN LIST: 0")  # type: ignore[attr-defined]
+    assert loop.run_until_complete(task) == []
+
+
 def test_scan_results_parsed_from_at_list():
     # Real firmware emits the base name with the device id in the "#" field;
     # the display name must combine them like the PC scan does.

@@ -5,6 +5,7 @@ from __future__ import annotations
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -43,6 +44,7 @@ class ScanPanel(QWidget):
     recording_start_all_requested = pyqtSignal()
     recording_stop_all_requested = pyqtSignal()
     open_log_folder_requested = pyqtSignal()
+    auto_reconnect_changed = pyqtSignal(bool)
 
     def __init__(self, ble: BleManager, parent=None) -> None:
         super().__init__(parent)
@@ -147,6 +149,11 @@ class ScanPanel(QWidget):
         self.disconnect_all_btn.clicked.connect(self.disconnect_all_requested.emit)
         disc_row.addWidget(self.disconnect_all_btn)
         root.addLayout(disc_row)
+
+        self.auto_reconnect_box = QCheckBox("斷線自動重連")
+        self.auto_reconnect_box.setObjectName("autoReconnectBox")
+        self.auto_reconnect_box.toggled.connect(self.auto_reconnect_changed.emit)
+        root.addWidget(self.auto_reconnect_box)
 
         rec_active_row = QHBoxLayout()
         rec_active_row.setSpacing(8)
@@ -581,6 +588,9 @@ class ScanPanel(QWidget):
         if not isinstance(result, DeviceScanResult):
             QMessageBox.information(self, "尚未選擇", "請先選擇一個裝置。")
             return
+        if result.address in self._connected_addresses or result.address in self._reconnecting_addresses:
+            self.active_changed.emit(result.address)
+            return
         self._set_scan_state("正在連線", f"正在連線 {result.name} ...")
         self.device_connect_requested.emit(result)
 
@@ -735,3 +745,8 @@ class ScanPanel(QWidget):
             self.recording_status,
         ):
             widget.setVisible(visible)
+
+    def set_auto_reconnect_enabled(self, enabled: bool) -> None:
+        self.auto_reconnect_box.blockSignals(True)
+        self.auto_reconnect_box.setChecked(enabled)
+        self.auto_reconnect_box.blockSignals(False)

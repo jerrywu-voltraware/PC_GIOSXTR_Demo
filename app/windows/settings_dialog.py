@@ -45,7 +45,7 @@ class SettingsDialog(QDialog):
         self,
         *,
         engineering_mode: bool,
-        auto_reconnect_enabled: bool = False,
+        auto_reconnect_enabled: bool = True,
         demo_use_fake_data: bool = True,
         demo_device_name: str = DEFAULT_DEMO_DEVICE_NAME,
         demo_ebike_pct: int = 76,

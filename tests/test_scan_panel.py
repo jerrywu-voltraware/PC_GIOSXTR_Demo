@@ -112,6 +112,51 @@ def test_connected_device_list_marks_reconnecting_device():
     assert "90:6C:0A:C9:96:00" in panel._reconnecting_addresses
 
 
+def test_scan_panel_connected_scan_result_switches_active_without_reconnect():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.ble_manager import DeviceScanResult
+    from app.windows.scan_panel import ScanPanel
+
+    app = QApplication.instance() or QApplication([])
+    panel = ScanPanel(ble=object())
+    result = DeviceScanResult(
+        address="90:04:22:B6:96:00",
+        name="GIOS0801ST#45",
+        rssi=-52,
+        raw_hex="",
+        advertising_rows=[],
+        device_number=45,
+        firmware_revision=None,
+    )
+    panel.results = [result]
+    panel.refresh_connected_devices(
+        [
+            {
+                "address": result.address,
+                "name": result.name,
+                "device_number": "45",
+                "connected": "1",
+                "reconnecting": "0",
+                "recording": "0",
+                "packets": "139",
+            }
+        ],
+        result.address,
+    )
+    panel.list_widget.setCurrentRow(0)
+    connect_requests: list[str] = []
+    active_changes: list[str] = []
+    panel.device_connect_requested.connect(lambda item: connect_requests.append(item.address))
+    panel.active_changed.connect(active_changes.append)
+
+    panel.connect_selected()
+
+    assert connect_requests == []
+    assert active_changes == [result.address]
+
+
 def test_connected_device_list_colors_recording_device_red_and_splits_status():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtGui import QColor
@@ -185,6 +230,26 @@ def test_scan_panel_uses_scroll_area_and_flexible_list_heights():
     assert panel.connected_list.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
     assert panel.list_widget.minimumHeight() <= 160
     assert panel.connected_list.minimumHeight() <= 96
+
+
+def test_scan_panel_auto_reconnect_toggle_is_visible_and_emits():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.windows.scan_panel import ScanPanel
+
+    app = QApplication.instance() or QApplication([])
+    panel = ScanPanel(ble=object())
+    received: list[bool] = []
+    panel.auto_reconnect_changed.connect(received.append)
+
+    panel.set_auto_reconnect_enabled(True)
+    assert panel.auto_reconnect_box.isChecked()
+    assert received == []
+
+    panel.auto_reconnect_box.setChecked(False)
+
+    assert received == [False]
 
 
 def test_scan_panel_scan_result_rows_fit_custom_widgets():

@@ -68,6 +68,7 @@ def _default_update_save_path(asset: UpdateAsset, downloads_dir: str | None = No
 
 
 AUTO_RECONNECT_SETTINGS_KEY = "connection/autoReconnect"
+AUTO_RECONNECT_DEFAULT = True
 DEMO_CHARGER_MODE_SETTINGS_KEY = "demo/chargerMode"
 DEMO_EBIKE_STYLE_SETTINGS_KEY = "demo/ebikeStyle"
 SETTINGS_ORGANIZATION = "GIOSXTR"
@@ -135,7 +136,7 @@ class MainWindow(QMainWindow):
         self.state = DeviceState()
         self._update_check_running = False
         self._last_adapter_status: AdapterStatus | None = None
-        self.auto_reconnect_enabled = _settings_bool(AUTO_RECONNECT_SETTINGS_KEY, False)
+        self.auto_reconnect_enabled = _settings_bool(AUTO_RECONNECT_SETTINGS_KEY, AUTO_RECONNECT_DEFAULT)
         self._manual_disconnect_addresses: set[str] = set()
         # Addresses that are connecting OR connected-but-not-yet-streaming.
         # The dongle cannot start a new connection while a previous link is
@@ -172,6 +173,8 @@ class MainWindow(QMainWindow):
         self.scan_panel.recording_start_all_requested.connect(self.start_csv_recording_all)
         self.scan_panel.recording_stop_all_requested.connect(self.stop_csv_recording_all)
         self.scan_panel.open_log_folder_requested.connect(self._open_log_folder)
+        self.scan_panel.auto_reconnect_changed.connect(self.set_auto_reconnect_enabled)
+        self.scan_panel.set_auto_reconnect_enabled(self.auto_reconnect_enabled)
         layout.addWidget(self.scan_panel)
 
         content = QWidget()
@@ -553,6 +556,9 @@ class MainWindow(QMainWindow):
 
     def set_auto_reconnect_enabled(self, enabled: bool, *, persist: bool = True) -> None:
         self.auto_reconnect_enabled = bool(enabled)
+        scan_panel = getattr(self, "scan_panel", None)
+        if scan_panel is not None:
+            scan_panel.set_auto_reconnect_enabled(self.auto_reconnect_enabled)
         if persist:
             _ensure_settings_identity()
             QSettings().setValue(AUTO_RECONNECT_SETTINGS_KEY, self.auto_reconnect_enabled)
@@ -567,7 +573,17 @@ class MainWindow(QMainWindow):
     @asyncSlot(object)
     async def _connect_device(self, result: DeviceScanResult) -> None:
         address = result.address
+        if address in self._connect_in_progress:
+            if address in self.states:
+                self._set_active(address)
+            return
         if address in self.managers:
+            self._set_active(address)
+            return
+        existing_state = self.states.get(address)
+        if existing_state is not None and (
+            existing_state.is_connected or address in self._reconnecting_addresses
+        ):
             self._set_active(address)
             return
 

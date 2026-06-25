@@ -160,6 +160,7 @@ _CONNECT_ERROR_PREFIXES = (
     "CONNECT TIMEOUT",
 )
 _DONGLE_CONNECT_TIMEOUT_SECONDS = 35.0
+_DONGLE_DISCONNECT_TIMEOUT_SECONDS = 5.0
 
 
 def _crc16_ccitt(data: bytes) -> int:
@@ -209,10 +210,15 @@ class DongleDeviceManager:
         self._connected = True
 
     async def disconnect(self) -> None:
-        if self.address:
-            await self._source._disconnect(self.address)
-        self._connected = False
-        self._source._unregister_manager(self.address)
+        address = self.address
+        if address:
+            try:
+                await self._source._disconnect(address)
+            finally:
+                self._connected = False
+                self._source._unregister_manager(address)
+        else:
+            self._connected = False
 
     async def enable_default_notifications(self) -> None:
         # The dongle subscribes to the device's 200B characteristic itself.
@@ -292,6 +298,7 @@ class DongleSource(DeviceSource):
         self._scan_expect: int | None = None
         self._scan_debug = False  # log every received line during scan() window
         self._connect_futures: dict[str, asyncio.Future[bool]] = {}
+        self._disconnect_futures: dict[str, asyncio.Future[bool]] = {}
         self._connect_lock = asyncio.Lock()
         self._active_connect_mac: str | None = None
 
@@ -317,6 +324,7 @@ class DongleSource(DeviceSource):
     async def scan(
         self, timeout: float = 5.0, supported_only: bool = True
     ) -> list[DeviceScanResult]:
+        await self._wait_for_pending_disconnects()
         # Start scanning, let advertisements accumulate, then pull the list.
         self._scan_lines = []
         self._scan_expect = None
@@ -394,8 +402,29 @@ class DongleSource(DeviceSource):
                     self._active_connect_mac = None
 
     async def _disconnect(self, mac: str) -> None:
-        # Fire-and-forget: the DISCONNECTED line drives UI cleanup.
+        future: asyncio.Future[bool] = self._loop.create_future()
+        self._disconnect_futures[mac] = future
         self._send_command(f"AT+DISC={mac}")
+        try:
+            await asyncio.wait_for(future, timeout=_DONGLE_DISCONNECT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            _write_scan_debug(f"dongle disconnect timed out for {mac}")
+        finally:
+            self._disconnect_futures.pop(mac, None)
+
+    async def _wait_for_pending_disconnects(self) -> None:
+        futures = [future for future in self._disconnect_futures.values() if not future.done()]
+        if not futures:
+            return
+        _write_scan_debug(f"dongle scan: waiting for {len(futures)} pending disconnect(s)")
+        done, pending = await asyncio.wait(
+            futures,
+            timeout=_DONGLE_DISCONNECT_TIMEOUT_SECONDS,
+        )
+        if pending:
+            _write_scan_debug(
+                f"dongle scan: {len(pending)} pending disconnect(s) still incomplete"
+            )
 
     @staticmethod
     def _parse_scan_results(lines: list[str]) -> list[DeviceScanResult]:
@@ -535,9 +564,13 @@ class DongleSource(DeviceSource):
             handle = int(match.group(1))
             mac = self._handle_to_mac.pop(handle, None)
             if mac is not None:
+                future = self._disconnect_futures.get(mac)
+                if future is not None and not future.done():
+                    future.set_result(True)
                 manager = self._managers.get(mac)
                 if manager is not None:
                     manager._dispatch_disconnect()
+                self._unregister_manager(mac)
             return
 
     def _fail_active_connect(self, message: str) -> None:

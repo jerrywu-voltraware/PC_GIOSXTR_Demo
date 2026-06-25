@@ -267,6 +267,59 @@ def test_manual_disconnect_removes_state_without_reconnect(monkeypatch):
     window.close()
 
 
+def test_connect_device_skips_existing_connected_state_without_manager():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import asyncio
+
+    from PyQt6.QtWidgets import QApplication
+
+    from app.ble_manager import DeviceScanResult
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    class FakeSource:
+        requires_ready_before_next_connect = False
+        supports_control = True
+
+        def __init__(self):
+            self.create_calls = 0
+
+        def create_manager(self):
+            self.create_calls += 1
+            raise AssertionError("should not create a second manager")
+
+    app = QApplication.instance() or QApplication([])
+    source = FakeSource()
+    window = MainWindow(source=source)
+    state = DeviceState(is_connected=True, device_name="A", device_address="AA:BB", device_number=45)
+    window.states[state.device_address] = state
+    window.active_address = state.device_address
+    window.state = state
+    warnings: list[tuple[str, str]] = []
+    window._show_warning = lambda title, message: warnings.append((title, message))
+
+    asyncio.run(
+        window._connect_device.__wrapped__(
+            window,
+            DeviceScanResult(
+                address=state.device_address,
+                name=state.device_name,
+                rssi=-52,
+                raw_hex="",
+                advertising_rows=[],
+                device_number=state.device_number,
+                firmware_revision=None,
+            ),
+        )
+    )
+
+    assert source.create_calls == 0
+    assert warnings == []
+    assert window.active_address == state.device_address
+    window._close_after_disconnect = True
+    window.close()
+
+
 def test_reconnect_device_rebuilds_manager_and_notifications():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     import asyncio
@@ -583,6 +636,48 @@ def test_settings_dialog_exposes_auto_reconnect_toggle():
     dialog.auto_reconnect_box.setChecked(False)
 
     assert received == [False]
+
+
+def test_settings_dialog_auto_reconnect_defaults_on():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.windows.settings_dialog import SettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(engineering_mode=False)
+
+    assert dialog.auto_reconnect_box.isChecked()
+
+
+def test_main_window_auto_reconnect_defaults_on_and_syncs_scan_panel():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtCore import QSettings
+    from PyQt6.QtWidgets import QApplication
+
+    from app.windows.main_window import (
+        AUTO_RECONNECT_SETTINGS_KEY,
+        MainWindow,
+        _ensure_settings_identity,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    _ensure_settings_identity()
+    settings = QSettings()
+    settings.remove(AUTO_RECONNECT_SETTINGS_KEY)
+    try:
+        window = MainWindow()
+        assert window.auto_reconnect_enabled
+        assert window.scan_panel.auto_reconnect_box.isChecked()
+
+        window.scan_panel.auto_reconnect_box.setChecked(False)
+
+        assert not window.auto_reconnect_enabled
+        assert QSettings().value(AUTO_RECONNECT_SETTINGS_KEY, type=bool) is False
+        window._close_after_disconnect = True
+        window.close()
+    finally:
+        settings.remove(AUTO_RECONNECT_SETTINGS_KEY)
 
 
 def test_settings_dialog_has_demo_defaults():
