@@ -6,6 +6,7 @@ from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -19,13 +20,23 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..constants import APP_NAME, APP_VERSION, DEFAULT_DEMO_DEVICE_NAME
+from ..constants import (
+    APP_NAME,
+    APP_VERSION,
+    DEFAULT_DEMO_CHARGER_MODE,
+    DEFAULT_DEMO_EBIKE_STYLE,
+    DEFAULT_DEMO_DEVICE_NAME,
+    DEMO_CHARGER_MODE_CHOICES,
+    DEMO_EBIKE_STYLE_CHOICES,
+    normalize_demo_charger_mode,
+    normalize_demo_ebike_style,
+)
 from ..theme import THEME_DARK, THEME_LIGHT, theme_manager
 
 
 class SettingsDialog(QDialog):
     engineering_mode_changed = pyqtSignal(bool)
-    demo_settings_changed = pyqtSignal(bool, int, int, str, object)
+    demo_settings_changed = pyqtSignal(bool, int, int, str, object, str, str)
     check_updates_requested = pyqtSignal()
     auto_reconnect_changed = pyqtSignal(bool)
     switch_source_requested = pyqtSignal()
@@ -39,6 +50,8 @@ class SettingsDialog(QDialog):
         demo_device_name: str = DEFAULT_DEMO_DEVICE_NAME,
         demo_ebike_pct: int = 76,
         demo_escooter_pct: int = 81,
+        demo_charger_mode: str = DEFAULT_DEMO_CHARGER_MODE,
+        demo_ebike_style: str = DEFAULT_DEMO_EBIKE_STYLE,
         demo_device_battery_pcts: dict[str, int] | None = None,
         connected_demo_devices: list[dict[str, object]] | None = None,
         source_display_name: str = "",
@@ -57,7 +70,17 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._about_tab(), "關於")
         tabs.addTab(self._appearance_tab(), "外觀")
         tabs.addTab(self._connection_tab(auto_reconnect_enabled), "連線")
-        tabs.addTab(self._demo_tab(demo_use_fake_data, demo_device_name, demo_ebike_pct, demo_escooter_pct), "DEMO")
+        tabs.addTab(
+            self._demo_tab(
+                demo_use_fake_data,
+                demo_device_name,
+                demo_ebike_pct,
+                demo_escooter_pct,
+                demo_charger_mode,
+                demo_ebike_style,
+            ),
+            "DEMO",
+        )
         tabs.addTab(self._engineering_tab(engineering_mode), "工程模式")
         root.addWidget(tabs)
 
@@ -172,7 +195,15 @@ class SettingsDialog(QDialog):
         layout.addStretch(1)
         return page
 
-    def _demo_tab(self, use_fake_data: bool, device_name: str, ebike_pct: int, escooter_pct: int) -> QWidget:
+    def _demo_tab(
+        self,
+        use_fake_data: bool,
+        device_name: str,
+        ebike_pct: int,
+        escooter_pct: int,
+        charger_mode: str,
+        ebike_style: str,
+    ) -> QWidget:
         page = QWidget()
         layout = QFormLayout(page)
         layout.setContentsMargins(14, 14, 14, 14)
@@ -182,6 +213,26 @@ class SettingsDialog(QDialog):
         self.demo_fake_data_box.setChecked(use_fake_data)
         self.demo_fake_data_box.toggled.connect(self._emit_demo_settings)
         layout.addRow("資料來源", self.demo_fake_data_box)
+
+        self.demo_charger_mode_combo = QComboBox()
+        for value, label in DEMO_CHARGER_MODE_CHOICES:
+            self.demo_charger_mode_combo.addItem(label, value)
+        mode_index = self.demo_charger_mode_combo.findData(
+            normalize_demo_charger_mode(charger_mode)
+        )
+        self.demo_charger_mode_combo.setCurrentIndex(max(0, mode_index))
+        self.demo_charger_mode_combo.currentIndexChanged.connect(self._emit_demo_settings)
+        layout.addRow("充電方式", self.demo_charger_mode_combo)
+
+        self.demo_ebike_style_combo = QComboBox()
+        for value, label in DEMO_EBIKE_STYLE_CHOICES:
+            self.demo_ebike_style_combo.addItem(label, value)
+        style_index = self.demo_ebike_style_combo.findData(
+            normalize_demo_ebike_style(ebike_style)
+        )
+        self.demo_ebike_style_combo.setCurrentIndex(max(0, style_index))
+        self.demo_ebike_style_combo.currentIndexChanged.connect(self._emit_demo_settings)
+        layout.addRow("E-BIKE 圖示", self.demo_ebike_style_combo)
 
         self.demo_device_name_edit = QLineEdit()
         self.demo_device_name_edit.setText(device_name)
@@ -239,4 +290,6 @@ class SettingsDialog(QDialog):
             self.demo_escooter_spin.value(),
             self.demo_device_name_edit.text().strip() or DEFAULT_DEMO_DEVICE_NAME,
             self._device_battery_pcts(),
+            normalize_demo_charger_mode(self.demo_charger_mode_combo.currentData()),
+            normalize_demo_ebike_style(self.demo_ebike_style_combo.currentData()),
         )

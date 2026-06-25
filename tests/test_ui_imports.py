@@ -111,6 +111,46 @@ def test_main_window_shows_device_tabs_for_multiple_ptus():
     window.close()
 
 
+def test_main_window_clears_active_packet_counts_from_scan_panel():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication, QLabel
+
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    state = DeviceState(
+        is_connected=True,
+        device_name="GIOS0801ST#45",
+        device_address="90:04:22:B6:96:00",
+        device_number=45,
+        packet_count_iot=5,
+        packet_count_20b=3,
+        packet_count_200b=44,
+    )
+    window.states[state.device_address] = state
+    window.active_address = state.device_address
+    window.state = state
+    window.refresh_pages()
+
+    assert window.scan_panel.clear_packet_counts_btn.isEnabled()
+
+    window.scan_panel.clear_packet_counts_btn.click()
+
+    assert state.packet_count_iot == 0
+    assert state.packet_count_20b == 0
+    assert state.packet_count_200b == 0
+    assert window.overview_page.labels["packets"].text() == "IOT 0 / 20B 0 / 200B 0"
+    assert window._connected_summary()[0]["packets"] == "0"
+    status_label = window.scan_panel.connected_list.itemWidget(
+        window.scan_panel.connected_list.item(0)
+    ).findChild(QLabel, "connectedDeviceStatusLabel")
+    assert status_label is not None
+    assert "0" in status_label.text()
+    window.close()
+
+
 def test_main_window_device_tab_switches_active_ptu():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication
@@ -549,15 +589,58 @@ def test_settings_dialog_has_demo_defaults():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication
 
+    from app.constants import DEMO_CHARGER_MODE_PLATE, DEMO_EBIKE_STYLE_2
     from app.windows.settings_dialog import SettingsDialog
 
     app = QApplication.instance() or QApplication([])
     dialog = SettingsDialog(engineering_mode=False)
 
     assert dialog.demo_fake_data_box.isChecked()
+    assert dialog.demo_charger_mode_combo.currentData() == DEMO_CHARGER_MODE_PLATE
+    assert dialog.demo_ebike_style_combo.currentData() == DEMO_EBIKE_STYLE_2
     assert dialog.demo_device_name_edit.text() == "MMEU"
     assert dialog.demo_ebike_spin.value() == 76
     assert dialog.demo_escooter_spin.value() == 81
+
+
+def test_settings_dialog_emits_demo_charger_mode():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.constants import DEMO_CHARGER_MODE_STATION
+    from app.windows.settings_dialog import SettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(engineering_mode=False)
+    received = []
+    dialog.demo_settings_changed.connect(lambda *args: received.append(args))
+
+    dialog.demo_charger_mode_combo.setCurrentIndex(
+        dialog.demo_charger_mode_combo.findData(DEMO_CHARGER_MODE_STATION)
+    )
+
+    assert received
+    assert received[-1][-2] == DEMO_CHARGER_MODE_STATION
+
+
+def test_settings_dialog_emits_demo_ebike_style():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.constants import DEMO_EBIKE_STYLE_1
+    from app.windows.settings_dialog import SettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(engineering_mode=False)
+    received = []
+    dialog.demo_settings_changed.connect(lambda *args: received.append(args))
+
+    dialog.demo_ebike_style_combo.setCurrentIndex(
+        dialog.demo_ebike_style_combo.findData(DEMO_EBIKE_STYLE_1)
+    )
+
+    assert received
+    assert received[-1][-1] == DEMO_EBIKE_STYLE_1
 
 
 def test_settings_dialog_shows_connected_device_fake_battery_controls():
@@ -931,21 +1014,124 @@ def test_demo_real_battery_percent_uses_snapshot_values():
 
 def test_main_window_demo_settings_update_demo_page():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtCore import QSettings
     from PyQt6.QtWidgets import QApplication
 
+    from app.constants import (
+        DEMO_CHARGER_MODE_PLATE,
+        DEMO_CHARGER_MODE_STATION,
+        DEMO_EBIKE_STYLE_1,
+        DEMO_EBIKE_STYLE_2,
+    )
     from app.windows.demo2_page import EngMode
-    from app.windows.main_window import MainWindow
+    from app.windows.main_window import (
+        DEMO_CHARGER_MODE_SETTINGS_KEY,
+        DEMO_EBIKE_STYLE_SETTINGS_KEY,
+        MainWindow,
+        _ensure_settings_identity,
+    )
 
     app = QApplication.instance() or QApplication([])
+    _ensure_settings_identity()
+    QSettings().remove(DEMO_CHARGER_MODE_SETTINGS_KEY)
+    QSettings().remove(DEMO_EBIKE_STYLE_SETTINGS_KEY)
     window = MainWindow(engineering_mode=True)
 
     window.set_demo_settings(True, 77, 82, "MMEU")
+    assert window.demo2_page._demo_charger_mode == DEMO_CHARGER_MODE_PLATE
+    assert window.demo2_page._demo_ebike_style == DEMO_EBIKE_STYLE_2
     window.demo2_page._set_eng_mode(EngMode.CHARGING_BIKE)
     assert window.demo2_page.pct_label.text() == "77%"
 
     window.demo2_page._set_eng_mode(EngMode.CHARGING_SCOOTER)
     assert window.demo2_page.pct_label.text() == "82%"
+
+    window.set_demo_settings(
+        True,
+        77,
+        82,
+        "MMEU",
+        demo_charger_mode=DEMO_CHARGER_MODE_STATION,
+        demo_ebike_style=DEMO_EBIKE_STYLE_1,
+    )
+    window.demo2_page._set_eng_mode(EngMode.CHARGING_BIKE)
+    assert window.demo_charger_mode == DEMO_CHARGER_MODE_STATION
+    assert window.demo_ebike_style == DEMO_EBIKE_STYLE_1
+    assert window.demo2_page.stage._charger_mode == DEMO_CHARGER_MODE_STATION
+    assert window.demo2_page.stage._ebike_style == DEMO_EBIKE_STYLE_1
     window.close()
+    QSettings().remove(DEMO_CHARGER_MODE_SETTINGS_KEY)
+    QSettings().remove(DEMO_EBIKE_STYLE_SETTINGS_KEY)
+
+
+def test_main_window_persists_demo_charger_mode():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtCore import QSettings
+    from PyQt6.QtWidgets import QApplication
+
+    from app.constants import DEMO_CHARGER_MODE_PLATE, DEMO_CHARGER_MODE_STATION
+    from app.windows.main_window import (
+        DEMO_CHARGER_MODE_SETTINGS_KEY,
+        DEMO_EBIKE_STYLE_SETTINGS_KEY,
+        MainWindow,
+        _ensure_settings_identity,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    _ensure_settings_identity()
+    settings = QSettings()
+    settings.remove(DEMO_CHARGER_MODE_SETTINGS_KEY)
+    settings.remove(DEMO_EBIKE_STYLE_SETTINGS_KEY)
+    try:
+        first = MainWindow()
+        assert first.demo_charger_mode == DEMO_CHARGER_MODE_PLATE
+
+        first.set_demo_settings(True, 76, 81, "MMEU", demo_charger_mode=DEMO_CHARGER_MODE_STATION)
+        assert QSettings().value(DEMO_CHARGER_MODE_SETTINGS_KEY) == DEMO_CHARGER_MODE_STATION
+        first.close()
+
+        second = MainWindow()
+        assert second.demo_charger_mode == DEMO_CHARGER_MODE_STATION
+        assert second.demo2_page._demo_charger_mode == DEMO_CHARGER_MODE_STATION
+        second.close()
+    finally:
+        settings.remove(DEMO_CHARGER_MODE_SETTINGS_KEY)
+        settings.remove(DEMO_EBIKE_STYLE_SETTINGS_KEY)
+
+
+def test_main_window_persists_demo_ebike_style():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtCore import QSettings
+    from PyQt6.QtWidgets import QApplication
+
+    from app.constants import DEMO_EBIKE_STYLE_1, DEMO_EBIKE_STYLE_2
+    from app.windows.main_window import (
+        DEMO_CHARGER_MODE_SETTINGS_KEY,
+        DEMO_EBIKE_STYLE_SETTINGS_KEY,
+        MainWindow,
+        _ensure_settings_identity,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    _ensure_settings_identity()
+    settings = QSettings()
+    settings.remove(DEMO_CHARGER_MODE_SETTINGS_KEY)
+    settings.remove(DEMO_EBIKE_STYLE_SETTINGS_KEY)
+    try:
+        first = MainWindow()
+        assert first.demo_ebike_style == DEMO_EBIKE_STYLE_2
+
+        first.set_demo_settings(True, 76, 81, "MMEU", demo_ebike_style=DEMO_EBIKE_STYLE_1)
+        assert QSettings().value(DEMO_EBIKE_STYLE_SETTINGS_KEY) == DEMO_EBIKE_STYLE_1
+        first.close()
+
+        second = MainWindow()
+        assert second.demo_ebike_style == DEMO_EBIKE_STYLE_1
+        assert second.demo2_page._demo_ebike_style == DEMO_EBIKE_STYLE_1
+        second.close()
+    finally:
+        settings.remove(DEMO_CHARGER_MODE_SETTINGS_KEY)
+        settings.remove(DEMO_EBIKE_STYLE_SETTINGS_KEY)
 
 
 def test_pru_connected_event_does_not_auto_start_csv_recording(tmp_path):

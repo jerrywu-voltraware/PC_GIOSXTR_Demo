@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from PyQt6.QtCore import QSettings, QStandardPaths, QTimer, Qt, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QCoreApplication, QSettings, QStandardPaths, QTimer, Qt, QUrl, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QDesktopServices, QIcon
 from PyQt6.QtWidgets import (
     QFileDialog,
@@ -25,7 +25,17 @@ from ..ble_adapter import AdapterCheckResult, AdapterStatus, check_bluetooth_ada
 from ..ble_manager import BleManager, DeviceScanResult
 from ..ble_manager import _write_scan_debug
 from ..device_source import DeviceManager, DeviceSource, PcBleSource
-from ..constants import APP_ICON_FILENAME, APP_VERSION, APP_WINDOW_TITLE, DEFAULT_DEMO_DEVICE_NAME
+from ..constants import (
+    APP_ICON_FILENAME,
+    APP_NAME,
+    APP_VERSION,
+    APP_WINDOW_TITLE,
+    DEFAULT_DEMO_CHARGER_MODE,
+    DEFAULT_DEMO_EBIKE_STYLE,
+    DEFAULT_DEMO_DEVICE_NAME,
+    normalize_demo_charger_mode,
+    normalize_demo_ebike_style,
+)
 from ..csv_logger import CsvLogger
 from ..models import DataEvent, DeviceState
 from ..protocol import parse_notify_packet
@@ -58,15 +68,38 @@ def _default_update_save_path(asset: UpdateAsset, downloads_dir: str | None = No
 
 
 AUTO_RECONNECT_SETTINGS_KEY = "connection/autoReconnect"
+DEMO_CHARGER_MODE_SETTINGS_KEY = "demo/chargerMode"
+DEMO_EBIKE_STYLE_SETTINGS_KEY = "demo/ebikeStyle"
+SETTINGS_ORGANIZATION = "GIOSXTR"
 RECONNECT_DELAYS_SECONDS = (1.0, 3.0, 5.0, 10.0)
 RECONNECT_MAX_ATTEMPTS = 10
 
 
+def _ensure_settings_identity() -> None:
+    if not QCoreApplication.organizationName():
+        QCoreApplication.setOrganizationName(SETTINGS_ORGANIZATION)
+    if QCoreApplication.applicationName().strip().lower() in {"", "python"}:
+        QCoreApplication.setApplicationName(APP_NAME)
+
+
 def _settings_bool(key: str, default: bool = False) -> bool:
+    _ensure_settings_identity()
     value = QSettings().value(key, default)
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _settings_demo_charger_mode() -> str:
+    _ensure_settings_identity()
+    value = QSettings().value(DEMO_CHARGER_MODE_SETTINGS_KEY, DEFAULT_DEMO_CHARGER_MODE)
+    return normalize_demo_charger_mode(value)
+
+
+def _settings_demo_ebike_style() -> str:
+    _ensure_settings_identity()
+    value = QSettings().value(DEMO_EBIKE_STYLE_SETTINGS_KEY, DEFAULT_DEMO_EBIKE_STYLE)
+    return normalize_demo_ebike_style(value)
 
 
 class MainWindow(QMainWindow):
@@ -95,6 +128,8 @@ class MainWindow(QMainWindow):
         self.demo_device_name = DEFAULT_DEMO_DEVICE_NAME
         self.demo_ebike_pct = 76
         self.demo_escooter_pct = 81
+        self.demo_charger_mode = _settings_demo_charger_mode()
+        self.demo_ebike_style = _settings_demo_ebike_style()
         self.demo_device_battery_pcts: dict[str, int] = {}
         self.active_address: str = ""
         self.state = DeviceState()
@@ -129,6 +164,7 @@ class MainWindow(QMainWindow):
         self.scan_panel.device_connect_requested.connect(self._connect_device)
         self.scan_panel.disconnect_requested.connect(self._disconnect_active)
         self.scan_panel.disconnect_all_requested.connect(self._disconnect_all)
+        self.scan_panel.packet_counts_clear_requested.connect(self.clear_packet_counts_active)
         self.scan_panel.active_changed.connect(self._set_active)
         self.scan_panel.selected_device_changed.connect(self._set_demo_preview_device)
         self.scan_panel.recording_start_requested.connect(self.start_csv_recording_active)
@@ -168,6 +204,8 @@ class MainWindow(QMainWindow):
             demo_device_name=self.demo_device_name,
             demo_ebike_pct=self.demo_ebike_pct,
             demo_escooter_pct=self.demo_escooter_pct,
+            demo_charger_mode=self.demo_charger_mode,
+            demo_ebike_style=self.demo_ebike_style,
             demo_device_battery_pcts=self.demo_device_battery_pcts,
         )
         self.log_page = LogPage()
@@ -231,11 +269,21 @@ class MainWindow(QMainWindow):
         escooter_pct: int,
         device_name: str,
         device_battery_pcts: dict[str, int] | None = None,
+        demo_charger_mode: str = DEFAULT_DEMO_CHARGER_MODE,
+        demo_ebike_style: str = DEFAULT_DEMO_EBIKE_STYLE,
+        *,
+        persist: bool = True,
     ) -> None:
         self.demo_use_fake_data = use_fake_data
         self.demo_device_name = device_name.strip() or DEFAULT_DEMO_DEVICE_NAME
         self.demo_ebike_pct = ebike_pct
         self.demo_escooter_pct = escooter_pct
+        self.demo_charger_mode = normalize_demo_charger_mode(demo_charger_mode)
+        self.demo_ebike_style = normalize_demo_ebike_style(demo_ebike_style)
+        if persist:
+            _ensure_settings_identity()
+            QSettings().setValue(DEMO_CHARGER_MODE_SETTINGS_KEY, self.demo_charger_mode)
+            QSettings().setValue(DEMO_EBIKE_STYLE_SETTINGS_KEY, self.demo_ebike_style)
         if device_battery_pcts is not None:
             self.demo_device_battery_pcts = {
                 str(address).strip(): max(0, min(100, int(pct)))
@@ -247,6 +295,8 @@ class MainWindow(QMainWindow):
             device_name=self.demo_device_name,
             ebike_pct=ebike_pct,
             escooter_pct=escooter_pct,
+            demo_charger_mode=self.demo_charger_mode,
+            demo_ebike_style=self.demo_ebike_style,
             device_battery_pcts=self.demo_device_battery_pcts,
         )
 
@@ -257,6 +307,8 @@ class MainWindow(QMainWindow):
             demo_device_name=self.demo_device_name,
             demo_ebike_pct=self.demo_ebike_pct,
             demo_escooter_pct=self.demo_escooter_pct,
+            demo_charger_mode=self.demo_charger_mode,
+            demo_ebike_style=self.demo_ebike_style,
             demo_device_battery_pcts=self.demo_device_battery_pcts,
             connected_demo_devices=self._connected_demo_device_settings(),
             auto_reconnect_enabled=self.auto_reconnect_enabled,
@@ -502,6 +554,7 @@ class MainWindow(QMainWindow):
     def set_auto_reconnect_enabled(self, enabled: bool, *, persist: bool = True) -> None:
         self.auto_reconnect_enabled = bool(enabled)
         if persist:
+            _ensure_settings_identity()
             QSettings().setValue(AUTO_RECONNECT_SETTINGS_KEY, self.auto_reconnect_enabled)
         if not self.auto_reconnect_enabled:
             for task in list(self._reconnect_tasks.values()):
@@ -611,6 +664,18 @@ class MainWindow(QMainWindow):
     async def _disconnect_all(self) -> None:
         for addr in list({*self.states.keys(), *self.managers.keys()}):
             await self._disconnect_address(addr)
+
+    @pyqtSlot()
+    def clear_packet_counts_active(self) -> None:
+        addr = self.active_address
+        if not addr:
+            return
+        state = self.states.get(addr)
+        if state is None or not state.is_connected:
+            return
+        state.reset_packet_counts()
+        state.add_log("Packet counters cleared")
+        self.refresh_pages()
 
     async def _disconnect_address(self, address: str) -> None:
         self._manual_disconnect_addresses.add(address)

@@ -3,12 +3,42 @@
 from __future__ import annotations
 
 APP_NAME = "PC GIOSXTR Demo"
-APP_VERSION = "V1.0.20"
+APP_VERSION = "V1.0.21"
 APP_WINDOW_TITLE = f"{APP_NAME} {APP_VERSION}"
 APP_ICON_FILENAME = "1024.png"
-APP_EXECUTABLE_NAME = "PC_GIOSXTR_Demo_V1.0.20"
+APP_EXECUTABLE_NAME = "PC_GIOSXTR_Demo_V1.0.21"
 ENGINEERING_MODE_ENV = "PC_GIOSXTR_ENGINEERING"
 DEFAULT_DEMO_DEVICE_NAME = "MMEU"
+DEMO_CHARGER_MODE_STATION = "station"
+DEMO_CHARGER_MODE_PLATE = "plate"
+DEFAULT_DEMO_CHARGER_MODE = DEMO_CHARGER_MODE_PLATE
+DEMO_CHARGER_MODE_CHOICES = (
+    (DEMO_CHARGER_MODE_STATION, "充電樁"),
+    (DEMO_CHARGER_MODE_PLATE, "充電板"),
+)
+DEMO_EBIKE_STYLE_1 = "style1"
+DEMO_EBIKE_STYLE_2 = "style2"
+DEFAULT_DEMO_EBIKE_STYLE = DEMO_EBIKE_STYLE_2
+DEMO_EBIKE_STYLE_CHOICES = (
+    (DEMO_EBIKE_STYLE_1, "E-BIKE 樣式1"),
+    (DEMO_EBIKE_STYLE_2, "E-BIKE 樣式2"),
+)
+
+
+def normalize_demo_charger_mode(value: object) -> str:
+    if str(value) == DEMO_CHARGER_MODE_STATION:
+        return DEMO_CHARGER_MODE_STATION
+    if str(value) == DEMO_CHARGER_MODE_PLATE:
+        return DEMO_CHARGER_MODE_PLATE
+    return DEFAULT_DEMO_CHARGER_MODE
+
+
+def normalize_demo_ebike_style(value: object) -> str:
+    if str(value) == DEMO_EBIKE_STYLE_1:
+        return DEMO_EBIKE_STYLE_1
+    if str(value) == DEMO_EBIKE_STYLE_2:
+        return DEMO_EBIKE_STYLE_2
+    return DEFAULT_DEMO_EBIKE_STYLE
 
 SUPPORTED_DEVICES = (
     "Central",

@@ -111,6 +111,11 @@ class DeviceState:
     def total_packet_count(self) -> int:
         return self.packet_count_200b + self.packet_count_20b + self.packet_count_iot
 
+    def reset_packet_counts(self) -> None:
+        self.packet_count_200b = 0
+        self.packet_count_20b = 0
+        self.packet_count_iot = 0
+
     def update_efficiency(self) -> None:
         if self.input_power_w > 0 and self.output_power_w > 0:
             self.system_eff = self.output_power_w / self.input_power_w * 100.0

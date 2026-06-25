@@ -40,7 +40,15 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from ..constants import DEFAULT_DEMO_DEVICE_NAME
+from ..constants import (
+    DEFAULT_DEMO_CHARGER_MODE,
+    DEFAULT_DEMO_EBIKE_STYLE,
+    DEFAULT_DEMO_DEVICE_NAME,
+    DEMO_CHARGER_MODE_PLATE,
+    DEMO_EBIKE_STYLE_2,
+    normalize_demo_charger_mode,
+    normalize_demo_ebike_style,
+)
 from ..models import DeviceState
 from ..resources import resource_path
 from ..theme import ThemeTokens, current_tokens, theme_manager
@@ -112,13 +120,17 @@ class _VehicleStage(QWidget):
         self._show_pad = False
         self._is_bike = False
         self._pru_connected = False
+        self._charger_mode = DEFAULT_DEMO_CHARGER_MODE
+        self._ebike_style = DEFAULT_DEMO_EBIKE_STYLE
 
-        self._pix_bike = self._load("assets/e-bike.png", remove_white=True) or self._load("app/assets/GIOS0403.png")
+        self._pix_bike_style_1 = self._load("assets/e-bike.png", remove_white=True) or self._load("app/assets/GIOS0403.png")
+        self._pix_bike_style_2 = self._load("assets/e-bike2.png", remove_white=True) or self._pix_bike_style_1
         self._pix_scooter = self._load("assets/e-scooter.png", remove_white=True) or self._load("app/assets/GIOS0404.png")
         self._pix_none = self._load("app/assets/No_device_clean.png")
         self._pix_pad = self._load("assets/charging_device.png", remove_white=True)
         # Battery icon position within the vehicle image (x_frac, y_frac).
-        self._battery_bike = (0.55, 0.50)
+        self._battery_bike_style_1 = (0.55, 0.50)
+        self._battery_bike_style_2 = (0.405, 0.50)
         self._battery_scooter = (0.45, 0.65)
         # Last vehicle draw rect (set during _draw_vehicle, used by _draw_energy_flow).
         self._vehicle_rect: QRectF | None = None
@@ -164,6 +176,8 @@ class _VehicleStage(QWidget):
         show_pad: bool,
         is_bike: bool,
         pru_connected: bool,
+        charger_mode: str = DEFAULT_DEMO_CHARGER_MODE,
+        ebike_style: str = DEFAULT_DEMO_EBIKE_STYLE,
     ) -> None:
         self._snapshot = snapshot
         self._is_charging = is_charging
@@ -172,6 +186,8 @@ class _VehicleStage(QWidget):
         self._show_pad = show_pad
         self._is_bike = is_bike
         self._pru_connected = pru_connected
+        self._charger_mode = normalize_demo_charger_mode(charger_mode)
+        self._ebike_style = normalize_demo_ebike_style(ebike_style)
         if is_charging or is_full or is_engineering:
             if not self._anim_timer.isActive():
                 self._anim_timer.start()
@@ -248,10 +264,15 @@ class _VehicleStage(QWidget):
         if not self._pru_connected:
             return None, "No Device", None, center_frac
         if self._snapshot.pru_type == "0403V1":
-            return self._pix_bike, "E-Bike", self._front_wheel_bike, (0.50, 0.493)
+            return self._selected_bike_pixmap(), "E-Bike", self._front_wheel_bike, (0.50, 0.493)
         if self._snapshot.pru_type == "0404V1":
             return self._pix_scooter, "E-Scooter", self._front_wheel_scooter, (0.508, 0.50)
         return None, "Engineering", None, center_frac
+
+    def _selected_bike_pixmap(self) -> QPixmap | None:
+        if self._ebike_style == DEMO_EBIKE_STYLE_2:
+            return self._pix_bike_style_2
+        return self._pix_bike_style_1
 
     def _vehicle_layout(
         self,
@@ -270,12 +291,20 @@ class _VehicleStage(QWidget):
             Qt.TransformationMode.SmoothTransformation,
         )
         if front_frac is not None:
-            pad_rect = self._pad_rect(w, h)
-            target_anchor_x = pad_rect.left() + pad_rect.width() * 0.42
-            target_anchor_y = pad_rect.bottom() - h * 0.005
             fx, fy = front_frac
-            x = target_anchor_x - scaled.width() * fx
-            y = target_anchor_y - scaled.height() * fy
+            if self._charger_mode == DEMO_CHARGER_MODE_PLATE:
+                plate_rect = self._plate_rect(w, h)
+                cx, _cy = center_frac
+                target_anchor_x = w * 0.50
+                target_anchor_y = plate_rect.top() + plate_rect.height() * 0.36
+                x = target_anchor_x - scaled.width() * cx
+                y = target_anchor_y - scaled.height() * fy
+            else:
+                pad_rect = self._pad_rect(w, h)
+                target_anchor_x = pad_rect.left() + pad_rect.width() * 0.42
+                target_anchor_y = pad_rect.bottom() - h * 0.005
+                x = target_anchor_x - scaled.width() * fx
+                y = target_anchor_y - scaled.height() * fy
         else:
             center_x = w * 0.50
             center_y = h * (0.56 if self._showcase_mode else 0.58)
@@ -307,7 +336,21 @@ class _VehicleStage(QWidget):
         pad_h = h * (0.32 if self._showcase_mode else 0.36)
         return QRectF(pad_cx - pad_w / 2, pad_cy - pad_h / 2, pad_w, pad_h)
 
+    def _plate_rect(self, w: float, h: float) -> QRectF:
+        plate_w = w * (0.74 if self._showcase_mode else 0.52)
+        plate_h = max(18.0, h * (0.058 if self._showcase_mode else 0.064))
+        plate_cx = w * 0.50
+        plate_cy = h * (0.785 if self._showcase_mode else 0.795)
+        return QRectF(plate_cx - plate_w / 2, plate_cy - plate_h / 2, plate_w, plate_h)
+
     def _draw_pad(self, p: QPainter, w: float, h: float, pulse: float) -> None:
+        if self._charger_mode == DEMO_CHARGER_MODE_PLATE:
+            self._draw_charge_plate(p, w, h, pulse)
+            return
+
+        self._draw_station(p, w, h, pulse)
+
+    def _draw_station(self, p: QPainter, w: float, h: float, pulse: float) -> None:
         pad_rect = self._pad_rect(w, h)
         pad_cx = pad_rect.center().x()
         pad_cy = pad_rect.center().y()
@@ -366,6 +409,127 @@ class _VehicleStage(QWidget):
                 wave_rect = QRectF(wcx - wave_w / 2, pad_cy - wave_h / 2, wave_w, wave_h)
                 p.drawArc(wave_rect, int(112 * 16), int(137 * 16))
 
+    def _draw_charge_plate(self, p: QPainter, w: float, h: float, pulse: float) -> None:
+        plate_rect = self._plate_rect(w, h)
+        radius = min(18.0, plate_rect.height() * 0.46)
+
+        glow_rect = QRectF(
+            plate_rect.left() - plate_rect.width() * 0.08,
+            plate_rect.top() - plate_rect.height() * (0.75 + 0.45 * pulse),
+            plate_rect.width() * 1.16,
+            plate_rect.height() * (2.4 + 0.7 * pulse),
+        )
+        glow = QRadialGradient(
+            glow_rect.center(),
+            max(glow_rect.width(), glow_rect.height()) * 0.55,
+        )
+        glow.setColorAt(
+            0.0,
+            QColor(0x18, 0xFF, 0xFF, int(255 * (0.16 + 0.16 * pulse))),
+        )
+        glow.setColorAt(0.58, QColor(0x18, 0xFF, 0xFF, int(255 * 0.08)))
+        glow.setColorAt(1.0, QColor(0x18, 0xFF, 0xFF, 0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(glow))
+        p.drawEllipse(glow_rect)
+
+        shadow_rect = QRectF(
+            plate_rect.left() + plate_rect.width() * 0.03,
+            plate_rect.top() + plate_rect.height() * 0.35,
+            plate_rect.width() * 0.94,
+            plate_rect.height() * 1.15,
+        )
+        p.setBrush(QColor(13, 31, 35, 58))
+        p.drawRoundedRect(shadow_rect, radius, radius)
+
+        body_grad = QLinearGradient(plate_rect.left(), plate_rect.top(), plate_rect.right(), plate_rect.bottom())
+        body_grad.setColorAt(0.0, QColor(0x12, 0x2F, 0x35, 238))
+        body_grad.setColorAt(0.48, QColor(0x1D, 0x55, 0x5F, 242))
+        body_grad.setColorAt(1.0, QColor(0x0C, 0x23, 0x28, 244))
+        p.setBrush(QBrush(body_grad))
+        p.setPen(QPen(QColor(0x82, 0xFF, 0xF4, 172), 1.7))
+        p.drawRoundedRect(plate_rect, radius, radius)
+
+        inset = plate_rect.adjusted(
+            plate_rect.width() * 0.035,
+            plate_rect.height() * 0.22,
+            -plate_rect.width() * 0.035,
+            -plate_rect.height() * 0.22,
+        )
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(0x18, 0xFF, 0xFF, 105), 1.2))
+        p.drawRoundedRect(inset, max(4.0, radius * 0.55), max(4.0, radius * 0.55))
+
+        coil_count = 4
+        coil_spacing = inset.width() / (coil_count + 1)
+        coil_radius_x = min(20.0, inset.width() * 0.045)
+        coil_radius_y = max(3.0, inset.height() * 0.33)
+        for index in range(coil_count):
+            cx = inset.left() + coil_spacing * (index + 1)
+            cy = inset.center().y()
+            coil_rect = QRectF(
+                cx - coil_radius_x,
+                cy - coil_radius_y,
+                coil_radius_x * 2,
+                coil_radius_y * 2,
+            )
+            alpha = 120 + int(70 * pulse) if self._is_charging else 92
+            p.setPen(
+                QPen(
+                    QColor(0x18, 0xFF, 0xFF, alpha),
+                    1.4,
+                    Qt.PenStyle.SolidLine,
+                    Qt.PenCapStyle.RoundCap,
+                )
+            )
+            p.drawEllipse(coil_rect)
+            inner = coil_rect.adjusted(
+                coil_radius_x * 0.34,
+                coil_radius_y * 0.34,
+                -coil_radius_x * 0.34,
+                -coil_radius_y * 0.34,
+            )
+            p.drawEllipse(inner)
+
+        highlight = plate_rect.adjusted(
+            plate_rect.width() * 0.08,
+            plate_rect.height() * 0.14,
+            -plate_rect.width() * 0.08,
+            -plate_rect.height() * 0.62,
+        )
+        p.setPen(
+            QPen(
+                QColor(255, 255, 255, 70),
+                1.1,
+                Qt.PenStyle.SolidLine,
+                Qt.PenCapStyle.RoundCap,
+            )
+        )
+        p.drawLine(
+            QPointF(highlight.left(), highlight.center().y()),
+            QPointF(highlight.right(), highlight.center().y()),
+        )
+
+        if not self._is_full:
+            for i in range(3):
+                wave_t = ((self._progress + i / 3) % 1.0) if self._is_charging else i / 3
+                alpha = (1.0 - wave_t) * 0.42 if self._is_charging else 0.13
+                p.setPen(
+                    QPen(
+                        QColor(0x18, 0xFF, 0xFF, int(255 * alpha)),
+                        2.0,
+                        Qt.PenStyle.SolidLine,
+                    )
+                )
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                wave_rect = QRectF(
+                    plate_rect.left() - w * (0.04 + 0.10 * wave_t),
+                    plate_rect.top() - h * (0.025 + 0.090 * wave_t),
+                    plate_rect.width() + w * (0.08 + 0.20 * wave_t),
+                    plate_rect.height() + h * (0.07 + 0.18 * wave_t),
+                )
+                p.drawEllipse(wave_rect)
+
     def _draw_energy_flow(self, p: QPainter, w: float, h: float) -> None:
         if self._vehicle_rect is None:
             return
@@ -377,15 +541,21 @@ class _VehicleStage(QWidget):
                            vr.top() + vr.height() * fy)
 
         if self._is_bike:
-            # Front wheel/fork -> head tube -> battery icon on the down tube.
+            # Front wheel/fork -> frame -> battery icon.
             front_hub = vpt(0.775, 0.60)
             fork_lower = vpt(0.746, 0.527)
             fork_upper = vpt(0.721, 0.453)
             head_tube = vpt(0.693, 0.379)
-            top_tube = vpt(0.669, 0.343)
-            frame_bend = vpt(0.641, 0.372)
-            battery_entry = vpt(0.602, 0.442)
-            node = vpt(0.55, 0.50)
+            if self._ebike_style == DEMO_EBIKE_STYLE_2:
+                top_tube = vpt(0.560, 0.390)
+                frame_bend = vpt(0.485, 0.445)
+                battery_entry = vpt(0.435, 0.480)
+                node = vpt(*self._battery_bike_style_2)
+            else:
+                top_tube = vpt(0.669, 0.343)
+                frame_bend = vpt(0.641, 0.372)
+                battery_entry = vpt(0.602, 0.442)
+                node = vpt(*self._battery_bike_style_1)
             waypoints = [
                 front_hub,
                 fork_lower,
@@ -676,6 +846,8 @@ class _ShowcaseDialog(QDialog):
         show_pad: bool,
         is_bike: bool,
         pru_connected: bool,
+        charger_mode: str = DEFAULT_DEMO_CHARGER_MODE,
+        ebike_style: str = DEFAULT_DEMO_EBIKE_STYLE,
         pct: int,
         icon_pct: int,
         show_panel: bool,
@@ -691,6 +863,8 @@ class _ShowcaseDialog(QDialog):
             show_pad=show_pad,
             is_bike=is_bike,
             pru_connected=pru_connected,
+            charger_mode=charger_mode,
+            ebike_style=ebike_style,
         )
         self.panel.setStyleSheet(self._panel_style if show_panel else self._panel_empty_style)
         self.battery_icon.setVisible(show_panel)
@@ -791,6 +965,8 @@ class _ShowcaseTile(QFrame):
         show_pad: bool,
         is_bike: bool,
         pru_connected: bool,
+        charger_mode: str = DEFAULT_DEMO_CHARGER_MODE,
+        ebike_style: str = DEFAULT_DEMO_EBIKE_STYLE,
         pct: int,
         icon_pct: int,
         device_text: str,
@@ -805,6 +981,8 @@ class _ShowcaseTile(QFrame):
             show_pad=show_pad,
             is_bike=is_bike,
             pru_connected=pru_connected,
+            charger_mode=charger_mode,
+            ebike_style=ebike_style,
         )
         self.battery_icon.set_pct(icon_pct)
         self.device_label.setText(device_text)
@@ -962,6 +1140,8 @@ class Demo2Page(QWidget):
         demo_device_name: str = DEFAULT_DEMO_DEVICE_NAME,
         demo_ebike_pct: int = 76,
         demo_escooter_pct: int = 81,
+        demo_charger_mode: str = DEFAULT_DEMO_CHARGER_MODE,
+        demo_ebike_style: str = DEFAULT_DEMO_EBIKE_STYLE,
         demo_device_battery_pcts: dict[str, int] | None = None,
         parent=None,
     ) -> None:
@@ -973,6 +1153,8 @@ class Demo2Page(QWidget):
         self._demo_device_name = demo_device_name.strip() or DEFAULT_DEMO_DEVICE_NAME
         self._demo_ebike_pct = self._clamp_pct(demo_ebike_pct)
         self._demo_escooter_pct = self._clamp_pct(demo_escooter_pct)
+        self._demo_charger_mode = normalize_demo_charger_mode(demo_charger_mode)
+        self._demo_ebike_style = normalize_demo_ebike_style(demo_ebike_style)
         self._demo_device_battery_pcts = self._clean_device_pcts(demo_device_battery_pcts or {})
         self._preview_device_name = ""
         self._preview_device_number: int | None = None
@@ -1118,12 +1300,16 @@ class Demo2Page(QWidget):
         device_name: str,
         ebike_pct: int,
         escooter_pct: int,
+        demo_charger_mode: str = DEFAULT_DEMO_CHARGER_MODE,
+        demo_ebike_style: str = DEFAULT_DEMO_EBIKE_STYLE,
         device_battery_pcts: dict[str, int] | None = None,
     ) -> None:
         self._demo_use_fake_data = use_fake_data
         self._demo_device_name = device_name.strip() or DEFAULT_DEMO_DEVICE_NAME
         self._demo_ebike_pct = self._clamp_pct(ebike_pct)
         self._demo_escooter_pct = self._clamp_pct(escooter_pct)
+        self._demo_charger_mode = normalize_demo_charger_mode(demo_charger_mode)
+        self._demo_ebike_style = normalize_demo_ebike_style(demo_ebike_style)
         if device_battery_pcts is not None:
             self._demo_device_battery_pcts = self._clean_device_pcts(device_battery_pcts)
         self.refresh(self._last_state)
@@ -1305,6 +1491,8 @@ class Demo2Page(QWidget):
             show_pad=show_pad,
             is_bike=is_bike,
             pru_connected=pru_connected,
+            charger_mode=self._demo_charger_mode,
+            ebike_style=self._demo_ebike_style,
         )
         self._refresh_showcase()
 
@@ -1380,6 +1568,8 @@ class Demo2Page(QWidget):
                 "show_pad": show_pad,
                 "is_bike": is_bike,
                 "pru_connected": pru_connected,
+                "charger_mode": self._demo_charger_mode,
+                "ebike_style": self._demo_ebike_style,
                 "pct": pct,
                 "icon_pct": self._animated_battery_pct(pct),
                 "device_text": self._device_text(state, snap, is_engineering),
@@ -1400,6 +1590,8 @@ class Demo2Page(QWidget):
         show_pad: bool,
         is_bike: bool,
         pru_connected: bool,
+        charger_mode: str,
+        ebike_style: str,
     ) -> None:
         stage.update_state(
             snapshot,
@@ -1409,6 +1601,8 @@ class Demo2Page(QWidget):
             show_pad=show_pad,
             is_bike=is_bike,
             pru_connected=pru_connected,
+            charger_mode=charger_mode,
+            ebike_style=ebike_style,
         )
 
     @staticmethod
