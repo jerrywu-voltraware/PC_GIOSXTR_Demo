@@ -543,6 +543,19 @@ class MainWindow(QMainWindow):
     def _create_ble_manager(self) -> DeviceManager:
         return self.source.create_manager()
 
+    async def _maybe_recover_source(self, exc: Exception) -> bool:
+        """Reset the data source after a connect timeout so the dongle does not
+        stay wedged (which would otherwise need an app restart). Returns True if
+        a recovery was attempted."""
+        recover = getattr(self.source, "recover", None)
+        if recover is None or not isinstance(exc, TimeoutError):
+            return False
+        try:
+            await recover("connect timed out")
+        except Exception:
+            return False
+        return True
+
     def _show_warning(self, title: str, message: str) -> None:
         box = QMessageBox(
             QMessageBox.Icon.Warning,
@@ -608,7 +621,14 @@ class MainWindow(QMainWindow):
             await manager.connect(address)
         except Exception as exc:
             self._connect_in_progress.discard(address)
-            self._show_warning("Connect failed", str(exc))
+            recovered = await self._maybe_recover_source(exc)
+            if recovered:
+                self._show_warning(
+                    "連線逾時",
+                    "連線逾時,已自動重置接收器。\n\n請重新搜尋裝置後再試一次。",
+                )
+            else:
+                self._show_warning("Connect failed", str(exc))
             return
 
         state = DeviceState()

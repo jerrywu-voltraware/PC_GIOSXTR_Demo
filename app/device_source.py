@@ -161,6 +161,19 @@ _CONNECT_ERROR_PREFIXES = (
 )
 _DONGLE_CONNECT_TIMEOUT_SECONDS = 35.0
 _DONGLE_DISCONNECT_TIMEOUT_SECONDS = 5.0
+# After a link drops, the dongle's BLE central needs a brief moment to release
+# the connection before it can start a new one. Issuing AT+CONN too soon wedges
+# the firmware (it then emits neither CONNECTED nor an error, so the connect
+# future blocks the full timeout). Only applied when a disconnect happened
+# recently, so a first connect after a scan is not slowed.
+_DONGLE_POST_DISCONNECT_SETTLE_SECONDS = 0.8
+# How long a scan waits for an in-flight connect to finish before treating it as
+# wedged and recovering the dongle. Healthy connects resolve well within this;
+# a wedged one (no CONNECTED/error within the 35s connect timeout) does not.
+_DONGLE_PENDING_CONNECT_SCAN_WAIT_SECONDS = 4.0
+# How long a connect waits for an in-progress scan to finish before proceeding.
+# Bounds the wait so a stuck scan can never block connects forever.
+_DONGLE_SCAN_IDLE_WAIT_SECONDS = 12.0
 
 
 def _crc16_ccitt(data: bytes) -> int:
@@ -276,6 +289,10 @@ class DongleSource(DeviceSource):
     ) -> None:
         self._loop = loop
         self._port_name = port
+        self._baudrate = baudrate
+        # When we created the serial port ourselves we may close/reopen it to
+        # recover a wedged dongle; an injected (test) port is never reopened.
+        self._owns_serial = serial_port is None
         if serial_port is not None:
             # Injected for testing.
             self._serial = serial_port
@@ -288,6 +305,10 @@ class DongleSource(DeviceSource):
         self._managers: dict[str, DongleDeviceManager] = {}
         self._devid_to_mac: dict[int, str] = {}
         self._handle_to_mac: dict[int, str] = {}
+        # Handles for which a disconnect timed out: the firmware still owes a
+        # (now stale) DISCONNECTED line. The first DISCONNECTED for such a handle
+        # is swallowed so it cannot tear down a link that reused the handle.
+        self._stale_disconnect_handles: set[int] = set()
 
         self._rxbuf = bytearray()
         self._running = True
@@ -301,6 +322,16 @@ class DongleSource(DeviceSource):
         self._disconnect_futures: dict[str, asyncio.Future[bool]] = {}
         self._connect_lock = asyncio.Lock()
         self._active_connect_mac: str | None = None
+        # Set while a scan is running so a concurrent connect waits for it to
+        # finish instead of multiplexing AT+CONN onto the busy serial link.
+        self._scan_idle = asyncio.Event()
+        self._scan_idle.set()
+        # Monotonic time of the most recent disconnect (line or timeout), used to
+        # gate the post-disconnect settle before the next AT+CONN.
+        self._last_disconnect_monotonic: float | None = None
+        # Set when a connect timed out (firmware wedged); the next scan resets
+        # the dongle so it does not require an app restart.
+        self._needs_recovery = False
 
         self._reader: threading.Thread | None = None
         if start_reader:
@@ -324,35 +355,47 @@ class DongleSource(DeviceSource):
     async def scan(
         self, timeout: float = 5.0, supported_only: bool = True
     ) -> list[DeviceScanResult]:
-        await self._wait_for_pending_disconnects()
-        # Start scanning, let advertisements accumulate, then pull the list.
-        self._scan_lines = []
-        self._scan_expect = None
-        _write_scan_debug("dongle scan: AT+SCAN")
-        self._scan_debug = True
-        self._send_command("AT+SCAN")
-        await asyncio.sleep(timeout)
-        _write_scan_debug("dongle scan: AT+STOP")
-        self._send_command("AT+STOP")
-
-        future: asyncio.Future[bool] = self._loop.create_future()
-        self._scan_future = future
-        self._scan_expect = None
-        _write_scan_debug("dongle scan: AT+LIST")
-        self._send_command("AT+LIST")
+        # Hold off concurrent connects (they would multiplex AT+CONN onto the
+        # serial link mid-scan) and let any pending disconnect finish first.
+        self._scan_idle.clear()
         try:
-            await asyncio.wait_for(future, timeout=3.0)
-        except asyncio.TimeoutError:
-            _write_scan_debug("dongle scan: AT+LIST timed out (no SCAN LIST received)")
+            await self._wait_for_pending_disconnects()
+            # A connect that never completed leaves the firmware wedged so it
+            # cannot service AT+SCAN. Recover the dongle before scanning, so the
+            # user does not have to restart the app.
+            await self._recover_if_connect_stuck()
+            # Start scanning, let advertisements accumulate, then pull the list.
+            self._scan_lines = []
+            self._scan_expect = None
+            _write_scan_debug("dongle scan: AT+SCAN")
+            self._scan_debug = True
+            self._send_command("AT+SCAN")
+            await asyncio.sleep(timeout)
+            _write_scan_debug("dongle scan: AT+STOP")
+            self._send_command("AT+STOP")
+
+            future: asyncio.Future[bool] = self._loop.create_future()
+            self._scan_future = future
+            self._scan_expect = None
+            _write_scan_debug("dongle scan: AT+LIST")
+            self._send_command("AT+LIST")
+            try:
+                await asyncio.wait_for(future, timeout=3.0)
+            except asyncio.TimeoutError:
+                _write_scan_debug(
+                    "dongle scan: AT+LIST timed out (no SCAN LIST received)"
+                )
+            finally:
+                self._scan_future = None
+                self._scan_debug = False
+            results = self._parse_scan_results(self._scan_lines)
+            _write_scan_debug(
+                f"dongle scan: parsed {len(results)} device(s) from "
+                f"{len(self._scan_lines)} collected line(s)"
+            )
+            return results
         finally:
-            self._scan_future = None
-            self._scan_debug = False
-        results = self._parse_scan_results(self._scan_lines)
-        _write_scan_debug(
-            f"dongle scan: parsed {len(results)} device(s) from "
-            f"{len(self._scan_lines)} collected line(s)"
-        )
-        return results
+            self._scan_idle.set()
 
     async def close(self) -> None:
         self.shutdown()
@@ -388,6 +431,12 @@ class DongleSource(DeviceSource):
 
     async def _connect(self, mac: str) -> None:
         async with self._connect_lock:
+            # Never multiplex a connect onto the serial link while a scan runs,
+            # and never issue AT+CONN while a previous link is still tearing down
+            # (a pending AT+DISC) — both wedge the firmware's BLE central.
+            await self._wait_for_scan_idle()
+            await self._wait_for_pending_disconnects()
+            await self._settle_after_disconnect()
             future: asyncio.Future[bool] = self._loop.create_future()
             self._connect_futures[mac] = future
             self._active_connect_mac = mac
@@ -395,11 +444,35 @@ class DongleSource(DeviceSource):
             try:
                 await asyncio.wait_for(future, timeout=_DONGLE_CONNECT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError as exc:
+                # Firmware never answered: it is wedged. Flag recovery so the
+                # next scan resets the dongle instead of returning empty.
+                self._needs_recovery = True
+                _write_scan_debug(f"dongle connect: timed out for {mac}; flagged for recovery")
                 raise TimeoutError(f"Dongle connect timed out for {mac}") from exc
             finally:
                 self._connect_futures.pop(mac, None)
                 if self._active_connect_mac == mac:
                     self._active_connect_mac = None
+
+    async def _wait_for_scan_idle(self) -> None:
+        if self._scan_idle.is_set():
+            return
+        _write_scan_debug("dongle connect: waiting for in-progress scan to finish")
+        try:
+            await asyncio.wait_for(
+                self._scan_idle.wait(), timeout=_DONGLE_SCAN_IDLE_WAIT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            _write_scan_debug("dongle connect: scan-idle wait timed out; proceeding")
+
+    async def _settle_after_disconnect(self) -> None:
+        last = self._last_disconnect_monotonic
+        if last is None:
+            return
+        remaining = _DONGLE_POST_DISCONNECT_SETTLE_SECONDS - (self._loop.time() - last)
+        if remaining > 0:
+            _write_scan_debug(f"dongle connect: settling {remaining:.2f}s before AT+CONN")
+            await asyncio.sleep(remaining)
 
     async def _disconnect(self, mac: str) -> None:
         future: asyncio.Future[bool] = self._loop.create_future()
@@ -408,7 +481,16 @@ class DongleSource(DeviceSource):
         try:
             await asyncio.wait_for(future, timeout=_DONGLE_DISCONNECT_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            _write_scan_debug(f"dongle disconnect timed out for {mac}")
+            # Firmware did not acknowledge the disconnect: its link may still be
+            # alive. Record the time so the next connect still settles, flag
+            # recovery so a stale link gets cleared before the next operation,
+            # and remember that the (late) DISCONNECTED for this handle must be
+            # swallowed so it cannot tear down a reused-handle link later.
+            self._last_disconnect_monotonic = self._loop.time()
+            self._needs_recovery = True
+            for handle in [h for h, m in self._handle_to_mac.items() if m == mac]:
+                self._stale_disconnect_handles.add(handle)
+            _write_scan_debug(f"dongle disconnect timed out for {mac}; flagged for recovery")
         finally:
             self._disconnect_futures.pop(mac, None)
 
@@ -425,6 +507,93 @@ class DongleSource(DeviceSource):
             _write_scan_debug(
                 f"dongle scan: {len(pending)} pending disconnect(s) still incomplete"
             )
+
+    async def _recover_if_connect_stuck(self) -> None:
+        """Reset the dongle if a connect attempt left it wedged.
+
+        A wedged firmware (no CONNECTED / error within the connect timeout, or a
+        disconnect that was never acknowledged) cannot service AT+SCAN, so the
+        scan would silently return nothing. Recovering here means the user no
+        longer has to close and reopen the app.
+        """
+        if self._needs_recovery:
+            await self.recover("previous connect/disconnect left the dongle wedged")
+            return
+        pending = [f for f in self._connect_futures.values() if not f.done()]
+        if not pending:
+            return
+        _write_scan_debug(
+            f"dongle scan: {len(pending)} connect(s) in flight; waiting briefly"
+        )
+        _, still_pending = await asyncio.wait(
+            pending, timeout=_DONGLE_PENDING_CONNECT_SCAN_WAIT_SECONDS
+        )
+        if still_pending:
+            await self.recover("scan requested over an unresponsive connect")
+
+    async def recover(self, reason: str = "manual recovery") -> None:
+        """Reset a wedged dongle without an app restart.
+
+        Fails any in-flight connect so its coroutine unwinds, reopens the CDC
+        serial port (which toggles DTR and resets the nRF firmware, the same
+        thing an app restart does), and drops all stale link state.
+        """
+        _write_scan_debug(f"dongle recovery: {reason}")
+        self._fail_all_pending_connects(RuntimeError(f"dongle reset: {reason}"))
+        if self._owns_serial:
+            try:
+                await self._loop.run_in_executor(None, self._reopen_serial)
+            except Exception as exc:  # pragma: no cover - hardware dependent
+                _write_scan_debug(f"dongle recovery: serial reopen failed: {exc}")
+        self._reset_link_state()
+        self._needs_recovery = False
+
+    def _fail_all_pending_connects(self, error: Exception) -> None:
+        for future in list(self._connect_futures.values()):
+            if not future.done():
+                future.set_exception(error)
+
+    def _reopen_serial(self) -> None:
+        """Close and reopen the serial port to force a firmware reset.
+
+        Runs in an executor thread. Stops the current reader, reopens the port,
+        then restarts the reader against the fresh handle.
+        """
+        import serial  # lazy import, mirrors __init__
+
+        self._running = False
+        old = self._serial
+        try:
+            if old is not None and getattr(old, "is_open", False):
+                old.close()
+        except Exception:
+            pass
+        reader = self._reader
+        if (
+            reader is not None
+            and reader.is_alive()
+            and reader is not threading.current_thread()
+        ):
+            reader.join(timeout=1.5)
+        self._serial = serial.Serial(self._port_name, self._baudrate, timeout=0.1)
+        self._rxbuf = bytearray()
+        self._running = True
+        self._reader = threading.Thread(
+            target=self._read_loop, name="dongle-reader", daemon=True
+        )
+        self._reader.start()
+        _write_scan_debug("dongle recovery: serial reopened, reader restarted")
+
+    def _reset_link_state(self) -> None:
+        """Drop every link mapping and tell managers their link is gone."""
+        managers = list(self._managers.values())
+        self._handle_to_mac.clear()
+        self._stale_disconnect_handles.clear()
+        self._devid_to_mac.clear()
+        self._managers.clear()
+        self._active_connect_mac = None
+        for manager in managers:
+            manager._dispatch_disconnect()
 
     @staticmethod
     def _parse_scan_results(lines: list[str]) -> list[DeviceScanResult]:
@@ -562,8 +731,16 @@ class DongleSource(DeviceSource):
         match = _DISCONNECTED.match(line)
         if match:
             handle = int(match.group(1))
+            # A disconnect that previously timed out still owes one DISCONNECTED.
+            # Swallow that stale line so it cannot tear down a link that has
+            # since reused the same handle number.
+            if handle in self._stale_disconnect_handles:
+                self._stale_disconnect_handles.discard(handle)
+                _write_scan_debug(f"dongle: swallowing stale DISCONNECTED handle={handle}")
+                return
             mac = self._handle_to_mac.pop(handle, None)
             if mac is not None:
+                self._last_disconnect_monotonic = self._loop.time()
                 future = self._disconnect_futures.get(mac)
                 if future is not None and not future.done():
                     future.set_result(True)

@@ -500,7 +500,7 @@ def test_demo_showcase_entries_use_connected_states():
 
     page.set_showcase_states({first.device_address: first, second.device_address: second}, first.device_address)
 
-    assert page._showcase_entries() == [("AA:BB", "MMEU  #45"), ("CC:DD", "MMEU  #60")]
+    assert page._showcase_entries() == [("AA:BB", "DEMO  #45"), ("CC:DD", "DEMO  #60")]
 
 
 def test_demo_multi_showcase_dialog_builds_quad_tiles():
@@ -523,8 +523,8 @@ def test_demo_multi_showcase_dialog_builds_quad_tiles():
 
     assert page._showcase_dialog is not None
     assert len(page._showcase_dialog.tiles) == 3
-    assert page._showcase_dialog.tiles["A"].device_label.text() == "MMEU  #45"
-    assert page._showcase_dialog.tiles["B"].device_label.text() == "MMEU  #60"
+    assert page._showcase_dialog.tiles["A"].device_label.text() == "DEMO  #45"
+    assert page._showcase_dialog.tiles["B"].device_label.text() == "DEMO  #60"
     assert page._showcase_dialog.tiles["A"].pct_label.text() == "76%"
     assert page._showcase_dialog.tiles["B"].pct_label.text() == "81%"
 
@@ -693,7 +693,7 @@ def test_settings_dialog_has_demo_defaults():
     assert dialog.demo_fake_data_box.isChecked()
     assert dialog.demo_charger_mode_combo.currentData() == DEMO_CHARGER_MODE_PLATE
     assert dialog.demo_ebike_style_combo.currentData() == DEMO_EBIKE_STYLE_2
-    assert dialog.demo_device_name_edit.text() == "MMEU"
+    assert dialog.demo_device_name_edit.text() == "DEMO"
     assert dialog.demo_ebike_spin.value() == 76
     assert dialog.demo_escooter_spin.value() == 81
 
@@ -785,8 +785,8 @@ def test_main_window_builds_connected_demo_device_fake_battery_settings():
     window.states[second.device_address] = second
 
     assert window._connected_demo_device_settings() == [
-        {"address": "A", "label": "MMEU #4", "default_pct": 76},
-        {"address": "B", "label": "MMEU #6", "default_pct": 81},
+        {"address": "A", "label": "DEMO #4", "default_pct": 76},
+        {"address": "B", "label": "DEMO #6", "default_pct": 81},
     ]
     window.close()
 
@@ -870,7 +870,7 @@ def test_demo_fake_name_uses_number_parsed_from_real_name():
 
     page.refresh(state)
 
-    assert page.device_label.text() == "MMEU  #45"
+    assert page.device_label.text() == "DEMO  #45"
 
 
 def test_demo_real_name_uses_number_parsed_from_real_name():
@@ -908,7 +908,7 @@ def test_demo_battery_panel_uses_selected_preview_device_when_not_connected():
     page.set_preview_device("GIOS0801ST#45", 45)
     page._set_eng_mode(EngMode.CHARGING_BIKE)
 
-    assert page.device_label.text() == "MMEU  #45"
+    assert page.device_label.text() == "DEMO  #45"
 
 
 def test_demo_device_name_label_is_readable():
@@ -950,7 +950,7 @@ def test_main_window_selected_scan_device_updates_demo_card():
     window._set_demo_preview_device(result)
     window.demo2_page._set_eng_mode(EngMode.CHARGING_BIKE)
 
-    assert window.demo2_page.device_label.text() == "MMEU  #45"
+    assert window.demo2_page.device_label.text() == "DEMO  #45"
     window.close()
 
 

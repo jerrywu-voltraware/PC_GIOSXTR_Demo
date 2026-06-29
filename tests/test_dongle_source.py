@@ -11,6 +11,7 @@ import asyncio
 
 import pytest
 
+from app import device_source as ds
 from app.constants import UUID_IOT_NOTIFY, UUID_NOTIFY_200B
 from app.device_source import DongleSource, _crc16_ccitt
 
@@ -234,6 +235,138 @@ def test_dongle_scan_waits_for_pending_disconnect_before_starting():
 
     src._on_line("SCAN LIST: 0")  # type: ignore[attr-defined]
     assert loop.run_until_complete(task) == []
+
+
+def test_connect_settles_after_recent_disconnect_before_at_conn():
+    # A connect that follows a recent disconnect must wait the firmware-settle
+    # window before issuing AT+CONN, so the dongle is not asked to connect while
+    # its BLE central is still releasing the previous link.
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+    # Simulate a disconnect that just happened.
+    src._last_disconnect_monotonic = loop.time()  # type: ignore[attr-defined]
+
+    task = loop.create_task(src._connect(mac))  # type: ignore[attr-defined]
+    loop.run_until_complete(asyncio.sleep(0))
+    # Still inside the settle window -> AT+CONN not sent yet.
+    assert serial.writes == []
+
+    # After the settle window elapses, AT+CONN goes out.
+    loop.run_until_complete(
+        asyncio.sleep(ds._DONGLE_POST_DISCONNECT_SETTLE_SECONDS + 0.05)
+    )
+    assert serial.writes == [f"AT+CONN={mac}"]
+
+    src._on_line(f"CONNECTED handle=0 #7 GIOS0403ST#7 MAC={mac}")  # type: ignore[attr-defined]
+    loop.run_until_complete(task)
+
+
+def test_connect_waits_for_in_progress_scan():
+    # A connect must not multiplex AT+CONN onto the serial link while a scan is
+    # running; it waits until the scan marks itself idle.
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+    src._scan_idle.clear()  # type: ignore[attr-defined]  # pretend a scan is running
+
+    task = loop.create_task(src._connect(mac))  # type: ignore[attr-defined]
+    loop.run_until_complete(asyncio.sleep(0))
+    assert serial.writes == []  # blocked on scan-idle
+
+    src._scan_idle.set()  # type: ignore[attr-defined]  # scan finished
+    loop.run_until_complete(asyncio.sleep(0))
+    assert serial.writes == [f"AT+CONN={mac}"]
+
+    src._on_line(f"CONNECTED handle=0 #7 GIOS0403ST#7 MAC={mac}")  # type: ignore[attr-defined]
+    loop.run_until_complete(task)
+
+
+def test_scan_recovers_when_connect_left_dongle_wedged():
+    # A connect that timed out flags recovery; the next scan must reset link
+    # state (drop managers/handles) before issuing AT+SCAN.
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+    mgr = src.create_manager()
+    events: list[str] = []
+    mgr.set_disconnect_callback(lambda addr: events.append(addr))
+    mgr.address = mac
+    src._register_manager(mac, mgr)  # type: ignore[attr-defined]
+    src._handle_to_mac[0] = mac  # type: ignore[attr-defined]
+    src._needs_recovery = True  # type: ignore[attr-defined]
+
+    task = loop.create_task(src.scan(timeout=0.01))
+    loop.run_until_complete(asyncio.sleep(0.05))
+
+    # Recovery dropped the stale link and notified the manager, then scanned.
+    assert events == [mac]
+    assert mac not in src._managers  # type: ignore[attr-defined]
+    assert src._needs_recovery is False  # type: ignore[attr-defined]
+    assert serial.writes == ["AT+SCAN", "AT+STOP", "AT+LIST"]
+
+    src._on_line("SCAN LIST: 0")  # type: ignore[attr-defined]
+    assert loop.run_until_complete(task) == []
+
+
+def test_recover_fails_pending_connect_and_resets_state():
+    src, _serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+    future = loop.create_future()
+    src._connect_futures[mac] = future  # type: ignore[attr-defined]
+    src._handle_to_mac[3] = mac  # type: ignore[attr-defined]
+    src._devid_to_mac[5] = mac  # type: ignore[attr-defined]
+    mgr = src.create_manager()
+    mgr.address = mac
+    src._register_manager(mac, mgr)  # type: ignore[attr-defined]
+
+    loop.run_until_complete(src.recover("test"))
+
+    assert future.done() and future.exception() is not None
+    assert src._handle_to_mac == {}  # type: ignore[attr-defined]
+    assert src._devid_to_mac == {}  # type: ignore[attr-defined]
+    assert src._managers == {}  # type: ignore[attr-defined]
+    assert src._needs_recovery is False  # type: ignore[attr-defined]
+
+
+def test_disconnect_timeout_swallows_stale_disconnected_on_reused_handle(monkeypatch):
+    # When AT+DISC times out, the firmware still owes a (now stale) DISCONNECTED.
+    # If the same handle number is later reused by a fresh link, that stale line
+    # must NOT tear the fresh link down.
+    monkeypatch.setattr(ds, "_DONGLE_DISCONNECT_TIMEOUT_SECONDS", 0.02)
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+
+    # First link on handle 0; disconnect it but the firmware never acks.
+    mgr1 = src.create_manager()
+    mgr1.address = mac
+    src._register_manager(mac, mgr1)  # type: ignore[attr-defined]
+    src._handle_to_mac[0] = mac  # type: ignore[attr-defined]
+    task = loop.create_task(mgr1.disconnect())
+    # Drive the disconnect to its timeout (no DISCONNECTED line arrives).
+    loop.run_until_complete(asyncio.sleep(0.1))
+    loop.run_until_complete(task)
+    assert 0 in src._stale_disconnect_handles  # type: ignore[attr-defined]
+
+    # Reconnect reuses handle 0 for a fresh manager.
+    events: list[str] = []
+    mgr2 = src.create_manager()
+    mgr2.address = mac
+    mgr2.set_disconnect_callback(lambda addr: events.append(addr))
+    src._register_manager(mac, mgr2)  # type: ignore[attr-defined]
+    src._on_line(f"CONNECTED handle=0 #7 GIOS0403ST#7 MAC={mac}")  # type: ignore[attr-defined]
+
+    # The belated DISCONNECTED for the OLD link finally arrives.
+    src._on_line("DISCONNECTED handle=0 #7 GIOS0403ST#7 reason=0x13")  # type: ignore[attr-defined]
+    assert events == []  # fresh link NOT torn down
+    assert src._managers.get(mac) is mgr2  # type: ignore[attr-defined]
+    assert 0 not in src._stale_disconnect_handles  # type: ignore[attr-defined]
+
+    # A subsequent real DISCONNECTED for the fresh link tears it down normally.
+    src._on_line("DISCONNECTED handle=0 #7 GIOS0403ST#7 reason=0x13")  # type: ignore[attr-defined]
+    assert events == [mac]
 
 
 def test_scan_results_parsed_from_at_list():
