@@ -165,7 +165,7 @@ class WaveformPage(QWidget):
         controls.addWidget(self.delta_clear_btn)
         controls.addWidget(self.region_box)
         controls.addWidget(self.region_clear_btn)
-        self.settings_btn = QPushButton("波形設定⚙")
+        self.settings_btn = QPushButton("波形設定")
         self.settings_btn.setToolTip("Δ 游標顯示與量測選項")
         self.settings_btn.clicked.connect(self._open_settings_dialog)
         self._settings_dialog: QDialog | None = None
