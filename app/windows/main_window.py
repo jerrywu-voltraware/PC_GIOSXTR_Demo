@@ -33,8 +33,10 @@ from ..constants import (
     DEFAULT_DEMO_CHARGER_MODE,
     DEFAULT_DEMO_EBIKE_STYLE,
     DEFAULT_DEMO_DEVICE_NAME,
+    DEFAULT_RECORD_SPLIT_ROWS,
     normalize_demo_charger_mode,
     normalize_demo_ebike_style,
+    normalize_record_split_rows,
 )
 from ..csv_logger import CsvLogger
 from ..models import DataEvent, DeviceState
@@ -71,6 +73,7 @@ AUTO_RECONNECT_SETTINGS_KEY = "connection/autoReconnect"
 AUTO_RECONNECT_DEFAULT = True
 DEMO_CHARGER_MODE_SETTINGS_KEY = "demo/chargerMode"
 DEMO_EBIKE_STYLE_SETTINGS_KEY = "demo/ebikeStyle"
+RECORD_SPLIT_ROWS_SETTINGS_KEY = "recording/splitRows"
 SETTINGS_ORGANIZATION = "GIOSXTR"
 RECONNECT_DELAYS_SECONDS = (1.0, 3.0, 5.0, 10.0)
 RECONNECT_MAX_ATTEMPTS = 10
@@ -103,6 +106,12 @@ def _settings_demo_ebike_style() -> str:
     return normalize_demo_ebike_style(value)
 
 
+def _settings_record_split_rows() -> int:
+    _ensure_settings_identity()
+    value = QSettings().value(RECORD_SPLIT_ROWS_SETTINGS_KEY, DEFAULT_RECORD_SPLIT_ROWS)
+    return normalize_record_split_rows(value)
+
+
 class MainWindow(QMainWindow):
     notify_received = pyqtSignal(str, str, bytes)
     disconnected = pyqtSignal(str)
@@ -132,6 +141,7 @@ class MainWindow(QMainWindow):
         self.demo_charger_mode = _settings_demo_charger_mode()
         self.demo_ebike_style = _settings_demo_ebike_style()
         self.demo_device_battery_pcts: dict[str, int] = {}
+        self.record_split_rows = _settings_record_split_rows()
         self.active_address: str = ""
         self.state = DeviceState()
         self._update_check_running = False
@@ -315,12 +325,14 @@ class MainWindow(QMainWindow):
             demo_device_battery_pcts=self.demo_device_battery_pcts,
             connected_demo_devices=self._connected_demo_device_settings(),
             auto_reconnect_enabled=self.auto_reconnect_enabled,
+            record_split_rows=self.record_split_rows,
             source_display_name=getattr(self.source, "display_name", ""),
             parent=self,
         )
         dialog.engineering_mode_changed.connect(self.set_engineering_mode)
         dialog.demo_settings_changed.connect(self.set_demo_settings)
         dialog.auto_reconnect_changed.connect(self.set_auto_reconnect_enabled)
+        dialog.record_split_rows_changed.connect(self.set_record_split_rows)
         dialog.check_updates_requested.connect(lambda: self._start_manual_update_check(dialog))
         dialog.switch_source_requested.connect(lambda: self._handle_switch_source(dialog))
         dialog.exec()
@@ -566,6 +578,12 @@ class MainWindow(QMainWindow):
         )
         box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         box.open()
+
+    def set_record_split_rows(self, rows: int, *, persist: bool = True) -> None:
+        self.record_split_rows = normalize_record_split_rows(rows)
+        if persist:
+            _ensure_settings_identity()
+            QSettings().setValue(RECORD_SPLIT_ROWS_SETTINGS_KEY, self.record_split_rows)
 
     def set_auto_reconnect_enabled(self, enabled: bool, *, persist: bool = True) -> None:
         self.auto_reconnect_enabled = bool(enabled)
@@ -971,7 +989,7 @@ class MainWindow(QMainWindow):
             return None
         if logger.is_recording:
             return logger.current_path
-        path = logger.start(_device_tag(state))
+        path = logger.start(_device_tag(state), max_rows=self.record_split_rows)
         state.add_log(f"CSV recording started: {path.name}")
         self.refresh_pages()
         return path

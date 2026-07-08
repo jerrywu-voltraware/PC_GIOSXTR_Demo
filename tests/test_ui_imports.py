@@ -427,6 +427,31 @@ def test_main_window_has_manual_csv_recording_controls(tmp_path):
     window.close()
 
 
+def test_main_window_recording_uses_split_rows_setting(tmp_path):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.csv_logger import CsvLogger
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    window.set_record_split_rows(1000, persist=False)
+    state = DeviceState(is_connected=True, device_name="Bike", device_address="AA:BB", device_number=7)
+    window.states[state.device_address] = state
+    window.loggers[state.device_address] = CsvLogger(tmp_path)
+    window.active_address = state.device_address
+    window.state = state
+
+    path = window.start_csv_recording_active()
+    assert path is not None
+    assert path.name.endswith("_007_p001.csv")
+    assert window.loggers[state.device_address].max_rows == 1000
+    window.stop_csv_recording_active()
+    window.close()
+
+
 def test_demo_engineering_controls_are_hidden_by_default():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication
@@ -736,6 +761,54 @@ def test_settings_dialog_emits_demo_ebike_style():
 
     assert received
     assert received[-1][-1] == DEMO_EBIKE_STYLE_1
+
+
+def test_settings_dialog_recording_split_defaults_and_choices():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.constants import DEFAULT_RECORD_SPLIT_ROWS, RECORD_SPLIT_ROWS_CHOICES
+    from app.windows.settings_dialog import SettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(engineering_mode=False)
+
+    combo = dialog.record_split_combo
+    assert combo.count() == len(RECORD_SPLIT_ROWS_CHOICES)
+    assert [combo.itemData(i) for i in range(combo.count())] == [
+        value for value, _label in RECORD_SPLIT_ROWS_CHOICES
+    ]
+    assert combo.currentData() == DEFAULT_RECORD_SPLIT_ROWS == 500000
+
+
+def test_settings_dialog_recording_split_respects_initial_value():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.windows.settings_dialog import SettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(engineering_mode=False, record_split_rows=1000)
+
+    assert dialog.record_split_combo.currentData() == 1000
+
+
+def test_settings_dialog_emits_recording_split_rows():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.windows.settings_dialog import SettingsDialog
+
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog(engineering_mode=False)
+    received = []
+    dialog.record_split_rows_changed.connect(received.append)
+
+    dialog.record_split_combo.setCurrentIndex(dialog.record_split_combo.findData(10000))
+
+    assert received
+    assert received[-1] == 10000
+    assert isinstance(received[-1], int)
 
 
 def test_settings_dialog_shows_connected_device_fake_battery_controls():

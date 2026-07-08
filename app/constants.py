@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 APP_NAME = "PC GIOSXTR Demo"
-APP_VERSION = "V1.0.23"
+APP_VERSION = "V1.0.24"
 APP_WINDOW_TITLE = f"{APP_NAME} {APP_VERSION}"
 APP_ICON_FILENAME = "1024.png"
-APP_EXECUTABLE_NAME = "PC_GIOSXTR_Demo_V1.0.23"
+APP_EXECUTABLE_NAME = "PC_GIOSXTR_Demo_V1.0.24"
 ENGINEERING_MODE_ENV = "PC_GIOSXTR_ENGINEERING"
 DEFAULT_DEMO_DEVICE_NAME = "DEMO"
 DEMO_CHARGER_MODE_STATION = "station"
@@ -39,6 +39,33 @@ def normalize_demo_ebike_style(value: object) -> str:
     if str(value) == DEMO_EBIKE_STYLE_2:
         return DEMO_EBIKE_STYLE_2
     return DEFAULT_DEMO_EBIKE_STYLE
+
+
+# Recording: split the CSV into a new file every N data rows so a single file
+# never grows past practical limits (e.g. Excel's ~1,048,576-row ceiling).
+DEFAULT_RECORD_SPLIT_ROWS = 500000
+RECORD_SPLIT_ROWS_CHOICES = (
+    (100, "100"),
+    (1000, "1000"),
+    (5000, "5000"),
+    (10000, "10000"),
+    (50000, "50000"),
+    (100000, "100000"),
+    (500000, "500000"),
+    (1000000, "1000000"),
+)
+_RECORD_SPLIT_ROWS_VALID = frozenset(value for value, _label in RECORD_SPLIT_ROWS_CHOICES)
+
+
+def normalize_record_split_rows(value: object) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_RECORD_SPLIT_ROWS
+    if parsed in _RECORD_SPLIT_ROWS_VALID:
+        return parsed
+    return DEFAULT_RECORD_SPLIT_ROWS
+
 
 SUPPORTED_DEVICES = (
     "Central",

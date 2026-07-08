@@ -37,6 +37,68 @@ def test_csv_logger_skips_empty_rows(tmp_path):
     assert len(path.read_text(encoding="utf-8").splitlines()) == 1
 
 
+def _non_empty_state() -> DeviceState:
+    state = DeviceState()
+    state.ptu_input_voltage = 10000  # non-zero so write_state does not skip it
+    return state
+
+
+def test_csv_logger_filename_carries_part_number(tmp_path):
+    logger = CsvLogger(tmp_path)
+    path = logger.start("005")
+    logger.stop()
+    assert path.name.endswith("_005_p001.csv")
+
+
+def test_csv_logger_splits_after_max_rows(tmp_path):
+    logger = CsvLogger(tmp_path)
+    first = logger.start("005", max_rows=2)
+    assert first.name.endswith("_005_p001.csv")
+
+    logger.write_state(_non_empty_state())  # part 1, row 1
+    logger.write_state(_non_empty_state())  # part 1, row 2 -> marks pending roll
+    assert logger.current_path is not None
+    # Lazy roll: the next file is not opened until a real row needs it.
+    assert logger.current_path.name.endswith("_005_p001.csv")
+    logger.write_state(_non_empty_state())  # opens part 2, writes its first row
+    assert logger.current_path.name.endswith("_005_p002.csv")
+    logger.stop()
+
+    files = sorted(p.name for p in tmp_path.glob("Log_*.csv"))
+    assert len(files) == 2
+    # part 1: header + 2 data rows; part 2: header + 1 data row
+    assert len((tmp_path / files[0]).read_text(encoding="utf-8").splitlines()) == 3
+    assert len((tmp_path / files[1]).read_text(encoding="utf-8").splitlines()) == 2
+    # both parts share the same timestamp+suffix stem
+    assert files[0][:-len("_p001.csv")] == files[1][:-len("_p002.csv")]
+
+
+def test_csv_logger_no_trailing_empty_file_on_exact_multiple(tmp_path):
+    logger = CsvLogger(tmp_path)
+    logger.start("005", max_rows=2)
+    for _ in range(4):  # exactly two full parts' worth of rows
+        logger.write_state(_non_empty_state())
+    logger.stop()
+
+    files = sorted(p.name for p in tmp_path.glob("Log_*.csv"))
+    assert len(files) == 2  # p001 and p002 only -- no empty p003
+    for name in files:
+        # every part carries header + 2 data rows; none is header-only
+        assert len((tmp_path / name).read_text(encoding="utf-8").splitlines()) == 3
+
+
+def test_csv_logger_no_split_when_max_rows_none(tmp_path):
+    logger = CsvLogger(tmp_path)
+    logger.start("005")  # default: no splitting
+    for _ in range(5):
+        logger.write_state(_non_empty_state())
+    logger.stop()
+
+    files = list(tmp_path.glob("Log_*.csv"))
+    assert len(files) == 1
+    assert len(files[0].read_text(encoding="utf-8").splitlines()) == 6  # header + 5 rows
+
+
 def test_build_advertising_table_extracts_device_number_and_revision():
     rows, raw_hex, number, firmware = build_advertising_table(
         name="GIOS0403ST",

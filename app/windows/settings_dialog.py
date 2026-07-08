@@ -26,10 +26,13 @@ from ..constants import (
     DEFAULT_DEMO_CHARGER_MODE,
     DEFAULT_DEMO_EBIKE_STYLE,
     DEFAULT_DEMO_DEVICE_NAME,
+    DEFAULT_RECORD_SPLIT_ROWS,
     DEMO_CHARGER_MODE_CHOICES,
     DEMO_EBIKE_STYLE_CHOICES,
+    RECORD_SPLIT_ROWS_CHOICES,
     normalize_demo_charger_mode,
     normalize_demo_ebike_style,
+    normalize_record_split_rows,
 )
 from ..theme import THEME_DARK, THEME_LIGHT, theme_manager
 
@@ -40,6 +43,7 @@ class SettingsDialog(QDialog):
     check_updates_requested = pyqtSignal()
     auto_reconnect_changed = pyqtSignal(bool)
     switch_source_requested = pyqtSignal()
+    record_split_rows_changed = pyqtSignal(int)
 
     def __init__(
         self,
@@ -54,6 +58,7 @@ class SettingsDialog(QDialog):
         demo_ebike_style: str = DEFAULT_DEMO_EBIKE_STYLE,
         demo_device_battery_pcts: dict[str, int] | None = None,
         connected_demo_devices: list[dict[str, object]] | None = None,
+        record_split_rows: int = DEFAULT_RECORD_SPLIT_ROWS,
         source_display_name: str = "",
         parent=None,
     ) -> None:
@@ -81,6 +86,7 @@ class SettingsDialog(QDialog):
             ),
             "DEMO",
         )
+        tabs.addTab(self._recording_tab(record_split_rows), "錄製")
         tabs.addTab(self._engineering_tab(engineering_mode), "工程模式")
         root.addWidget(tabs)
 
@@ -279,6 +285,35 @@ class SettingsDialog(QDialog):
         detail.setWordWrap(True)
         layout.addRow("", detail)
         return page
+
+    def _recording_tab(self, split_rows: int) -> QWidget:
+        page = QWidget()
+        layout = QFormLayout(page)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        self.record_split_combo = QComboBox()
+        for value, label in RECORD_SPLIT_ROWS_CHOICES:
+            self.record_split_combo.addItem(label, value)
+        split_index = self.record_split_combo.findData(
+            normalize_record_split_rows(split_rows)
+        )
+        self.record_split_combo.setCurrentIndex(max(0, split_index))
+        self.record_split_combo.currentIndexChanged.connect(self._emit_record_split)
+        layout.addRow("每檔筆數上限", self.record_split_combo)
+
+        detail = QLabel(
+            "錄製時每寫滿指定筆數就自動分割成新檔繼續錄，避免單一檔案過大"
+            "（例如超過 Excel 約 104 萬列上限）。變更會在下一次開始錄製時生效。"
+        )
+        detail.setWordWrap(True)
+        layout.addRow("", detail)
+        return page
+
+    def _emit_record_split(self, *_args) -> None:
+        self.record_split_rows_changed.emit(
+            normalize_record_split_rows(self.record_split_combo.currentData())
+        )
 
     def _device_battery_pcts(self) -> dict[str, int]:
         return {address: spin.value() for address, spin in self.demo_device_pct_spins.items()}
