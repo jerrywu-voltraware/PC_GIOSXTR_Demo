@@ -34,6 +34,9 @@ from ..constants import (
     DEFAULT_DEMO_EBIKE_STYLE,
     DEFAULT_DEMO_DEVICE_NAME,
     DEFAULT_RECORD_SPLIT_ROWS,
+    UUID_IOT_NOTIFY,
+    UUID_NOTIFY_20B,
+    UUID_NOTIFY_200B,
     normalize_demo_charger_mode,
     normalize_demo_ebike_style,
     normalize_record_split_rows,
@@ -63,6 +66,16 @@ def _device_tag(state: DeviceState) -> str:
     return addr[-6:].upper() if addr else "dev"
 
 
+def _is_stream_payload(uuid: str, data: bytes) -> bool:
+    """Return whether a notification is long enough to contain real data."""
+    uuid_l = uuid.lower()
+    return (
+        (uuid_l == UUID_IOT_NOTIFY and len(data) >= 15)
+        or (uuid_l == UUID_NOTIFY_20B and len(data) >= 20)
+        or (uuid_l == UUID_NOTIFY_200B and len(data) >= 193)
+    )
+
+
 def _default_update_save_path(asset: UpdateAsset, downloads_dir: str | None = None) -> Path:
     base_dir = downloads_dir or QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DownloadLocation)
     base_path = Path(base_dir) if base_dir else Path.home() / "Downloads"
@@ -77,6 +90,9 @@ RECORD_SPLIT_ROWS_SETTINGS_KEY = "recording/splitRows"
 SETTINGS_ORGANIZATION = "GIOSXTR"
 RECONNECT_DELAYS_SECONDS = (1.0, 3.0, 5.0, 10.0)
 RECONNECT_MAX_ATTEMPTS = 10
+# Longer than the dongle's 12s stream watchdog plus its 5s disconnect wait, so
+# the safety timer cannot release a second AT+CONN while recovery is starting.
+CONNECT_READY_GUARD_TIMEOUT_MS = 20_000
 
 
 def _ensure_settings_identity() -> None:
@@ -560,10 +576,21 @@ class MainWindow(QMainWindow):
         stay wedged (which would otherwise need an app restart). Returns True if
         a recovery was attempted."""
         recover = getattr(self.source, "recover", None)
-        if recover is None or not isinstance(exc, TimeoutError):
+        ensure_recovered = getattr(self.source, "ensure_recovered", None)
+        recovery_state = getattr(self.source, "needs_recovery", None)
+        if recovery_state is None:
+            recovery_action = recover
+            should_recover = isinstance(exc, (TimeoutError, ConnectionError))
+        else:
+            # A transport-aware source knows whether the whole adapter is
+            # unhealthy.  A peripheral-specific ConnectionError must not reset
+            # the dongle and disconnect other healthy recording sessions.
+            recovery_action = ensure_recovered or recover
+            should_recover = bool(recovery_state)
+        if recovery_action is None or not should_recover:
             return False
         try:
-            await recover("connect timed out")
+            await recovery_action("connect failed")
         except Exception:
             return False
         return True
@@ -668,10 +695,11 @@ class MainWindow(QMainWindow):
         self._refresh_device_tabs()
 
         # 連上了但還在等第一個封包；_handle_notify 收到資料時會解除。安全網：
-        # 萬一連上卻一直沒資料，10 秒後自動解除，避免永久擋住後續連線。
+        # 萬一連上卻一直沒資料，watchdog/recovery 之外仍保留 20 秒安全網。
         if address in self._connect_in_progress:
             QTimer.singleShot(
-                10000, lambda a=address: self._connect_in_progress.discard(a)
+                CONNECT_READY_GUARD_TIMEOUT_MS,
+                lambda a=address, m=manager: self._expire_connect_guard(a, m),
             )
 
         try:
@@ -824,9 +852,14 @@ class MainWindow(QMainWindow):
                     await self._reconnect_device(address)
                     return
                 except Exception as exc:
+                    recovered = await self._maybe_recover_source(exc)
                     state = self.states.get(address)
                     if state is not None:
-                        state.add_log(f"重新連線失敗 ({attempt_index + 1}/{self._reconnect_max_attempts}): {exc}")
+                        recovery_note = "；已重置 dongle" if recovered else ""
+                        state.add_log(
+                            f"重新連線失敗 ({attempt_index + 1}/"
+                            f"{self._reconnect_max_attempts}): {exc}{recovery_note}"
+                        )
                         self.refresh_pages()
             state = self.states.get(address)
             if state is not None and not state.is_connected:
@@ -842,6 +875,19 @@ class MainWindow(QMainWindow):
         state = self.states.get(address)
         if state is None:
             return
+        # A dongle must finish GATT discovery/start streaming for one link
+        # before another AT+CONN is issued.  Unexpected dongle reset can make
+        # several reconnect loops wake together, so serialize them through the
+        # same first-packet guard used by manual connections.
+        if getattr(self.source, "requires_ready_before_next_connect", False):
+            while any(
+                pending_address != address
+                for pending_address in self._connect_in_progress
+            ):
+                await asyncio.sleep(0.1)
+                if address not in self.states or not self.auto_reconnect_enabled:
+                    return
+            self._connect_in_progress.add(address)
         manager = self._create_ble_manager()
         manager.set_notify_callback(self._make_notify_emitter())
         manager.set_disconnect_callback(self._make_disconnect_emitter())
@@ -854,8 +900,10 @@ class MainWindow(QMainWindow):
                 state.add_log(f"重新連線 200B 要求略過: {exc}")
             manager.start_200b_keeper()
         except Exception:
+            self._connect_in_progress.discard(address)
             try:
-                await manager.disconnect()
+                if manager.is_connected:
+                    await manager.disconnect()
             except Exception:
                 pass
             raise
@@ -864,6 +912,11 @@ class MainWindow(QMainWindow):
         self._reconnecting_addresses.discard(address)
         state.is_connected = True
         state.add_log("已重新連線")
+        if address in self._connect_in_progress:
+            QTimer.singleShot(
+                CONNECT_READY_GUARD_TIMEOUT_MS,
+                lambda a=address, m=manager: self._expire_connect_guard(a, m),
+            )
         if not self.active_address:
             self.active_address = address
         if self.active_address == address:
@@ -873,9 +926,11 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str, str, bytes)
     def _handle_notify(self, address: str, uuid: str, data: bytes) -> None:
-        # First packet arrived → this device is now streaming, so it is safe to
-        # connect the next device (clears the connect-in-progress guard).
-        self._connect_in_progress.discard(address)
+        # Only a complete data packet proves GATT discovery/streaming is ready.
+        # Dongle control frames and truncated notifications must not release the
+        # guard and allow another AT+CONN too early.
+        if _is_stream_payload(uuid, data):
+            self._connect_in_progress.discard(address)
         state = self.states.get(address)
         if state is None:
             return
@@ -893,7 +948,14 @@ class MainWindow(QMainWindow):
             self.refresh_pages()
         else:
             self._refresh_device_tabs()
-            self.scan_panel.refresh_connected_devices(self._connected_summary(), self.active_address)
+            self.scan_panel.refresh_connected_devices(
+                self._connected_summary(), self.active_address
+            )
+
+    def _expire_connect_guard(self, address: str, manager: DeviceManager) -> None:
+        """Expire only the attempt that created this safety timer."""
+        if self.managers.get(address) is manager:
+            self._connect_in_progress.discard(address)
 
     def _handle_event(self, event: DataEvent, state: DeviceState | None = None) -> None:
         if event.kind == "error":
