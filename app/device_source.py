@@ -19,7 +19,10 @@ from __future__ import annotations
 import asyncio
 import re
 import threading
+import time
 from abc import ABC, abstractmethod
+from datetime import datetime
+from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
 from .ble_adapter import AdapterCheckResult, AdapterStatus, check_bluetooth_adapter
@@ -135,7 +138,8 @@ _SOF0 = 0xAA
 _SOF1 = 0x55
 _PKT_HEADER = 8  # SOF(2)+SITE_ID(2)+DEV_ID(1)+SEQ(2)+LEN(1)
 _PKT_FOOTER = 3  # RSSI(1)+CRC16(2)
-_IOT_PACKET_LEN = 50  # legacy IOT packet size (sizeof iot_packet_t); else 200B
+_IOT_PACKET_LEN = 50  # legacy IOT packet size (sizeof iot_packet_t)
+_MIN_200B_PACKET_LEN = 193  # shortest payload accepted by decode_200b_packet()
 
 # AT response line patterns emitted by the firmware.
 _SCAN_LIST_HDR = re.compile(r"^SCAN LIST:\s+(\d+)")
@@ -174,6 +178,28 @@ _DONGLE_PENDING_CONNECT_SCAN_WAIT_SECONDS = 4.0
 # How long a connect waits for an in-progress scan to finish before proceeding.
 # Bounds the wait so a stuck scan can never block connects forever.
 _DONGLE_SCAN_IDLE_WAIT_SECONDS = 12.0
+# The firmware requests a fresh 200B packet every two seconds when the stream is
+# stale.  If the PC still sees no frame for this long, the BLE link or USB path
+# is no longer healthy even when no DISCONNECTED line made it across CDC.
+_DONGLE_STREAM_WATCHDOG_INTERVAL_SECONDS = 2.0
+_DONGLE_STREAM_STALE_SECONDS = 12.0
+# A reset temporarily removes the CDC device from Windows.  Reopen in an
+# executor and allow enough time for the same dongle to enumerate again.
+_DONGLE_REOPEN_TIMEOUT_SECONDS = 6.0
+_DONGLE_POST_RESET_SETTLE_SECONDS = 1.0
+_DONGLE_SERIAL_WRITE_TIMEOUT_SECONDS = 1.0
+
+
+def _write_dongle_runtime_log(message: str) -> None:
+    """Persist transport/recovery events even when verbose scan logging is off."""
+    try:
+        log_dir = Path.cwd() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        with (log_dir / "dongle_runtime.log").open("a", encoding="utf-8") as file:
+            file.write(f"{timestamp} {message}\n")
+    except Exception:
+        pass
 
 
 def _crc16_ccitt(data: bytes) -> int:
@@ -201,6 +227,8 @@ class DongleDeviceManager:
         self._notify_callback: NotifyCallback | None = None
         self._disconnect_callback: DisconnectCallback | None = None
         self._connected = False
+        self._last_notify_monotonic: float | None = None
+        self._keeper_task: asyncio.Task[None] | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -214,17 +242,25 @@ class DongleDeviceManager:
 
     async def connect(self, address: str) -> None:
         self.address = address.upper()
-        self._source._register_manager(self.address, self)
         try:
-            await self._source._connect(self.address)
+            # Registration happens inside the source's connect lock, after any
+            # pending dongle recovery.  Otherwise recovery would clear this
+            # not-yet-connected manager and every later frame would be dropped.
+            await self._source._connect(self.address, self)
+            if not self._source._manager_has_active_link(self.address, self):
+                raise ConnectionError(
+                    f"Dongle link disappeared while connecting to {self.address}"
+                )
         except Exception:
             self._source._unregister_manager(self.address)
             raise
         self._connected = True
+        self._last_notify_monotonic = self._source._loop.time()
 
     async def disconnect(self) -> None:
         address = self.address
-        if address:
+        self.stop_200b_keeper()
+        if address and self._connected:
             try:
                 await self._source._disconnect(address)
             finally:
@@ -241,11 +277,59 @@ class DongleDeviceManager:
         # The firmware runs its own 200B keeper; nothing to do here.
         return None
 
-    def start_200b_keeper(self, **kwargs: object) -> None:
-        return None
+    def start_200b_keeper(
+        self,
+        *,
+        interval: float = _DONGLE_STREAM_WATCHDOG_INTERVAL_SECONDS,
+        stale_after: float = _DONGLE_STREAM_STALE_SECONDS,
+        **_kwargs: object,
+    ) -> None:
+        """Watch the PC-facing stream, not only the firmware's BLE state.
+
+        The dongle firmware already re-requests 200B notifications.  This
+        second-level watchdog covers failures for which neither BLE nor CDC
+        delivered a DISCONNECTED line (reader failure, firmware reset, or a
+        logically-connected peripheral that stopped producing data).
+        """
+        self.stop_200b_keeper()
+        if not self._connected:
+            return
+        self._keeper_task = self._source._loop.create_task(
+            self._run_stream_watchdog(interval, stale_after)
+        )
 
     def stop_200b_keeper(self) -> None:
-        return None
+        task = self._keeper_task
+        self._keeper_task = None
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        if (
+            task is not None
+            and not task.done()
+            and task is not current_task
+        ):
+            task.cancel()
+
+    async def _run_stream_watchdog(self, interval: float, stale_after: float) -> None:
+        try:
+            while self._connected:
+                await asyncio.sleep(interval)
+                if not self._connected:
+                    return
+                last = self._last_notify_monotonic
+                if last is None:
+                    last = self._source._loop.time()
+                    self._last_notify_monotonic = last
+                if (self._source._loop.time() - last) > stale_after:
+                    await self._source._handle_stream_stale(self)
+                    return
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if self._keeper_task is asyncio.current_task():
+                self._keeper_task = None
 
     async def write_device_number(self, number: int) -> None:
         self._source._send_command(f"AT+DEVNUM={self.address},{number}")
@@ -256,11 +340,13 @@ class DongleDeviceManager:
     # -- called by the source (in the event-loop thread) ---------------------
 
     def _dispatch_notify(self, uuid: str, payload: bytes) -> None:
+        self._last_notify_monotonic = self._source._loop.time()
         if self._notify_callback is not None:
             self._notify_callback(self.address, uuid, payload)
 
     def _dispatch_disconnect(self) -> None:
         self._connected = False
+        self.stop_200b_keeper()
         if self._disconnect_callback is not None:
             self._disconnect_callback(self.address)
 
@@ -290,6 +376,10 @@ class DongleSource(DeviceSource):
         self._loop = loop
         self._port_name = port
         self._baudrate = baudrate
+        self._serial_vid: int | None = None
+        self._serial_pid: int | None = None
+        self._serial_number: str | None = None
+        self._serial_location: str | None = None
         # When we created the serial port ourselves we may close/reopen it to
         # recover a wedged dongle; an injected (test) port is never reopened.
         self._owns_serial = serial_port is None
@@ -299,7 +389,13 @@ class DongleSource(DeviceSource):
         else:
             import serial  # imported lazily so the app runs without pyserial
 
-            self._serial = serial.Serial(port, baudrate, timeout=0.1)
+            self._serial = serial.Serial(
+                port,
+                baudrate,
+                timeout=0.1,
+                write_timeout=_DONGLE_SERIAL_WRITE_TIMEOUT_SECONDS,
+            )
+            self._remember_serial_identity(port)
         self._write_lock = threading.Lock()
 
         self._managers: dict[str, DongleDeviceManager] = {}
@@ -332,6 +428,9 @@ class DongleSource(DeviceSource):
         # Set when a connect timed out (firmware wedged); the next scan resets
         # the dongle so it does not require an app restart.
         self._needs_recovery = False
+        self._recovering = False
+        self._last_transport_error = ""
+        self._recovery_lock = asyncio.Lock()
 
         self._reader: threading.Thread | None = None
         if start_reader:
@@ -343,11 +442,25 @@ class DongleSource(DeviceSource):
     # -- DeviceSource API ----------------------------------------------------
 
     async def check_ready(self) -> AdapterCheckResult:
-        if self._serial is not None and self._serial.is_open:
+        if self._serial is not None and getattr(self._serial, "is_open", False):
+            if self._reader is not None and not self._reader.is_alive():
+                detail = self._last_transport_error or "Dongle reader thread stopped"
+                return AdapterCheckResult(AdapterStatus.NO_ADAPTER, detail)
+            if self._needs_recovery:
+                detail = self._last_transport_error or "Dongle recovery required"
+                return AdapterCheckResult(AdapterStatus.NO_ADAPTER, detail)
             return AdapterCheckResult(AdapterStatus.OK, f"Dongle on {self._port_name}")
         return AdapterCheckResult(
             AdapterStatus.NO_ADAPTER, "Dongle serial port is not open"
         )
+
+    @property
+    def needs_recovery(self) -> bool:
+        return self._needs_recovery
+
+    async def ensure_recovered(self, reason: str) -> None:
+        """Coalesce callers that only need recovery when transport is unhealthy."""
+        await self._ensure_recovered(reason)
 
     def create_manager(self) -> DeviceManager:
         return DongleDeviceManager(self)
@@ -378,14 +491,15 @@ class DongleSource(DeviceSource):
             self._scan_future = future
             self._scan_expect = None
             _write_scan_debug("dongle scan: AT+LIST")
-            self._send_command("AT+LIST")
             try:
+                self._send_command("AT+LIST")
                 await asyncio.wait_for(future, timeout=3.0)
             except asyncio.TimeoutError:
                 _write_scan_debug(
                     "dongle scan: AT+LIST timed out (no SCAN LIST received)"
                 )
             finally:
+                self._consume_future_exception(future)
                 self._scan_future = None
                 self._scan_debug = False
             results = self._parse_scan_results(self._scan_lines)
@@ -395,6 +509,7 @@ class DongleSource(DeviceSource):
             )
             return results
         finally:
+            self._scan_debug = False
             self._scan_idle.set()
 
     async def close(self) -> None:
@@ -413,14 +528,26 @@ class DongleSource(DeviceSource):
     def _send_command(self, text: str) -> None:
         try:
             with self._write_lock:
+                if not getattr(self._serial, "is_open", False):
+                    raise OSError("serial port is closed")
                 self._serial.write((text + "\r\n").encode("ascii"))
-        except Exception:
-            pass
+        except Exception as exc:
+            message = f"serial write failed on {self._port_name}: {exc}"
+            self._handle_transport_failure(message)
+            raise ConnectionError(message) from exc
 
     # -- manager registry ----------------------------------------------------
 
     def _register_manager(self, mac: str, manager: DongleDeviceManager) -> None:
         self._managers[mac] = manager
+
+    def _manager_has_active_link(
+        self, mac: str, manager: DongleDeviceManager
+    ) -> bool:
+        return (
+            self._managers.get(mac) is manager
+            and mac in self._handle_to_mac.values()
+        )
 
     def _unregister_manager(self, mac: str) -> None:
         self._managers.pop(mac, None)
@@ -429,19 +556,30 @@ class DongleSource(DeviceSource):
         for handle in [h for h, m in self._handle_to_mac.items() if m == mac]:
             self._handle_to_mac.pop(handle, None)
 
-    async def _connect(self, mac: str) -> None:
+    async def _connect(
+        self, mac: str, manager: DongleDeviceManager | None = None
+    ) -> None:
         async with self._connect_lock:
+            await self._ensure_recovered("transport/connect state requires recovery")
             # Never multiplex a connect onto the serial link while a scan runs,
             # and never issue AT+CONN while a previous link is still tearing down
             # (a pending AT+DISC) — both wedge the firmware's BLE central.
             await self._wait_for_scan_idle()
             await self._wait_for_pending_disconnects()
             await self._settle_after_disconnect()
+            # Recovery may have started while any of the waits above yielded.
+            # Recheck immediately before registration/AT+CONN; no await occurs
+            # between this check and creation of the coordination future.
+            await self._ensure_recovered(
+                "transport changed while connect was waiting"
+            )
+            if manager is not None:
+                self._register_manager(mac, manager)
             future: asyncio.Future[bool] = self._loop.create_future()
             self._connect_futures[mac] = future
             self._active_connect_mac = mac
-            self._send_command(f"AT+CONN={mac}")
             try:
+                self._send_command(f"AT+CONN={mac}")
                 await asyncio.wait_for(future, timeout=_DONGLE_CONNECT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError as exc:
                 # Firmware never answered: it is wedged. Flag recovery so the
@@ -451,6 +589,7 @@ class DongleSource(DeviceSource):
                 raise TimeoutError(f"Dongle connect timed out for {mac}") from exc
             finally:
                 self._connect_futures.pop(mac, None)
+                self._consume_future_exception(future)
                 if self._active_connect_mac == mac:
                     self._active_connect_mac = None
 
@@ -477,8 +616,8 @@ class DongleSource(DeviceSource):
     async def _disconnect(self, mac: str) -> None:
         future: asyncio.Future[bool] = self._loop.create_future()
         self._disconnect_futures[mac] = future
-        self._send_command(f"AT+DISC={mac}")
         try:
+            self._send_command(f"AT+DISC={mac}")
             await asyncio.wait_for(future, timeout=_DONGLE_DISCONNECT_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
             # Firmware did not acknowledge the disconnect: its link may still be
@@ -493,6 +632,31 @@ class DongleSource(DeviceSource):
             _write_scan_debug(f"dongle disconnect timed out for {mac}; flagged for recovery")
         finally:
             self._disconnect_futures.pop(mac, None)
+            self._consume_future_exception(future)
+
+    async def _handle_stream_stale(self, manager: DongleDeviceManager) -> None:
+        """Turn a silent stream into a real disconnect/reconnect workflow."""
+        mac = manager.address
+        if not mac or self._managers.get(mac) is not manager or not manager.is_connected:
+            return
+        age = self._loop.time() - (manager._last_notify_monotonic or self._loop.time())
+        message = f"stream stale for {mac} ({age:.1f}s without a frame)"
+        _write_scan_debug(f"dongle: {message}")
+        _write_dongle_runtime_log(message)
+        try:
+            await self._disconnect(mac)
+        except Exception as exc:
+            _write_dongle_runtime_log(f"stale-stream disconnect failed for {mac}: {exc}")
+
+        # A normal DISCONNECTED line removes the manager and drives the UI.  If
+        # the line/transport was lost, force source recovery so the same UI path
+        # still runs and recording state is retained for auto-reconnect.
+        if self._managers.get(mac) is manager:
+            self._needs_recovery = True
+            try:
+                await self.recover(f"{message}; no disconnect acknowledgement")
+            except Exception as exc:
+                _write_dongle_runtime_log(f"stale-stream recovery pending: {exc}")
 
     async def _wait_for_pending_disconnects(self) -> None:
         futures = [future for future in self._disconnect_futures.values() if not future.done()]
@@ -516,8 +680,10 @@ class DongleSource(DeviceSource):
         scan would silently return nothing. Recovering here means the user no
         longer has to close and reopen the app.
         """
-        if self._needs_recovery:
-            await self.recover("previous connect/disconnect left the dongle wedged")
+        if self._needs_recovery or self._recovering:
+            await self._ensure_recovered(
+                "previous connect/disconnect left the dongle wedged"
+            )
             return
         pending = [f for f in self._connect_futures.values() if not f.done()]
         if not pending:
@@ -531,34 +697,84 @@ class DongleSource(DeviceSource):
         if still_pending:
             await self.recover("scan requested over an unresponsive connect")
 
-    async def recover(self, reason: str = "manual recovery") -> None:
-        """Reset a wedged dongle without an app restart.
+    async def _ensure_recovered(self, reason: str) -> None:
+        """Wait for an active recovery, then reset only if it is still needed."""
+        if self._recovering:
+            # Do not queue a second reset behind the first one.  The recovery
+            # lock is released only after needs_recovery reflects its outcome.
+            async with self._recovery_lock:
+                pass
+        if self._needs_recovery:
+            await self.recover(reason)
 
-        Fails any in-flight connect so its coroutine unwinds, reopens the CDC
-        serial port (which toggles DTR and resets the nRF firmware, the same
-        thing an app restart does), and drops all stale link state.
+    async def recover(self, reason: str = "manual recovery") -> None:
+        """Reset BLE/CDC state and reopen the physical dongle.
+
+        Closing a CDC handle does *not* reset an nRF52840.  New firmware accepts
+        AT+RESET; AT+DISC remains a compatibility fallback for older firmware.
         """
-        _write_scan_debug(f"dongle recovery: {reason}")
-        self._fail_all_pending_connects(RuntimeError(f"dongle reset: {reason}"))
-        if self._owns_serial:
+        async with self._recovery_lock:
+            _write_scan_debug(f"dongle recovery: {reason}")
+            _write_dongle_runtime_log(f"recovery started: {reason}")
+            self._needs_recovery = True
+            self._recovering = True
+            self._fail_all_pending_operations(f"dongle reset: {reason}")
+            # Notify the UI before touching the port.  This is what preserves
+            # state/CSV recording and schedules auto-reconnect.
+            self._reset_link_state()
             try:
-                await self._loop.run_in_executor(None, self._reopen_serial)
-            except Exception as exc:  # pragma: no cover - hardware dependent
-                _write_scan_debug(f"dongle recovery: serial reopen failed: {exc}")
-        self._reset_link_state()
-        self._needs_recovery = False
+                if self._owns_serial:
+                    # Best effort: old firmware understands AT+DISC; the fixed
+                    # firmware then performs a real MCU reset via AT+RESET.
+                    try:
+                        self._send_command("AT+DISC")
+                        await asyncio.sleep(0.15)
+                        self._send_command("AT+RESET")
+                        await asyncio.sleep(0.2)
+                    except Exception as exc:
+                        _write_scan_debug(f"dongle recovery command failed: {exc}")
+                    await self._loop.run_in_executor(None, self._reopen_serial)
+                    await asyncio.sleep(_DONGLE_POST_RESET_SETTLE_SECONDS)
+                    if (
+                        not getattr(self._serial, "is_open", False)
+                        or self._reader is None
+                        or not self._reader.is_alive()
+                    ):
+                        raise OSError("dongle reader did not survive CDC reopen")
+            except Exception as exc:
+                self._last_transport_error = f"dongle reopen failed: {exc}"
+                _write_scan_debug(f"dongle recovery: {self._last_transport_error}")
+                _write_dongle_runtime_log(self._last_transport_error)
+                self._needs_recovery = True
+                raise ConnectionError(self._last_transport_error) from exc
+            finally:
+                self._recovering = False
+            self._last_transport_error = ""
+            self._needs_recovery = False
+            _write_dongle_runtime_log(f"recovery completed on {self._port_name}")
 
     def _fail_all_pending_connects(self, error: Exception) -> None:
         for future in list(self._connect_futures.values()):
             if not future.done():
                 future.set_exception(error)
 
-    def _reopen_serial(self) -> None:
-        """Close and reopen the serial port to force a firmware reset.
+    @staticmethod
+    def _consume_future_exception(future: asyncio.Future[object]) -> None:
+        """Mark a synchronously failed coordination future as observed."""
+        if future.done() and not future.cancelled():
+            future.exception()
 
-        Runs in an executor thread. Stops the current reader, reopens the port,
-        then restarts the reader against the fresh handle.
-        """
+    def _fail_all_pending_operations(self, message: str) -> None:
+        """Release every coroutine waiting on a transport that has died."""
+        self._fail_all_pending_connects(ConnectionError(message))
+        if self._scan_future is not None and not self._scan_future.done():
+            self._scan_future.set_exception(ConnectionError(message))
+        for future in list(self._disconnect_futures.values()):
+            if not future.done():
+                future.set_exception(ConnectionError(message))
+
+    def _reopen_serial(self) -> None:
+        """Close/reopen CDC after firmware reset, following a changed COM name."""
         import serial  # lazy import, mirrors __init__
 
         self._running = False
@@ -575,7 +791,30 @@ class DongleSource(DeviceSource):
             and reader is not threading.current_thread()
         ):
             reader.join(timeout=1.5)
-        self._serial = serial.Serial(self._port_name, self._baudrate, timeout=0.1)
+            if reader.is_alive():
+                raise OSError("dongle reader did not stop before CDC reopen")
+        deadline = time.monotonic() + _DONGLE_REOPEN_TIMEOUT_SECONDS
+        last_error: Exception | None = None
+        while True:
+            for candidate in self._serial_port_candidates():
+                try:
+                    self._serial = serial.Serial(
+                        candidate,
+                        self._baudrate,
+                        timeout=0.1,
+                        write_timeout=_DONGLE_SERIAL_WRITE_TIMEOUT_SECONDS,
+                    )
+                    self._port_name = candidate
+                    self._remember_serial_identity(candidate)
+                    last_error = None
+                    break
+                except Exception as exc:  # pragma: no cover - hardware dependent
+                    last_error = exc
+            if last_error is None and getattr(self._serial, "is_open", False):
+                break
+            if time.monotonic() >= deadline:
+                raise last_error or OSError("dongle did not re-enumerate")
+            time.sleep(0.25)
         self._rxbuf = bytearray()
         self._running = True
         self._reader = threading.Thread(
@@ -583,6 +822,51 @@ class DongleSource(DeviceSource):
         )
         self._reader.start()
         _write_scan_debug("dongle recovery: serial reopened, reader restarted")
+
+    def _remember_serial_identity(self, port: str) -> None:
+        try:
+            from serial.tools import list_ports
+
+            for info in list_ports.comports():
+                if str(info.device).upper() != str(port).upper():
+                    continue
+                self._serial_vid = info.vid
+                self._serial_pid = info.pid
+                self._serial_number = info.serial_number
+                self._serial_location = info.location
+                return
+        except Exception:
+            pass
+
+    def _serial_port_candidates(self) -> list[str]:
+        candidates: list[str] = []
+        try:
+            from serial.tools import list_ports
+
+            matches: list[str] = []
+            for info in list_ports.comports():
+                if self._serial_number and info.serial_number == self._serial_number:
+                    matches.insert(0, info.device)
+                    continue
+                if (
+                    self._serial_vid is not None
+                    and info.vid == self._serial_vid
+                    and info.pid == self._serial_pid
+                    and (
+                        not self._serial_location
+                        or not info.location
+                        or info.location == self._serial_location
+                    )
+                ):
+                    matches.append(info.device)
+            candidates.extend(matches)
+        except Exception:
+            pass
+        # Prefer the remembered USB identity in case Windows assigned a new COM
+        # number; fall back to the original name when enumeration has not yet
+        # repopulated.
+        candidates.append(self._port_name)
+        return list(dict.fromkeys(str(candidate) for candidate in candidates if candidate))
 
     def _reset_link_state(self) -> None:
         """Drop every link mapping and tell managers their link is gone."""
@@ -593,7 +877,24 @@ class DongleSource(DeviceSource):
         self._managers.clear()
         self._active_connect_mac = None
         for manager in managers:
-            manager._dispatch_disconnect()
+            # A manager registered for an in-flight AT+CONN is not a live link;
+            # emitting its callback would start a duplicate UI reconnect task.
+            if manager.is_connected:
+                manager._dispatch_disconnect()
+            else:
+                manager.stop_200b_keeper()
+
+    def _handle_transport_failure(self, message: str) -> None:
+        """Mark a dead CDC transport and surface it as device disconnects."""
+        self._last_transport_error = message
+        _write_scan_debug(f"dongle transport: {message}")
+        _write_dongle_runtime_log(message)
+        if self._recovering or not self._running:
+            return
+        self._needs_recovery = True
+        self._running = False
+        self._fail_all_pending_operations(message)
+        self._reset_link_state()
 
     @staticmethod
     def _parse_scan_results(lines: list[str]) -> list[DeviceScanResult]:
@@ -630,7 +931,12 @@ class DongleSource(DeviceSource):
         while self._running:
             try:
                 chunk = self._serial.read(256)
-            except Exception:
+            except Exception as exc:
+                if self._running:
+                    message = f"serial read failed on {self._port_name}: {exc}"
+                    self._loop.call_soon_threadsafe(
+                        self._handle_transport_failure, message
+                    )
                 break
             if not chunk:
                 continue
@@ -682,11 +988,15 @@ class DongleSource(DeviceSource):
         dev_id = frame[4]
         length = frame[7]
         payload = frame[_PKT_HEADER : _PKT_HEADER + length]
-        # Route to the right decoder by payload length, mirroring the PC's dual
-        # IOT + 200B subscription: 50 bytes is the legacy IOT packet, larger is
-        # the 200B packet. Other (tiny) control payloads fall through to the
-        # 200B decoder, which ignores anything shorter than a full 200B packet.
-        uuid = UUID_IOT_NOTIFY if length == _IOT_PACKET_LEN else UUID_NOTIFY_200B
+        # Firmware also emits tiny binary control frames for connect/disconnect
+        # events.  They are not BLE notifications and must not refresh the
+        # stream watchdog or release the UI's first-data connection guard.
+        if length == _IOT_PACKET_LEN:
+            uuid = UUID_IOT_NOTIFY
+        elif length >= _MIN_200B_PACKET_LEN:
+            uuid = UUID_NOTIFY_200B
+        else:
+            return True
         self._loop.call_soon_threadsafe(self._on_frame, dev_id, uuid, payload)
         return True
 
@@ -706,6 +1016,8 @@ class DongleSource(DeviceSource):
             manager._dispatch_notify(uuid, payload)
 
     def _on_line(self, line: str) -> None:
+        if line.startswith("DIAG:"):
+            _write_dongle_runtime_log(f"firmware {line}")
         if self._scan_debug:
             _write_scan_debug(f"dongle rx: {line!r}")
         if self._scan_debug and self._collect_scan_line(line):
@@ -746,7 +1058,10 @@ class DongleSource(DeviceSource):
                     future.set_result(True)
                 manager = self._managers.get(mac)
                 if manager is not None:
-                    manager._dispatch_disconnect()
+                    if manager.is_connected:
+                        manager._dispatch_disconnect()
+                    else:
+                        manager.stop_200b_keeper()
                 self._unregister_manager(mac)
             return
 

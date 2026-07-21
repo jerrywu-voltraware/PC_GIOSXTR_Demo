@@ -12,6 +12,7 @@ import asyncio
 import pytest
 
 from app import device_source as ds
+from app.ble_adapter import AdapterStatus
 from app.constants import UUID_IOT_NOTIFY, UUID_NOTIFY_200B
 from app.device_source import DongleSource, _crc16_ccitt
 
@@ -50,6 +51,16 @@ class FakeSerial:
 
     def close(self) -> None:
         self.is_open = False
+
+
+class ReadFailSerial(FakeSerial):
+    def read(self, _size: int) -> bytes:
+        raise OSError("simulated serial read failure")
+
+
+class WriteFailSerial(FakeSerial):
+    def write(self, _data: bytes) -> None:
+        raise OSError("simulated serial write failure")
 
 
 def _make_source_with_fake_serial() -> tuple[DongleSource, FakeSerial]:
@@ -94,6 +105,25 @@ def test_50_byte_frame_routes_to_iot_uuid():
     addr, uuid, data = _route_one(payload)
     assert uuid == UUID_IOT_NOTIFY
     assert data == payload
+
+
+def test_tiny_control_frames_do_not_dispatch_notifications():
+    src = _make_source()
+    received: list[bytes] = []
+    mgr = src.create_manager()
+    mgr.set_notify_callback(lambda _a, _u, data: received.append(data))
+    mac = "AA:BB:CC:01:10:90"
+    mgr.address = mac
+    src._register_manager(mac, mgr)  # type: ignore[attr-defined]
+    src._devid_to_mac[7] = mac  # type: ignore[attr-defined]
+
+    for seq, payload in enumerate((bytes(range(6)), b"\x13")):
+        src._rxbuf.extend(_build_frame(1, 7, seq, payload, 0))  # type: ignore[attr-defined]
+    src._consume()  # type: ignore[attr-defined]
+    src._loop.run_until_complete(asyncio.sleep(0))
+
+    assert received == []
+    assert mgr._last_notify_monotonic is None  # type: ignore[attr-defined]
 
 
 def test_bad_crc_frame_is_dropped():
@@ -175,6 +205,244 @@ def test_dongle_connect_error_fails_active_connect_immediately():
         loop.run_until_complete(task)
 
 
+def test_reader_exception_disconnects_all_managers_and_marks_source_unready():
+    loop = asyncio.new_event_loop()
+    source = DongleSource(
+        "TEST",
+        loop,
+        serial_port=ReadFailSerial(),
+        start_reader=False,
+    )
+    disconnects: list[str] = []
+    pending_connect = loop.create_future()
+    pending_scan = loop.create_future()
+    pending_disconnect = loop.create_future()
+    source._connect_futures["AA:BB:CC:01:10:92"] = pending_connect  # type: ignore[attr-defined]
+    source._scan_future = pending_scan  # type: ignore[attr-defined]
+    source._disconnect_futures["AA:BB:CC:01:10:93"] = pending_disconnect  # type: ignore[attr-defined]
+
+    for index, mac in enumerate(
+        ("AA:BB:CC:01:10:90", "AA:BB:CC:01:10:91")
+    ):
+        manager = source.create_manager()
+        manager.address = mac
+        manager._connected = True  # type: ignore[attr-defined]
+        manager.set_disconnect_callback(disconnects.append)
+        source._register_manager(mac, manager)  # type: ignore[attr-defined]
+        source._handle_to_mac[index] = mac  # type: ignore[attr-defined]
+
+    # Exercise the reader body synchronously, then flush any event-loop callback
+    # that the transport-failure path scheduled from the reader thread.
+    source._read_loop()  # type: ignore[attr-defined]
+    loop.run_until_complete(asyncio.sleep(0))
+    readiness = loop.run_until_complete(source.check_ready())
+
+    assert disconnects == ["AA:BB:CC:01:10:90", "AA:BB:CC:01:10:91"]
+    assert source._managers == {}  # type: ignore[attr-defined]
+    assert source._needs_recovery is True  # type: ignore[attr-defined]
+    assert isinstance(pending_connect.exception(), ConnectionError)
+    assert isinstance(pending_scan.exception(), ConnectionError)
+    assert isinstance(pending_disconnect.exception(), ConnectionError)
+    assert readiness.status is not AdapterStatus.OK
+    loop.close()
+
+
+def test_serial_write_exception_fails_connect_immediately_and_marks_recovery():
+    loop = asyncio.new_event_loop()
+    source = DongleSource(
+        "TEST",
+        loop,
+        serial_port=WriteFailSerial(),
+        start_reader=False,
+    )
+    mac = "AA:BB:CC:01:10:90"
+
+    # The outer timeout is only a test safety net. The expected failure must be
+    # the serial write error itself, not the dongle's 35-second connect timeout.
+    with pytest.raises(Exception, match="simulated serial write failure"):
+        loop.run_until_complete(
+            asyncio.wait_for(source._connect(mac), timeout=0.25)  # type: ignore[attr-defined]
+        )
+
+    assert source._needs_recovery is True  # type: ignore[attr-defined]
+
+
+def test_manager_stays_registered_when_recovery_precedes_connect():
+    source, serial = _make_source_with_fake_serial()
+    loop = source._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+    manager = source.create_manager()
+    notifications: list[bytes] = []
+    disconnects: list[str] = []
+    manager.set_notify_callback(lambda _a, _u, data: notifications.append(data))
+    manager.set_disconnect_callback(disconnects.append)
+    source._needs_recovery = True  # type: ignore[attr-defined]
+
+    task = loop.create_task(manager.connect(mac))
+    loop.run_until_complete(asyncio.sleep(0))
+    assert serial.writes == [f"AT+CONN={mac}"]
+
+    source._on_line(f"CONNECTED handle=0 #7 GIOS0403ST#7 MAC={mac}")  # type: ignore[attr-defined]
+    loop.run_until_complete(task)
+    assert source._managers.get(mac) is manager  # type: ignore[attr-defined]
+    assert disconnects == []
+
+    payload = bytes(index % 256 for index in range(200))
+    source._rxbuf.extend(_build_frame(1, 7, 1, payload, -50))  # type: ignore[attr-defined]
+    source._consume()  # type: ignore[attr-defined]
+    loop.run_until_complete(asyncio.sleep(0))
+    assert notifications == [payload]
+
+
+def test_manager_connect_fails_if_link_drops_before_coroutine_resumes():
+    source, _serial = _make_source_with_fake_serial()
+    loop = source._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+    manager = source.create_manager()
+    disconnects: list[str] = []
+    manager.set_disconnect_callback(disconnects.append)
+
+    task = loop.create_task(manager.connect(mac))
+    loop.run_until_complete(asyncio.sleep(0))
+    source._on_line(f"CONNECTED handle=0 #7 GIOS0403ST#7 MAC={mac}")  # type: ignore[attr-defined]
+    source._on_line("DISCONNECTED handle=0 #7 GIOS0403ST#7 reason=0x13")  # type: ignore[attr-defined]
+
+    with pytest.raises(ConnectionError, match="link disappeared"):
+        loop.run_until_complete(task)
+    assert manager.is_connected is False
+    assert disconnects == []
+
+
+def test_ensure_recovered_waits_without_queueing_second_reset(monkeypatch):
+    source, _serial = _make_source_with_fake_serial()
+    loop = source._loop  # type: ignore[attr-defined]
+    loop.run_until_complete(source._recovery_lock.acquire())  # type: ignore[attr-defined]
+    source._recovering = True  # type: ignore[attr-defined]
+    source._needs_recovery = True  # type: ignore[attr-defined]
+    recover_calls: list[str] = []
+
+    async def unexpected_recover(reason: str) -> None:
+        recover_calls.append(reason)
+
+    monkeypatch.setattr(source, "recover", unexpected_recover)
+    task = loop.create_task(source.ensure_recovered("test"))
+    loop.run_until_complete(asyncio.sleep(0))
+    assert not task.done()
+
+    source._needs_recovery = False  # type: ignore[attr-defined]
+    source._recovering = False  # type: ignore[attr-defined]
+    source._recovery_lock.release()  # type: ignore[attr-defined]
+    loop.run_until_complete(task)
+    assert recover_calls == []
+
+
+def test_reopen_serial_rejects_reader_that_does_not_stop():
+    source, serial = _make_source_with_fake_serial()
+    loop = source._loop  # type: ignore[attr-defined]
+
+    class StuckReader:
+        def __init__(self) -> None:
+            self.join_timeouts: list[float | None] = []
+
+        @staticmethod
+        def is_alive() -> bool:
+            return True
+
+        def join(self, timeout: float | None = None) -> None:
+            self.join_timeouts.append(timeout)
+
+    reader = StuckReader()
+    source._reader = reader  # type: ignore[assignment]
+
+    with pytest.raises(OSError, match="reader did not stop"):
+        source._reopen_serial()  # type: ignore[attr-defined]
+
+    assert serial.is_open is False
+    assert reader.join_timeouts == [1.5]
+    assert source._reader is reader  # type: ignore[attr-defined]
+    loop.close()
+
+
+def test_connect_rechecks_recovery_after_preflight_waits(monkeypatch):
+    source, serial = _make_source_with_fake_serial()
+    loop = source._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+    recover_calls: list[str] = []
+
+    async def transport_changes_while_waiting() -> None:
+        source._needs_recovery = True  # type: ignore[attr-defined]
+
+    async def recover_once(reason: str) -> None:
+        recover_calls.append(reason)
+        source._needs_recovery = False  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(source, "_settle_after_disconnect", transport_changes_while_waiting)
+    monkeypatch.setattr(source, "recover", recover_once)
+    task = loop.create_task(source._connect(mac))  # type: ignore[attr-defined]
+    loop.run_until_complete(asyncio.sleep(0))
+
+    assert recover_calls == ["transport changed while connect was waiting"]
+    assert serial.writes == [f"AT+CONN={mac}"]
+    source._on_line(f"CONNECTED handle=0 #7 GIOS0403ST#7 MAC={mac}")  # type: ignore[attr-defined]
+    loop.run_until_complete(task)
+
+
+def test_recover_rejects_a_dead_reopened_reader(monkeypatch):
+    source, _serial = _make_source_with_fake_serial()
+    loop = source._loop  # type: ignore[attr-defined]
+    source._owns_serial = True  # type: ignore[attr-defined]
+    monkeypatch.setattr(ds, "_DONGLE_POST_RESET_SETTLE_SECONDS", 0.0)
+
+    class DeadReader:
+        @staticmethod
+        def is_alive() -> bool:
+            return False
+
+    def reopen_with_dead_reader() -> None:
+        source._running = True  # type: ignore[attr-defined]
+        source._reader = DeadReader()  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(source, "_reopen_serial", reopen_with_dead_reader)
+    with pytest.raises(ConnectionError, match="reader did not survive"):
+        loop.run_until_complete(source.recover("test dead reader"))
+
+    assert source._needs_recovery is True  # type: ignore[attr-defined]
+    assert source._recovering is False  # type: ignore[attr-defined]
+    loop.close()
+
+
+def test_dongle_keeper_recovers_stale_connection_when_no_frames_arrive():
+    source, _serial = _make_source_with_fake_serial()
+    loop = source._loop  # type: ignore[attr-defined]
+    manager = source.create_manager()
+    mac = "AA:BB:CC:01:10:90"
+
+    connect_task = loop.create_task(manager.connect(mac))
+    loop.run_until_complete(asyncio.sleep(0))
+    source._on_line(  # type: ignore[attr-defined]
+        f"CONNECTED handle=0 #7 GIOS0403ST#7 MAC={mac}"
+    )
+    loop.run_until_complete(connect_task)
+
+    stale_managers: list[object] = []
+
+    async def recover_stale(stale_manager: object) -> None:
+        stale_managers.append(stale_manager)
+        manager._connected = False  # type: ignore[attr-defined]
+
+    source._handle_stream_stale = recover_stale  # type: ignore[method-assign]
+
+    async def exercise_keeper() -> None:
+        manager.start_200b_keeper(interval=0.01, stale_after=0.02)
+        await asyncio.sleep(0.08)
+        manager.stop_200b_keeper()
+
+    loop.run_until_complete(exercise_keeper())
+
+    assert stale_managers == [manager]
+    loop.close()
+
+
 def test_disconnected_line_dispatches_to_manager():
     src = _make_source()
     events: list[str] = []
@@ -182,6 +450,7 @@ def test_disconnected_line_dispatches_to_manager():
     mgr.set_disconnect_callback(lambda addr: events.append(addr))
     mac = "AA:BB:CC:01:10:90"
     mgr.address = mac  # connect() sets this in the real flow
+    mgr._connected = True  # type: ignore[attr-defined]
     src._register_manager(mac, mgr)  # type: ignore[attr-defined]
     src._handle_to_mac[2] = mac  # type: ignore[attr-defined]
 
@@ -197,6 +466,7 @@ def test_dongle_disconnect_waits_for_disconnected_line_before_unregistering():
     mgr.set_disconnect_callback(lambda addr: events.append(addr))
     mac = "AA:BB:CC:01:10:90"
     mgr.address = mac  # connect() sets this in the real flow
+    mgr._connected = True  # type: ignore[attr-defined]
     src._register_manager(mac, mgr)  # type: ignore[attr-defined]
     src._handle_to_mac[2] = mac  # type: ignore[attr-defined]
     src._devid_to_mac[7] = mac  # type: ignore[attr-defined]
@@ -292,6 +562,7 @@ def test_scan_recovers_when_connect_left_dongle_wedged():
     events: list[str] = []
     mgr.set_disconnect_callback(lambda addr: events.append(addr))
     mgr.address = mac
+    mgr._connected = True  # type: ignore[attr-defined]
     src._register_manager(mac, mgr)  # type: ignore[attr-defined]
     src._handle_to_mac[0] = mac  # type: ignore[attr-defined]
     src._needs_recovery = True  # type: ignore[attr-defined]
@@ -342,6 +613,7 @@ def test_disconnect_timeout_swallows_stale_disconnected_on_reused_handle(monkeyp
     # First link on handle 0; disconnect it but the firmware never acks.
     mgr1 = src.create_manager()
     mgr1.address = mac
+    mgr1._connected = True  # type: ignore[attr-defined]
     src._register_manager(mac, mgr1)  # type: ignore[attr-defined]
     src._handle_to_mac[0] = mac  # type: ignore[attr-defined]
     task = loop.create_task(mgr1.disconnect())
@@ -354,6 +626,7 @@ def test_disconnect_timeout_swallows_stale_disconnected_on_reused_handle(monkeyp
     events: list[str] = []
     mgr2 = src.create_manager()
     mgr2.address = mac
+    mgr2._connected = True  # type: ignore[attr-defined]
     mgr2.set_disconnect_callback(lambda addr: events.append(addr))
     src._register_manager(mac, mgr2)  # type: ignore[attr-defined]
     src._on_line(f"CONNECTED handle=0 #7 GIOS0403ST#7 MAC={mac}")  # type: ignore[attr-defined]

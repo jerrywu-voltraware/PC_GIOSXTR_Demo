@@ -378,6 +378,228 @@ def test_reconnect_device_rebuilds_manager_and_notifications():
     window.close()
 
 
+def test_reconnect_timeout_recovers_source_before_next_attempt():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import asyncio
+
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    order: list[str] = []
+
+    class FakeManager:
+        def __init__(self, attempt: int, *, fail: bool):
+            self.attempt = attempt
+            self.fail = fail
+            self.is_connected = False
+
+        def set_notify_callback(self, _callback):
+            pass
+
+        def set_disconnect_callback(self, _callback):
+            pass
+
+        async def connect(self, _address):
+            order.append(f"connect-{self.attempt}")
+            if self.fail:
+                raise TimeoutError("simulated reconnect timeout")
+            self.is_connected = True
+
+        async def disconnect(self):
+            order.append(f"disconnect-{self.attempt}")
+            self.is_connected = False
+
+        async def enable_default_notifications(self):
+            pass
+
+        async def request_200b(self):
+            pass
+
+        def start_200b_keeper(self):
+            pass
+
+    class FakeSource:
+        display_name = "Fake dongle"
+        supports_control = True
+        requires_ready_before_next_connect = False
+
+        def __init__(self):
+            self.managers = [
+                FakeManager(1, fail=True),
+                FakeManager(2, fail=False),
+            ]
+
+        def create_manager(self):
+            return self.managers.pop(0)
+
+        async def recover(self, _reason: str):
+            order.append("recover")
+
+    app = QApplication.instance() or QApplication([])
+    source = FakeSource()
+    window = MainWindow(source=source)
+    state = DeviceState(
+        is_connected=False,
+        device_name="A",
+        device_address="AA:BB",
+        device_number=45,
+    )
+    window.states[state.device_address] = state
+    window.active_address = state.device_address
+    window.state = state
+    window._reconnecting_addresses.add(state.device_address)
+    window._reconnect_delays = (0.0,)
+    window._reconnect_max_attempts = 2
+    window.refresh_pages = lambda: None
+    window._refresh_device_tabs = lambda: None
+
+    asyncio.run(window._run_reconnect_loop(state.device_address))
+
+    assert "recover" in order
+    assert order.index("connect-1") < order.index("recover") < order.index("connect-2")
+    assert state.is_connected
+    window._close_after_disconnect = True
+    window.close()
+
+
+def test_peripheral_connection_error_does_not_reset_healthy_dongle():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import asyncio
+
+    from PyQt6.QtWidgets import QApplication
+
+    from app.windows.main_window import MainWindow
+
+    class HealthyDongleSource:
+        display_name = "Healthy dongle"
+        supports_control = True
+        requires_ready_before_next_connect = False
+        needs_recovery = False
+
+        def __init__(self):
+            self.recovery_calls: list[str] = []
+
+        def create_manager(self):
+            raise AssertionError("manager is not needed for this test")
+
+        async def ensure_recovered(self, reason: str):
+            self.recovery_calls.append(reason)
+
+        async def recover(self, reason: str):
+            self.recovery_calls.append(reason)
+
+    app = QApplication.instance() or QApplication([])
+    source = HealthyDongleSource()
+    window = MainWindow(source=source)
+
+    recovered = asyncio.run(
+        window._maybe_recover_source(ConnectionError("peripheral link disappeared"))
+    )
+
+    assert recovered is False
+    assert source.recovery_calls == []
+    window._close_after_disconnect = True
+    window.close()
+
+
+def test_failed_reconnect_does_not_disconnect_manager_that_never_connected():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import asyncio
+
+    import pytest
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    class NeverConnectedManager:
+        is_connected = False
+
+        def __init__(self):
+            self.disconnect_calls = 0
+
+        def set_notify_callback(self, _callback):
+            pass
+
+        def set_disconnect_callback(self, _callback):
+            pass
+
+        async def connect(self, _address):
+            raise RuntimeError("simulated connect rejection")
+
+        async def disconnect(self):
+            self.disconnect_calls += 1
+
+        async def enable_default_notifications(self):
+            raise AssertionError("notifications must not be enabled")
+
+        async def request_200b(self):
+            raise AssertionError("200B must not be requested")
+
+        def start_200b_keeper(self):
+            raise AssertionError("keeper must not start")
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    state = DeviceState(
+        is_connected=False,
+        device_name="A",
+        device_address="AA:BB",
+        device_number=45,
+    )
+    window.states[state.device_address] = state
+    window.active_address = state.device_address
+    window.state = state
+    manager = NeverConnectedManager()
+    window._create_ble_manager = lambda: manager
+
+    with pytest.raises(RuntimeError, match="simulated connect rejection"):
+        asyncio.run(window._reconnect_device(state.device_address))
+
+    assert manager.disconnect_calls == 0
+    window._close_after_disconnect = True
+    window.close()
+
+
+def test_short_dongle_control_frame_does_not_release_connect_guard():
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.constants import UUID_NOTIFY_200B
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    address = "AA:BB:CC:01:10:90"
+    window.states[address] = DeviceState(
+        is_connected=True,
+        device_name="GIOS0403ST#7",
+        device_address=address,
+    )
+    window._connect_in_progress.add(address)
+
+    window._handle_notify(address, UUID_NOTIFY_200B, bytes(6))
+    assert address in window._connect_in_progress
+
+    window._handle_notify(address, UUID_NOTIFY_200B, bytes(193))
+    assert address not in window._connect_in_progress
+
+    old_manager = object()
+    new_manager = object()
+    window.managers[address] = new_manager  # type: ignore[assignment]
+    window._connect_in_progress.add(address)
+    window._expire_connect_guard(address, old_manager)  # type: ignore[arg-type]
+    assert address in window._connect_in_progress
+    window._expire_connect_guard(address, new_manager)  # type: ignore[arg-type]
+    assert address not in window._connect_in_progress
+    window.managers.pop(address)
+    window._close_after_disconnect = True
+    window.close()
+
+
 def test_data_pages_do_not_show_group_column():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import QApplication
