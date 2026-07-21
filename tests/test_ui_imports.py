@@ -2031,3 +2031,199 @@ def test_main_window_waveform_stores_non_active_device_and_shows_it_when_tab_bec
     assert chart.y == [54123.0]
     assert "PTU #10" in chart.stats_label.text()
     window.close()
+
+
+def test_reconnect_loop_retries_beyond_ten_attempts_and_never_gives_up():
+    # B-1: reconnect must never permanently give up.  The old loop stopped after
+    # RECONNECT_MAX_ATTEMPTS (10); the new loop keeps retrying until it succeeds.
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import asyncio
+
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    attempts = {"n": 0}
+
+    class FlakyManager:
+        def __init__(self):
+            self.is_connected = False
+
+        def set_notify_callback(self, _callback):
+            pass
+
+        def set_disconnect_callback(self, _callback):
+            pass
+
+        async def connect(self, _address):
+            attempts["n"] += 1
+            if attempts["n"] < 12:
+                raise TimeoutError(f"still down ({attempts['n']})")
+            self.is_connected = True
+
+        async def disconnect(self):
+            self.is_connected = False
+
+        async def enable_default_notifications(self):
+            pass
+
+        async def request_200b(self):
+            pass
+
+        def start_200b_keeper(self):
+            pass
+
+    class FlakySource:
+        display_name = "Flaky dongle"
+        supports_control = True
+        requires_ready_before_next_connect = False
+
+        def create_manager(self):
+            return FlakyManager()
+
+        async def recover(self, _reason):
+            pass
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(source=FlakySource())
+    state = DeviceState(is_connected=False, device_name="A", device_address="AA:BB", device_number=45)
+    window.states[state.device_address] = state
+    window.active_address = state.device_address
+    window.state = state
+    window._reconnecting_addresses.add(state.device_address)
+    window._reconnect_delays = (0.0,)
+    window._slow_reconnect_interval = 0.0
+    window.refresh_pages = lambda: None
+    window._refresh_device_tabs = lambda: None
+
+    asyncio.run(window._run_reconnect_loop(state.device_address))
+
+    # Kept retrying well past the old 10-attempt cap and finally connected.
+    assert attempts["n"] == 12
+    assert state.is_connected
+    window._close_after_disconnect = True
+    window.close()
+
+
+def test_re_enabling_auto_reconnect_rearms_disconnected_kept_device(monkeypatch):
+    # B-2a: turning auto-reconnect back on must re-arm a device that dropped
+    # while the toggle was off.
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    state = DeviceState(is_connected=False, device_name="A", device_address="AA:BB", device_number=45)
+    window.states[state.device_address] = state
+    window.active_address = state.device_address
+    window.state = state
+    window.set_auto_reconnect_enabled(False, persist=False)
+
+    scheduled = []
+    monkeypatch.setattr(window, "_schedule_reconnect", lambda address: scheduled.append(address))
+
+    window.set_auto_reconnect_enabled(True, persist=False)
+
+    assert scheduled == [state.device_address]
+    assert state.device_address in window._reconnecting_addresses
+    window._close_after_disconnect = True
+    window.close()
+
+
+def test_reconnect_health_tick_reschedules_device_whose_task_died(monkeypatch):
+    # B-2b: the periodic safety net re-arms a kept-but-disconnected device whose
+    # reconnect task has already finished (died) and left no live task.
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    state = DeviceState(is_connected=False, device_name="A", device_address="AA:BB", device_number=45)
+    window.states[state.device_address] = state
+    window.set_auto_reconnect_enabled(True, persist=False)
+
+    class DeadTask:
+        @staticmethod
+        def done():
+            return True
+
+    window._reconnect_tasks[state.device_address] = DeadTask()
+
+    scheduled = []
+    monkeypatch.setattr(window, "_schedule_reconnect", lambda address: scheduled.append(address))
+
+    window._reconnect_health_tick()
+
+    assert scheduled == [state.device_address]
+    window._close_after_disconnect = True
+    window.close()
+
+
+def test_health_tick_does_not_reschedule_live_task_device(monkeypatch):
+    # The safety net must NOT double-schedule a device that still has a live
+    # (not-done) reconnect task.
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    state = DeviceState(is_connected=False, device_name="A", device_address="AA:BB", device_number=45)
+    window.states[state.device_address] = state
+    window.set_auto_reconnect_enabled(True, persist=False)
+
+    class LiveTask:
+        @staticmethod
+        def done():
+            return False
+
+    window._reconnect_tasks[state.device_address] = LiveTask()
+
+    scheduled = []
+    monkeypatch.setattr(window, "_schedule_reconnect", lambda address: scheduled.append(address))
+
+    window._reconnect_health_tick()
+
+    assert scheduled == []
+    window._close_after_disconnect = True
+    window.close()
+
+
+def test_manual_disconnect_is_never_auto_reconnected_by_safety_net(monkeypatch):
+    # Hard requirement: a manually-disconnected device must NEVER be auto
+    # reconnected — not by the health tick, not by re-enabling the toggle.
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from app.models import DeviceState
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    state = DeviceState(is_connected=False, device_name="A", device_address="AA:BB", device_number=45)
+    window.states[state.device_address] = state
+    window.active_address = state.device_address
+    window.state = state
+    window.set_auto_reconnect_enabled(True, persist=False)
+    # Kept in states but flagged as manually disconnected.
+    window._manual_disconnect_addresses.add(state.device_address)
+
+    scheduled = []
+    monkeypatch.setattr(window, "_schedule_reconnect", lambda address: scheduled.append(address))
+
+    window._reconnect_health_tick()
+    window.set_auto_reconnect_enabled(False, persist=False)
+    window.set_auto_reconnect_enabled(True, persist=False)
+
+    assert scheduled == []
+    window._close_after_disconnect = True
+    window.close()

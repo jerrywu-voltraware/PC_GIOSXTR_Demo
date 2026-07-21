@@ -100,6 +100,15 @@ class DeviceSource(ABC):
         """
         return await check_bluetooth_adapter()
 
+    async def prepare_reconnect(self, address: str) -> None:
+        """Clear any latched per-device link state before a reconnect connects.
+
+        Default: no-op (the OS Bluetooth stack keeps no per-device latch).
+        Sources that hold firmware-side connection state (the dongle) override
+        this to force a disconnect/clear that settles before the next connect.
+        """
+        return None
+
     async def close(self) -> None:
         """Release any backend resources (serial port, tasks). Default: no-op."""
         self.shutdown()
@@ -188,6 +197,13 @@ _DONGLE_STREAM_STALE_SECONDS = 12.0
 _DONGLE_REOPEN_TIMEOUT_SECONDS = 6.0
 _DONGLE_POST_RESET_SETTLE_SECONDS = 1.0
 _DONGLE_SERIAL_WRITE_TIMEOUT_SECONDS = 1.0
+# After a reset+reopen we must prove the firmware actually answers before
+# declaring recovery a success.  A reopened CDC handle does NOT prove the
+# nRF52840 survived the reset (AT+RESET may never have reached a wedged MCU
+# whose writes were timing out).  Send a lightweight AT+STATUS and require a
+# reply; if none arrives, keep needs_recovery set so the next attempt retries.
+_DONGLE_PROBE_TIMEOUT_SECONDS = 1.5
+_DONGLE_PROBE_ATTEMPTS = 3
 
 
 def _write_dongle_runtime_log(message: str) -> None:
@@ -322,9 +338,26 @@ class DongleDeviceManager:
                 if last is None:
                     last = self._source._loop.time()
                     self._last_notify_monotonic = last
-                if (self._source._loop.time() - last) > stale_after:
+                if (self._source._loop.time() - last) <= stale_after:
+                    continue
+                # Stream went silent.  Escalate to a disconnect/recovery, but do
+                # NOT stop watching: if the disconnect/recovery did not take (the
+                # transport is still wedged and this link is somehow still
+                # flagged connected), the loop must re-detect staleness and
+                # escalate again instead of leaving the link unmonitored.  A
+                # successful escalation clears self._connected, so the loop then
+                # exits on its own.
+                try:
                     await self._source._handle_stream_stale(self)
-                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    _write_dongle_runtime_log(
+                        f"stream watchdog escalation failed for {self.address}: {exc}"
+                    )
+                # Reset the clock so a still-connected but wedged link waits a
+                # full stale window before re-escalating (avoids a tight loop).
+                self._last_notify_monotonic = self._source._loop.time()
         except asyncio.CancelledError:
             pass
         finally:
@@ -416,6 +449,9 @@ class DongleSource(DeviceSource):
         self._scan_debug = False  # log every received line during scan() window
         self._connect_futures: dict[str, asyncio.Future[bool]] = {}
         self._disconnect_futures: dict[str, asyncio.Future[bool]] = {}
+        # Resolved by the reader when the firmware answers a liveness probe
+        # (AT+STATUS -> "STATUS links=...").  Used to handshake-gate recovery.
+        self._probe_future: asyncio.Future[bool] | None = None
         self._connect_lock = asyncio.Lock()
         self._active_connect_mac: str | None = None
         # Set while a scan is running so a concurrent connect waits for it to
@@ -461,6 +497,30 @@ class DongleSource(DeviceSource):
     async def ensure_recovered(self, reason: str) -> None:
         """Coalesce callers that only need recovery when transport is unhealthy."""
         await self._ensure_recovered(reason)
+
+    async def prepare_reconnect(self, address: str) -> None:
+        """Force a per-device AT+DISC before a reconnect's AT+CONN.
+
+        A reconnect must clear the firmware's latched per-device link state
+        (a half-open link whose DISCONNECTED line was lost, or m_connecting
+        left set for this MAC) before AT+CONN, otherwise the fresh connect can
+        be rejected or race the stale link.  A per-device AT+DISC=<mac> is used
+        (not the global AT+DISC) so other healthy recording sessions are not
+        torn down.  The disconnect timestamp is recorded so the AT+CONN that
+        follows honours the firmware-settle window.
+        """
+        mac = address.upper()
+        async with self._connect_lock:
+            await self._wait_for_scan_idle()
+            await self._wait_for_pending_disconnects()
+            try:
+                self._send_command(f"AT+DISC={mac}")
+                self._last_disconnect_monotonic = self._loop.time()
+                _write_scan_debug(f"dongle reconnect: cleared {mac} before AT+CONN")
+            except Exception as exc:
+                _write_dongle_runtime_log(
+                    f"reconnect pre-disconnect failed for {mac}: {exc}"
+                )
 
     def create_manager(self) -> DeviceManager:
         return DongleDeviceManager(self)
@@ -707,6 +767,36 @@ class DongleSource(DeviceSource):
         if self._needs_recovery:
             await self.recover(reason)
 
+    async def _probe_firmware_alive(self) -> bool:
+        """Return True only if the firmware answers a lightweight AT+STATUS.
+
+        A reopened CDC handle does not prove the nRF52840 survived the reset, so
+        recovery must not declare success until the MCU actually replies.  Sends
+        AT+STATUS (which the firmware answers with a "STATUS links=..." line) and
+        waits briefly; retries a few times before giving up.
+        """
+        for _ in range(_DONGLE_PROBE_ATTEMPTS):
+            future: asyncio.Future[bool] = self._loop.create_future()
+            self._probe_future = future
+            try:
+                self._send_command("AT+STATUS")
+            except Exception as exc:
+                self._consume_future_exception(future)
+                if self._probe_future is future:
+                    self._probe_future = None
+                _write_dongle_runtime_log(f"dongle probe send failed: {exc}")
+                return False
+            try:
+                await asyncio.wait_for(future, timeout=_DONGLE_PROBE_TIMEOUT_SECONDS)
+                return True
+            except asyncio.TimeoutError:
+                continue
+            finally:
+                self._consume_future_exception(future)
+                if self._probe_future is future:
+                    self._probe_future = None
+        return False
+
     async def recover(self, reason: str = "manual recovery") -> None:
         """Reset BLE/CDC state and reopen the physical dongle.
 
@@ -741,6 +831,15 @@ class DongleSource(DeviceSource):
                         or not self._reader.is_alive()
                     ):
                         raise OSError("dongle reader did not survive CDC reopen")
+                    # Handshake gate: a reopened port is not proof the MCU reset
+                    # took.  Require a live AT+STATUS reply before declaring
+                    # success; otherwise keep needs_recovery set so the next
+                    # attempt retries (and escalates through this full
+                    # close/reopen + MCU-reset cycle again).
+                    if not await self._probe_firmware_alive():
+                        raise OSError(
+                            "dongle did not answer AT+STATUS after reset"
+                        )
             except Exception as exc:
                 self._last_transport_error = f"dongle reopen failed: {exc}"
                 _write_scan_debug(f"dongle recovery: {self._last_transport_error}")
@@ -1021,6 +1120,14 @@ class DongleSource(DeviceSource):
         if self._scan_debug:
             _write_scan_debug(f"dongle rx: {line!r}")
         if self._scan_debug and self._collect_scan_line(line):
+            return
+
+        # Liveness probe reply (AT+STATUS -> "STATUS links=u/u connecting=..").
+        # Proves the firmware is actually responsive after a reset/reopen.
+        if line.startswith("STATUS "):
+            future = self._probe_future
+            if future is not None and not future.done():
+                future.set_result(True)
             return
 
         match = _CONNECTED.match(line)

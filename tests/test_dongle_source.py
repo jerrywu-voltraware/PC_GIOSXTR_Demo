@@ -699,3 +699,86 @@ def test_scan_collects_live_found_update_before_at_list():
     assert [(result.address, result.name, result.device_number) for result in results] == [
         ("90:04:22:B6:96:00", "GIOS0801ST#45", 45),
     ]
+
+
+class _LiveReader:
+    @staticmethod
+    def is_alive() -> bool:
+        return True
+
+
+def test_recover_keeps_needs_recovery_when_firmware_probe_gets_no_response(monkeypatch):
+    # A reopened CDC handle is NOT proof the MCU reset took.  When the firmware
+    # never answers the AT+STATUS liveness probe, recover() must NOT clear
+    # needs_recovery / log false success; it must fail so the next attempt
+    # retries the full reset cycle.
+    source, serial = _make_source_with_fake_serial()
+    loop = source._loop  # type: ignore[attr-defined]
+    source._owns_serial = True  # type: ignore[attr-defined]
+    monkeypatch.setattr(ds, "_DONGLE_POST_RESET_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(ds, "_DONGLE_PROBE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(ds, "_DONGLE_PROBE_ATTEMPTS", 2)
+
+    def reopen_ok() -> None:
+        # Serial reopened and reader alive, but nothing feeds a STATUS line.
+        serial.is_open = True
+        source._reader = _LiveReader()  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(source, "_reopen_serial", reopen_ok)
+
+    with pytest.raises(ConnectionError, match="did not answer AT\\+STATUS"):
+        loop.run_until_complete(source.recover("probe timeout test"))
+
+    assert source._needs_recovery is True  # type: ignore[attr-defined]
+    assert source._recovering is False  # type: ignore[attr-defined]
+    assert "AT+STATUS" in serial.writes  # the probe actually went out on the wire
+    loop.close()
+
+
+def test_recover_succeeds_when_firmware_answers_probe(monkeypatch):
+    # When the firmware replies to AT+STATUS, the handshake gate passes and
+    # recovery clears needs_recovery as before.
+    source, serial = _make_source_with_fake_serial()
+    loop = source._loop  # type: ignore[attr-defined]
+    source._owns_serial = True  # type: ignore[attr-defined]
+    monkeypatch.setattr(ds, "_DONGLE_POST_RESET_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(ds, "_DONGLE_PROBE_TIMEOUT_SECONDS", 1.0)
+
+    def reopen_ok() -> None:
+        serial.is_open = True
+        source._reader = _LiveReader()  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(source, "_reopen_serial", reopen_ok)
+
+    async def answer_probe() -> None:
+        for _ in range(200):
+            if source._probe_future is not None:  # type: ignore[attr-defined]
+                break
+            await asyncio.sleep(0.005)
+        source._on_line("STATUS links=0/8 connecting=0 scanning=0")  # type: ignore[attr-defined]
+
+    async def drive() -> None:
+        answer = loop.create_task(answer_probe())
+        await source.recover("probe ok test")
+        await answer
+
+    loop.run_until_complete(drive())
+
+    assert source._needs_recovery is False  # type: ignore[attr-defined]
+    assert source._recovering is False  # type: ignore[attr-defined]
+    loop.close()
+
+
+def test_prepare_reconnect_sends_per_device_disc_before_at_conn():
+    # A reconnect must clear the firmware's latched per-device link with a
+    # per-device AT+DISC (not the global AT+DISC that would drop other links).
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+
+    loop.run_until_complete(src.prepare_reconnect(mac))
+
+    assert serial.writes == [f"AT+DISC={mac}"]
+    # The disconnect timestamp is recorded so the following AT+CONN settles.
+    assert src._last_disconnect_monotonic is not None  # type: ignore[attr-defined]
+    loop.close()

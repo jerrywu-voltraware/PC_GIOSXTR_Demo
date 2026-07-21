@@ -24,7 +24,7 @@ from qasync import asyncSlot
 from ..ble_adapter import AdapterCheckResult, AdapterStatus, check_bluetooth_adapter, user_facing_message
 from ..ble_manager import BleManager, DeviceScanResult
 from ..ble_manager import _write_scan_debug
-from ..device_source import DeviceManager, DeviceSource, PcBleSource
+from ..device_source import DeviceManager, DeviceSource, PcBleSource, _write_dongle_runtime_log
 from ..constants import (
     APP_ICON_FILENAME,
     APP_NAME,
@@ -90,6 +90,13 @@ RECORD_SPLIT_ROWS_SETTINGS_KEY = "recording/splitRows"
 SETTINGS_ORGANIZATION = "GIOSXTR"
 RECONNECT_DELAYS_SECONDS = (1.0, 3.0, 5.0, 10.0)
 RECONNECT_MAX_ATTEMPTS = 10
+# After the fast ramp above is exhausted, reconnect never gives up: it keeps
+# retrying forever at this steady, capped interval so a device dropped during a
+# long unattended run is always recovered once it comes back.
+SLOW_RECONNECT_INTERVAL_SECONDS = 30.0
+# Background safety net: periodically re-arm any kept-but-disconnected device
+# whose reconnect task died, so reconnect can never be permanently lost.
+RECONNECT_HEALTH_INTERVAL_MS = 30_000
 # Longer than the dongle's 12s stream watchdog plus its 5s disconnect wait, so
 # the safety timer cannot release a second AT+CONN while recovery is starting.
 CONNECT_READY_GUARD_TIMEOUT_MS = 20_000
@@ -173,6 +180,10 @@ class MainWindow(QMainWindow):
         self._reconnecting_addresses: set[str] = set()
         self._reconnect_delays = RECONNECT_DELAYS_SECONDS
         self._reconnect_max_attempts = RECONNECT_MAX_ATTEMPTS
+        # Number of leading attempts that use the fast ramp; afterwards reconnect
+        # keeps retrying forever at the slow interval (never gives up).
+        self._reconnect_fast_attempts = len(RECONNECT_DELAYS_SECONDS)
+        self._slow_reconnect_interval = SLOW_RECONNECT_INTERVAL_SECONDS
         # Pending error dialogs awaiting 200B data/limit values, per device.
         # Maps address -> error_num just observed; resolved either when a 200B
         # arrives with non-zero data/limit, or by a 2s fallback timer.
@@ -261,6 +272,14 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._start_initial_adapter_check)
         if os.getenv("QT_QPA_PLATFORM", "").lower() != "offscreen":
             QTimer.singleShot(1500, self._start_automatic_update_check)
+
+        # Background safety net: no matter how a reconnect loop exited (crash,
+        # never-scheduled, transport wedge), this periodically re-arms every
+        # kept-but-disconnected device so reconnect can never be lost for good.
+        self._reconnect_health_timer = QTimer(self)
+        self._reconnect_health_timer.setInterval(RECONNECT_HEALTH_INTERVAL_MS)
+        self._reconnect_health_timer.timeout.connect(self._reconnect_health_tick)
+        self._reconnect_health_timer.start()
 
     def _start_initial_adapter_check(self) -> None:
         asyncio.create_task(self._run_initial_adapter_check())
@@ -627,6 +646,36 @@ class MainWindow(QMainWindow):
             self._reconnect_tasks.clear()
             self._reconnecting_addresses.clear()
             self.refresh_pages()
+        else:
+            # Re-enabling must re-arm every kept-but-disconnected device that is
+            # not currently connecting; otherwise a device that dropped while the
+            # toggle was off would stay stranded.
+            self._rearm_disconnected_devices()
+            self.refresh_pages()
+
+    def _rearm_disconnected_devices(self) -> None:
+        """Schedule reconnect for kept devices that are down and have no live task.
+
+        Shared by the auto-reconnect toggle and the periodic health tick so a
+        reconnect can never be permanently lost, no matter how its loop exited.
+        """
+        if not self.auto_reconnect_enabled:
+            return
+        for address, state in list(self.states.items()):
+            if state.is_connected:
+                continue
+            if address in self._manual_disconnect_addresses:
+                continue
+            if address in self._connect_in_progress:
+                continue
+            task = self._reconnect_tasks.get(address)
+            if task is not None and not task.done():
+                continue
+            self._reconnecting_addresses.add(address)
+            self._schedule_reconnect(address)
+
+    def _reconnect_health_tick(self) -> None:
+        self._rearm_disconnected_devices()
 
     @asyncSlot(object)
     async def _connect_device(self, result: DeviceScanResult) -> None:
@@ -828,44 +877,110 @@ class MainWindow(QMainWindow):
         task = self._reconnect_tasks.get(address)
         if task is not None and not task.done():
             return
+        coro = self._run_reconnect_loop(address)
         try:
-            self._reconnect_tasks[address] = asyncio.create_task(self._run_reconnect_loop(address))
+            new_task = asyncio.create_task(coro)
         except RuntimeError:
             # No running event loop in unit tests or during teardown; keep state
             # preserved and let the next user action handle the device.
-            pass
+            coro.close()
+            return
+        self._reconnect_tasks[address] = new_task
+        new_task.add_done_callback(
+            lambda finished, a=address: self._on_reconnect_task_done(a, finished)
+        )
+
+    def _on_reconnect_task_done(self, address: str, task: asyncio.Task[None]) -> None:
+        """Last-resort guard: an exception must never silently kill reconnect.
+
+        The reconnect loop already swallows its own errors, but if anything
+        unexpected escapes it, log it (device state log + runtime log) and
+        re-arm the device so it is never stranded in the reconnecting state.
+        """
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is None:
+            return
+        _write_dongle_runtime_log(f"reconnect loop crashed for {address}: {exc!r}")
+        state = self.states.get(address)
+        if state is not None:
+            state.add_log(f"重新連線流程異常，重新排程: {exc}")
+        if self._reconnect_tasks.get(address) is task:
+            self._reconnect_tasks.pop(address, None)
+        if (
+            self.auto_reconnect_enabled
+            and address in self.states
+            and not self.states[address].is_connected
+            and address not in self._manual_disconnect_addresses
+        ):
+            self._reconnecting_addresses.add(address)
+            self._schedule_reconnect(address)
 
     def _reconnect_delay(self, attempt_index: int) -> float:
-        if not self._reconnect_delays:
-            return 0.0
-        return self._reconnect_delays[min(attempt_index, len(self._reconnect_delays) - 1)]
+        delays = self._reconnect_delays
+        if delays:
+            if attempt_index < len(delays):
+                return delays[attempt_index]
+            # Within the fast window but past a (possibly test-shortened) ramp,
+            # reuse the last ramp step rather than jumping straight to the slow
+            # interval.
+            if attempt_index < self._reconnect_fast_attempts:
+                return delays[-1]
+        # Past the fast ramp: keep retrying forever at a steady slow interval.
+        return self._slow_reconnect_interval
 
     async def _run_reconnect_loop(self, address: str) -> None:
+        # Never give up: while auto-reconnect is on and the device is still kept
+        # (in self.states) and not manually disconnected, retry forever — the
+        # fast ramp first, then a steady slow interval indefinitely.  Exits only
+        # on: auto-reconnect off, address removed, a successful reconnect, or
+        # task cancellation (manual disconnect).
+        attempt_index = 0
         try:
-            for attempt_index in range(self._reconnect_max_attempts):
+            while True:
                 if not self.auto_reconnect_enabled or address not in self.states:
                     return
                 await asyncio.sleep(self._reconnect_delay(attempt_index))
                 if not self.auto_reconnect_enabled or address not in self.states:
                     return
+                state = self.states.get(address)
+                if state is not None and state.is_connected:
+                    # Reconnected by another path (e.g. manual connect); done.
+                    self._reconnecting_addresses.discard(address)
+                    return
                 try:
                     await self._reconnect_device(address)
                     return
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
-                    recovered = await self._maybe_recover_source(exc)
+                    # A raising _maybe_recover_source / refresh_pages must never
+                    # kill the loop or strand the address; keep retrying.
+                    try:
+                        recovered = await self._maybe_recover_source(exc)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as recover_exc:
+                        recovered = False
+                        _write_dongle_runtime_log(
+                            f"reconnect recover failed for {address}: {recover_exc!r}"
+                        )
                     state = self.states.get(address)
                     if state is not None:
                         recovery_note = "；已重置 dongle" if recovered else ""
-                        state.add_log(
-                            f"重新連線失敗 ({attempt_index + 1}/"
-                            f"{self._reconnect_max_attempts}): {exc}{recovery_note}"
-                        )
-                        self.refresh_pages()
-            state = self.states.get(address)
-            if state is not None and not state.is_connected:
-                self._reconnecting_addresses.discard(address)
-                state.add_log("重新連線已停止")
-                self.refresh_pages()
+                        try:
+                            state.add_log(
+                                f"重新連線失敗 (第 {attempt_index + 1} 次): "
+                                f"{exc}{recovery_note}"
+                            )
+                            self.refresh_pages()
+                        except Exception:
+                            pass
+                attempt_index += 1
         except asyncio.CancelledError:
             pass
         finally:
@@ -888,6 +1003,16 @@ class MainWindow(QMainWindow):
                 if address not in self.states or not self.auto_reconnect_enabled:
                     return
             self._connect_in_progress.add(address)
+        # Clear any latched firmware link state for this device before AT+CONN
+        # (dongle only; no-op for PC Bluetooth).  Prevents a stale half-open
+        # link from rejecting or racing the fresh connect, and settles the
+        # firmware before the connect goes out.
+        prepare_reconnect = getattr(self.source, "prepare_reconnect", None)
+        if prepare_reconnect is not None:
+            try:
+                await prepare_reconnect(address)
+            except Exception as exc:
+                state.add_log(f"重連前清除連線狀態略過: {exc}")
         manager = self._create_ble_manager()
         manager.set_notify_callback(self._make_notify_emitter())
         manager.set_disconnect_callback(self._make_disconnect_emitter())
@@ -1121,6 +1246,9 @@ class MainWindow(QMainWindow):
             asyncio.create_task(self._disconnect_then_close())
             return
 
+        timer = getattr(self, "_reconnect_health_timer", None)
+        if timer is not None:
+            timer.stop()
         for logger in self.loggers.values():
             logger.stop()
         for addr in list(self._reconnect_tasks):
