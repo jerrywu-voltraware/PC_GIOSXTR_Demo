@@ -6,11 +6,13 @@ import asyncio
 import argparse
 import os
 import sys
+from pathlib import Path
 
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QMessageBox
 from qasync import QEventLoop
 
+from app.batch_log import batch_log, initialize_batch_log, install_exception_logging
 from app.constants import APP_ICON_FILENAME, APP_NAME, APP_VERSION, APP_WINDOW_TITLE, ENGINEERING_MODE_ENV
 from app.device_source import DeviceSource, PcBleSource
 from app.resources import resource_path
@@ -50,6 +52,13 @@ def main() -> int:
 
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
+    batch_path = initialize_batch_log(Path.cwd() / "logs" / "batch.txt")
+    install_exception_logging(loop)
+    batch_log(
+        "APP",
+        f"Session started version={APP_VERSION} engineering={engineering_mode} "
+        f"batch_file={batch_path}",
+    )
 
     # Choose the data source before building the main window. The PC built-in
     # Bluetooth path is unchanged; the dongle path feeds the same UI over USB.
@@ -59,6 +68,7 @@ def main() -> int:
     while True:
         selection = SourceSelectDialog.ask()
         if selection is None:
+            batch_log("APP", "Source selection cancelled; application exiting")
             return 0
 
         if selection.source == SOURCE_DONGLE and selection.port:
@@ -67,6 +77,11 @@ def main() -> int:
             try:
                 source = DongleSource(selection.port, loop=loop)
             except Exception as exc:
+                batch_log(
+                    "DONGLE",
+                    f"Failed to open serial port {selection.port}: {exc}",
+                    level="ERROR",
+                )
                 QMessageBox.critical(
                     None,
                     "無法開啟序列埠",
@@ -78,15 +93,19 @@ def main() -> int:
                     "排除後請重新選擇。",
                 )
                 continue
+            batch_log("APP", f"Data source opened: Nordic dongle port={selection.port}")
         else:
             source = PcBleSource()
+            batch_log("APP", "Data source opened: PC Bluetooth")
         break
 
     window = MainWindow(source=source, engineering_mode=engineering_mode)
     window.show()
+    batch_log("APP", "Main window shown")
 
     with loop:
         loop.run_forever()
+    batch_log("APP", "Session ended")
     return 0
 
 

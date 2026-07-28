@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 )
 from qasync import asyncSlot
 
+from ..batch_log import batch_log
 from ..ble_adapter import AdapterCheckResult, AdapterStatus, check_bluetooth_adapter, user_facing_message
 from ..ble_manager import BleManager, DeviceScanResult
 from ..ble_manager import _write_scan_debug
@@ -144,6 +145,11 @@ class MainWindow(QMainWindow):
         # Data-source backend (PC built-in Bluetooth by default). The dongle
         # source is injected from main(); everything below is source-agnostic.
         self.source: DeviceSource = source or PcBleSource()
+        batch_log(
+            "APP",
+            f"Main window initializing source={type(self.source).__name__} "
+            f"engineering={engineering_mode}",
+        )
         self.setWindowTitle(APP_WINDOW_TITLE)
         icon = QIcon(str(resource_path(APP_ICON_FILENAME)))
         if not icon.isNull():
@@ -294,6 +300,16 @@ class MainWindow(QMainWindow):
 
     def _handle_adapter_check_result(self, result: AdapterCheckResult, *, show_warning: bool) -> None:
         self._last_adapter_status = result.status
+        level = "ERROR" if result.status in (
+            AdapterStatus.NO_ADAPTER,
+            AdapterStatus.DISABLED,
+            AdapterStatus.UNKNOWN_ERROR,
+        ) else "INFO"
+        batch_log(
+            "ADAPTER",
+            f"Startup readiness status={result.status.value} detail={result.detail}",
+            level=level,
+        )
         if result.status in (AdapterStatus.NO_ADAPTER, AdapterStatus.DISABLED):
             message_provider = getattr(self.source, "readiness_error_message", None)
             title, body = (
@@ -393,12 +409,13 @@ class MainWindow(QMainWindow):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+        batch_log("APP", "User confirmed data-source switch; restarting application")
         dialog.accept()
         # Release the serial port so the relaunched instance can open it.
         try:
             self.source.shutdown()
-        except Exception:
-            pass
+        except Exception as exc:
+            batch_log("APP", f"Source shutdown before restart failed: {exc}", level="ERROR")
         self._relaunch_app()
 
     def _relaunch_app(self) -> None:
@@ -416,6 +433,7 @@ class MainWindow(QMainWindow):
     def _start_manual_update_check(self, dialog: SettingsDialog) -> None:
         if self._update_check_running:
             return
+        batch_log("UPDATE", f"Manual update check started; current={APP_VERSION}")
         dialog.set_update_checking(True)
         asyncio.create_task(self._check_for_updates(settings_dialog=dialog))
 
@@ -432,6 +450,24 @@ class MainWindow(QMainWindow):
             if settings_dialog is not None:
                 settings_dialog.set_update_checking(False)
 
+        latest = result.info.latest_version if result.info is not None else ""
+        level = "ERROR" if result.status in (
+            UpdateStatus.NETWORK_ERROR,
+            UpdateStatus.INVALID_RESPONSE,
+        ) else (
+            "WARNING"
+            if result.status not in (
+                UpdateStatus.UP_TO_DATE,
+                UpdateStatus.UPDATE_AVAILABLE,
+            )
+            else "INFO"
+        )
+        batch_log(
+            "UPDATE",
+            f"Manual update check completed status={result.status.value} "
+            f"latest={latest} detail={result.message}",
+            level=level,
+        )
         self._show_update_result(result)
 
     def _show_update_result(self, result: UpdateCheckResult) -> None:
@@ -449,7 +485,10 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes,
             )
             if answer is QMessageBox.StandardButton.Yes:
+                batch_log("UPDATE", f"User accepted manual update {info.latest_version}")
                 asyncio.create_task(self._download_update(info.asset))
+            else:
+                batch_log("UPDATE", f"User deferred manual update {info.latest_version}")
             return
 
         title = "檢查更新"
@@ -467,13 +506,18 @@ class MainWindow(QMainWindow):
     async def _download_update(self, asset: UpdateAsset) -> None:
         target_path = self._select_update_download_path(asset)
         if target_path is None:
+            batch_log("UPDATE", f"Manual update download cancelled asset={asset.name}")
             return
 
+        batch_log("UPDATE", f"Manual update download started asset={asset.name} target={target_path}")
         try:
             path = await asyncio.to_thread(download_asset, asset, target_path=target_path)
         except Exception as exc:
+            batch_log("UPDATE", f"Manual update download failed: {exc}", level="ERROR")
             QMessageBox.warning(self, "更新下載失敗", str(exc))
             return
+
+        batch_log("UPDATE", f"Manual update downloaded successfully: {path}")
 
         answer = QMessageBox.question(
             self,
@@ -615,6 +659,7 @@ class MainWindow(QMainWindow):
         return True
 
     def _show_warning(self, title: str, message: str) -> None:
+        batch_log("WARNING", f"{title}: {message}", level="WARNING")
         box = QMessageBox(
             QMessageBox.Icon.Warning,
             title,
@@ -630,6 +675,7 @@ class MainWindow(QMainWindow):
         if persist:
             _ensure_settings_identity()
             QSettings().setValue(RECORD_SPLIT_ROWS_SETTINGS_KEY, self.record_split_rows)
+            batch_log("SETTINGS", f"CSV split rows set to {self.record_split_rows}")
 
     def set_auto_reconnect_enabled(self, enabled: bool, *, persist: bool = True) -> None:
         self.auto_reconnect_enabled = bool(enabled)
@@ -639,6 +685,10 @@ class MainWindow(QMainWindow):
         if persist:
             _ensure_settings_identity()
             QSettings().setValue(AUTO_RECONNECT_SETTINGS_KEY, self.auto_reconnect_enabled)
+            batch_log(
+                "SETTINGS",
+                f"Automatic reconnect {'enabled' if self.auto_reconnect_enabled else 'disabled'}",
+            )
         if not self.auto_reconnect_enabled:
             for task in list(self._reconnect_tasks.values()):
                 if not task.done():
@@ -711,10 +761,12 @@ class MainWindow(QMainWindow):
         manager.set_notify_callback(self._make_notify_emitter())
         manager.set_disconnect_callback(self._make_disconnect_emitter())
         self._connect_in_progress.add(address)
+        batch_log("CONNECT", f"Connection workflow started name={result.name} address={address}")
         try:
             await manager.connect(address)
         except Exception as exc:
             self._connect_in_progress.discard(address)
+            batch_log("CONNECT", f"Connection failed address={address}: {exc}", level="ERROR")
             recovered = await self._maybe_recover_source(exc)
             if recovered:
                 self._show_warning(
@@ -773,8 +825,12 @@ class MainWindow(QMainWindow):
                 )
             )
             self.scan_panel.set_recent_devices(self.recent_device_store.load())
-        except OSError:
-            pass
+        except OSError as exc:
+            batch_log(
+                "FILES",
+                f"Unable to update recent-device history for {result.address}: {exc}",
+                level="ERROR",
+            )
 
     @pyqtSlot(str)
     def _set_active(self, address: str) -> None:
@@ -816,6 +872,7 @@ class MainWindow(QMainWindow):
         self.refresh_pages()
 
     async def _disconnect_address(self, address: str) -> None:
+        batch_log("DISCONNECT", f"Manual disconnect workflow started address={address}")
         self._manual_disconnect_addresses.add(address)
         self._cancel_reconnect(address)
         manager = self.managers.get(address)
@@ -825,6 +882,13 @@ class MainWindow(QMainWindow):
             return
         try:
             await manager.disconnect()
+        except Exception as exc:
+            batch_log(
+                "DISCONNECT",
+                f"Transport disconnect failed address={address}: {exc}",
+                level="ERROR",
+            )
+            raise
         finally:
             self._cleanup_address(address)
             self._manual_disconnect_addresses.discard(address)
@@ -869,6 +933,13 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str)
     def _handle_disconnect(self, address: str) -> None:
         manual = address in self._manual_disconnect_addresses
+        if not manual:
+            batch_log(
+                "DISCONNECT",
+                f"Unexpected disconnect address={address} "
+                f"auto_reconnect={self.auto_reconnect_enabled}",
+                level="WARNING",
+            )
         self._manual_disconnect_addresses.discard(address)
         self._cleanup_address(address, allow_reconnect=self.auto_reconnect_enabled and not manual)
 
@@ -947,6 +1018,7 @@ class MainWindow(QMainWindow):
         # on: auto-reconnect off, address removed, a successful reconnect, or
         # task cancellation (manual disconnect).
         attempt_index = 0
+        batch_log("RECONNECT", f"Automatic reconnect loop started address={address}")
         try:
             while True:
                 if not self.auto_reconnect_enabled or address not in self.states:
@@ -1172,8 +1244,10 @@ class MainWindow(QMainWindow):
         try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
+            batch_log("FILES", f"Unable to open log folder {self.log_dir}: {exc}", level="ERROR")
             QMessageBox.warning(self, "開啟錄製資料夾失敗", str(exc))
             return
+        batch_log("FILES", f"Opening log folder: {self.log_dir}")
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.log_dir)))
 
     def _start_recording(self, address: str) -> Path | None:
@@ -1247,6 +1321,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         if self.managers and not self._close_after_disconnect:
+            batch_log(
+                "APP",
+                f"Close requested; disconnecting {len(self.managers)} active device(s)",
+            )
             event.ignore()
             self.setEnabled(False)
             self.scan_panel.status.setText("正在中斷裝置連線，完成後關閉 APP ...")
@@ -1261,13 +1339,19 @@ class MainWindow(QMainWindow):
         for addr in list(self._reconnect_tasks):
             self._cancel_reconnect(addr)
         self._reconnecting_addresses.clear()
+        batch_log("APP", "Main window closed")
         super().closeEvent(event)
 
     async def _disconnect_then_close(self) -> None:
         for addr in list(self.managers.keys()):
             try:
                 await self._disconnect_address(addr)
-            except Exception:
+            except Exception as exc:
+                batch_log(
+                    "APP",
+                    f"Disconnect during close failed address={addr}: {exc}",
+                    level="ERROR",
+                )
                 self._cleanup_address(addr)
         self._close_after_disconnect = True
         self.setEnabled(True)

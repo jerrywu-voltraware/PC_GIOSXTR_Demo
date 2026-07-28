@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ..batch_log import batch_log
 from ..constants import APP_VERSION
 from ..updater import UpdateAsset, UpdateCheckResult, UpdateStatus, check_for_update, download_asset
 
@@ -212,8 +213,10 @@ class SourceSelectDialog(QDialog):
                 QMessageBox.warning(self, "無序列埠", "未偵測到 dongle 序列埠，請插入後重新整理。")
                 return
             self._selection = SourceSelection(SOURCE_DONGLE, str(port))
+            batch_log("STARTUP", f"Selected data source: Nordic dongle port={port}")
         else:
             self._selection = SourceSelection(SOURCE_PC, None)
+            batch_log("STARTUP", "Selected data source: PC Bluetooth")
         self.accept()
 
     def _set_ok_enabled(self, enabled: bool) -> None:
@@ -226,6 +229,7 @@ class SourceSelectDialog(QDialog):
             return
         self._update_check_started = True
         self._update_check_running = True
+        batch_log("UPDATE", f"Startup update check started; current={APP_VERSION}")
         self._set_ok_enabled(False)
         self._update_status.setText("正在檢查是否有新版本，完成後即可繼續...")
 
@@ -240,6 +244,24 @@ class SourceSelectDialog(QDialog):
         self._update_check_running = False
         self._update_worker = None
         self._set_ok_enabled(True)
+        latest = result.info.latest_version if result.info is not None else ""
+        level = "ERROR" if result.status in (
+            UpdateStatus.NETWORK_ERROR,
+            UpdateStatus.INVALID_RESPONSE,
+        ) else (
+            "WARNING"
+            if result.status not in (
+                UpdateStatus.UP_TO_DATE,
+                UpdateStatus.UPDATE_AVAILABLE,
+            )
+            else "INFO"
+        )
+        batch_log(
+            "UPDATE",
+            f"Startup update check completed status={result.status.value} "
+            f"latest={latest} detail={result.message}",
+            level=level,
+        )
 
         if result.status is UpdateStatus.UPDATE_AVAILABLE and result.info is not None:
             info = result.info
@@ -258,9 +280,14 @@ class SourceSelectDialog(QDialog):
                 QMessageBox.StandardButton.Yes,
             )
             if answer is QMessageBox.StandardButton.Yes:
+                batch_log("UPDATE", f"User accepted download for {info.latest_version}")
                 target_path = self._select_update_download_path(info.asset)
                 if target_path is not None:
                     self._start_update_download(info.asset, target_path)
+                else:
+                    batch_log("UPDATE", f"User cancelled download for {info.latest_version}")
+            else:
+                batch_log("UPDATE", f"User deferred update {info.latest_version}")
             return
 
         if result.status is UpdateStatus.UP_TO_DATE:
@@ -272,11 +299,12 @@ class SourceSelectDialog(QDialog):
             self._update_status.setText("暫時無法檢查更新；仍可繼續選擇連線方式。")
 
     @pyqtSlot(str)
-    def _handle_update_check_failure(self, _detail: str) -> None:
+    def _handle_update_check_failure(self, detail: str) -> None:
         self._update_check_running = False
         self._update_worker = None
         self._set_ok_enabled(True)
         self._update_status.setText("暫時無法檢查更新；仍可繼續選擇連線方式。")
+        batch_log("UPDATE", f"Startup update check failed: {detail}", level="ERROR")
 
     def _select_update_download_path(self, asset: UpdateAsset) -> Path | None:
         downloads_dir = QStandardPaths.writableLocation(
@@ -300,6 +328,7 @@ class SourceSelectDialog(QDialog):
         if self._update_download_running:
             return
         self._update_download_running = True
+        batch_log("UPDATE", f"Downloading {asset.name} to {target_path}")
         self._set_ok_enabled(False)
         self._update_status.setText(f"正在下載 {asset.name} ...")
 
@@ -315,6 +344,7 @@ class SourceSelectDialog(QDialog):
         self._update_worker = None
         self._set_ok_enabled(True)
         self._update_status.setText(f"新版已下載：{path.name}")
+        batch_log("UPDATE", f"Update downloaded successfully: {path}")
         answer = QMessageBox.question(
             self,
             "更新已下載",
@@ -331,6 +361,7 @@ class SourceSelectDialog(QDialog):
         self._update_worker = None
         self._set_ok_enabled(True)
         self._update_status.setText("新版下載失敗；仍可繼續使用目前版本。")
+        batch_log("UPDATE", f"Update download failed: {detail}", level="ERROR")
         QMessageBox.warning(self, "更新下載失敗", detail)
 
     def showEvent(self, event) -> None:

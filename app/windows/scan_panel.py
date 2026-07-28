@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 )
 from qasync import asyncSlot
 
+from ..batch_log import batch_log
 from ..ble_adapter import AdapterStatus, check_bluetooth_adapter, user_facing_message
 from ..ble_manager import BleManager, DeviceScanResult
 from ..ble_manager import _write_scan_debug
@@ -550,6 +551,7 @@ class ScanPanel(QWidget):
     @asyncSlot()
     async def scan(self) -> None:
         self._is_scanning = True
+        batch_log("SCAN", "User started device scan")
         self.scan_btn.setEnabled(False)
         self.list_widget.clear()
         self.adv_table.setRowCount(0)
@@ -562,6 +564,10 @@ class ScanPanel(QWidget):
             self.results = await self.ble.scan(timeout=5.0, supported_only=True)
             available_results = self._available_scan_results()
             self._rebuild_scan_list()
+            batch_log(
+                "SCAN",
+                f"Scan completed total={len(self.results)} available={len(available_results)}",
+            )
             if available_results:
                 self._set_scan_state(
                     "已找到可連線裝置",
@@ -584,12 +590,14 @@ class ScanPanel(QWidget):
             # recovery+retry did not succeed.  Show only the curated zh-TW
             # text; the raw pyserial detail goes to the debug log.
             message = exc.user_message or _SCAN_UNAVAILABLE_MESSAGE
+            batch_log("SCAN", f"Dongle scan aborted: {exc}", level="ERROR")
             _write_scan_debug(f"dongle scan aborted: {exc}")
             self._adapter_retry_allowed = True  # keep the scan button usable
             QMessageBox.warning(self, "接收器連線中斷", message)
             self._show_empty_result("接收器連線中斷", "請檢查 dongle 後再按一次「搜尋裝置」。")
             self._set_scan_state("接收器連線中斷", "請檢查 dongle 後再按一次「搜尋裝置」。")
         except Exception as exc:
+            batch_log("SCAN", f"Device scan failed: {exc}", level="ERROR")
             QMessageBox.warning(self, "掃描失敗", str(exc))
             self._show_empty_result("掃描失敗", "藍牙掃描未完成，請確認藍牙已開啟後重試。")
             self._set_scan_state("掃描失敗", str(exc))
@@ -608,6 +616,11 @@ class ScanPanel(QWidget):
         result = await check_ready() if callable(check_ready) else await check_bluetooth_adapter()
         _write_scan_debug(f"adapter check before scan: {result.status.value} {result.detail}")
         if result.status in (AdapterStatus.NO_ADAPTER, AdapterStatus.DISABLED):
+            batch_log(
+                "ADAPTER",
+                f"Scan readiness failed status={result.status.value} detail={result.detail}",
+                level="ERROR",
+            )
             message_provider = getattr(self.ble, "readiness_error_message", None)
             title, body = (
                 message_provider(result)
@@ -624,8 +637,14 @@ class ScanPanel(QWidget):
             )
             return False
         if result.status is AdapterStatus.OK:
+            batch_log("ADAPTER", "Scan readiness check passed")
             self.set_adapter_available()
         elif result.status is AdapterStatus.UNKNOWN_ERROR:
+            batch_log(
+                "ADAPTER",
+                f"Scan readiness returned unknown error: {result.detail}",
+                level="ERROR",
+            )
             self.status.setText(f"藍牙狀態檢測失敗: {result.detail}")
         return True
 

@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from .batch_log import batch_log
+
 
 @dataclass(frozen=True)
 class DataEvent:
@@ -98,6 +100,21 @@ class DeviceState:
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         self.log_messages.insert(0, f"{timestamp}  {message}")
         del self.log_messages[500:]
+        identity = self.device_address or self.device_name or "unassigned"
+        message_text = message.casefold()
+        if any(
+            marker in message_text
+            for marker in ("error", "failed", "失敗", "錯誤", "異常")
+        ):
+            level = "ERROR"
+        elif any(
+            marker in message_text
+            for marker in ("warning", "unknown", "skipped", "警告", "略過")
+        ):
+            level = "WARNING"
+        else:
+            level = "INFO"
+        batch_log("DEVICE", f"[{identity}] {message}", level=level)
 
     @property
     def input_power_w(self) -> float:

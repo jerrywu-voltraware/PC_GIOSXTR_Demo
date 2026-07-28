@@ -25,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
+from .batch_log import batch_log
 from .ble_adapter import (
     AdapterCheckResult,
     AdapterStatus,
@@ -257,6 +258,22 @@ _SCAN_RECOVERY_FAILED_MESSAGE = (
 
 def _write_dongle_runtime_log(message: str) -> None:
     """Persist transport/recovery events even when verbose scan logging is off."""
+    level = "ERROR" if any(
+        marker in message.lower()
+        for marker in (
+            "failed",
+            "error",
+            "fault",
+            "gave up",
+            "aborted",
+            "crashed",
+            "unavailable",
+            "stale",
+        )
+    ) else "INFO"
+    if "warn:" in message.lower() and level == "INFO":
+        level = "WARNING"
+    batch_log("DONGLE", message, level=level)
     try:
         log_dir = Path.cwd() / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
