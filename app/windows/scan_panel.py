@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -27,6 +28,7 @@ from qasync import asyncSlot
 from ..ble_adapter import AdapterStatus, check_bluetooth_adapter, user_facing_message
 from ..ble_manager import BleManager, DeviceScanResult
 from ..ble_manager import _write_scan_debug
+from ..device_source import _SCAN_UNAVAILABLE_MESSAGE, DongleTransactionAborted
 from ..models import DeviceState
 from ..recent_devices import RecentDevice
 from ..theme import ThemeTokens, current_tokens, theme_manager
@@ -36,6 +38,7 @@ class ScanPanel(QWidget):
     device_connect_requested = pyqtSignal(object)
     selected_device_changed = pyqtSignal(object)
     disconnect_requested = pyqtSignal()
+    device_disconnect_requested = pyqtSignal(str)
     disconnect_all_requested = pyqtSignal()
     packet_counts_clear_requested = pyqtSignal()
     active_changed = pyqtSignal(str)
@@ -53,6 +56,7 @@ class ScanPanel(QWidget):
         self.recent_devices: list[RecentDevice] = []
         self._is_scanning = False
         self._adapter_available = True
+        self._adapter_retry_allowed = False
         self._connected_addresses: set[str] = set()
         self._reconnecting_addresses: set[str] = set()
         self._tracked_addresses: set[str] = set()
@@ -125,6 +129,12 @@ class ScanPanel(QWidget):
         self.connected_list = QListWidget()
         self.connected_list.setObjectName("connectedList")
         self.connected_list.currentItemChanged.connect(self._on_connected_selection_changed)
+        self.connected_list.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.connected_list.customContextMenuRequested.connect(
+            self._show_connected_context_menu
+        )
         self.connected_list.setMinimumHeight(96)
         self.connected_list.setMaximumHeight(200)
         self.connected_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -354,17 +364,26 @@ class ScanPanel(QWidget):
         layout.addWidget(detail_label)
         self._set_item_widget(self.list_widget, item, widget, min_height=64)
 
-    def set_adapter_unavailable(self, _status: AdapterStatus, hint: str) -> None:
-        """Disable scan controls and show an actionable adapter hint."""
+    def set_adapter_unavailable(
+        self,
+        _status: AdapterStatus,
+        hint: str,
+        *,
+        allow_retry: bool = False,
+    ) -> None:
+        """Show an actionable adapter hint and optionally allow retry."""
         self._adapter_available = False
-        self.scan_btn.setEnabled(False)
-        self.scan_btn.setText("藍牙不可用")
+        self._adapter_retry_allowed = allow_retry
+        self.scan_btn.setEnabled(allow_retry)
+        self.scan_btn.setText("重新連接 dongle" if allow_retry else "藍牙不可用")
         first_line = hint.splitlines()[0] if hint.splitlines() else hint
-        self._set_scan_state("藍牙不可用", first_line)
-        self._show_empty_result("藍牙不可用", hint)
+        title = "Dongle 連線中斷" if allow_retry else "藍牙不可用"
+        self._set_scan_state(title, first_line)
+        self._show_empty_result(title, hint)
 
     def set_adapter_available(self) -> None:
         self._adapter_available = True
+        self._adapter_retry_allowed = False
         self.scan_btn.setText("搜尋裝置")
         self.scan_btn.setEnabled(not self._is_scanning)
         if self._is_scanning or self.results:
@@ -380,6 +399,20 @@ class ScanPanel(QWidget):
         if rssi >= -70:
             return "訊號穩定"
         return "訊號較弱"
+
+    def _available_scan_results(self) -> list[DeviceScanResult]:
+        """Return scan results that are not already shown in the lower list.
+
+        A tracked address is either connected or being retained for automatic
+        reconnect.  Keeping it out of the upper list prevents the same device
+        from appearing in both sections.  ``self.results`` remains intact so a
+        manually disconnected device can reappear without another scan.
+        """
+        return [
+            result
+            for result in self.results
+            if result.address not in self._tracked_addresses
+        ]
 
     def _add_scan_result(self, result: DeviceScanResult) -> None:
         item = QListWidgetItem()
@@ -527,23 +560,44 @@ class ScanPanel(QWidget):
             if not await self._adapter_ready_for_scan():
                 return
             self.results = await self.ble.scan(timeout=5.0, supported_only=True)
-            for result in self.results:
-                self._add_scan_result(result)
-            if self.results:
+            available_results = self._available_scan_results()
+            self._rebuild_scan_list()
+            if available_results:
                 self._set_scan_state(
                     "已找到可連線裝置",
-                    f"找到 {len(self.results)} 個支援裝置，選擇後即可連線。",
+                    f"找到 {len(available_results)} 個支援裝置，選擇後即可連線。",
+                )
+            elif self.results:
+                self._show_empty_result(
+                    "沒有其他可連線裝置",
+                    "本次掃描到的裝置已顯示在下方「已連線裝置」。",
+                )
+                self._set_scan_state(
+                    "沒有其他可連線裝置",
+                    "本次掃描到的裝置已顯示在下方「已連線裝置」。",
                 )
             else:
                 self._show_empty_result("沒有找到支援裝置", "請確認裝置已開機，並靠近充電板後再搜尋一次。")
                 self._set_scan_state("沒有找到支援裝置", "請確認裝置已開機，並靠近充電板後再搜尋一次。")
+        except DongleTransactionAborted as exc:
+            # The dongle transport died mid-scan and the automatic
+            # recovery+retry did not succeed.  Show only the curated zh-TW
+            # text; the raw pyserial detail goes to the debug log.
+            message = exc.user_message or _SCAN_UNAVAILABLE_MESSAGE
+            _write_scan_debug(f"dongle scan aborted: {exc}")
+            self._adapter_retry_allowed = True  # keep the scan button usable
+            QMessageBox.warning(self, "接收器連線中斷", message)
+            self._show_empty_result("接收器連線中斷", "請檢查 dongle 後再按一次「搜尋裝置」。")
+            self._set_scan_state("接收器連線中斷", "請檢查 dongle 後再按一次「搜尋裝置」。")
         except Exception as exc:
             QMessageBox.warning(self, "掃描失敗", str(exc))
             self._show_empty_result("掃描失敗", "藍牙掃描未完成，請確認藍牙已開啟後重試。")
             self._set_scan_state("掃描失敗", str(exc))
         finally:
             self._is_scanning = False
-            self.scan_btn.setEnabled(self._adapter_available)
+            self.scan_btn.setEnabled(
+                self._adapter_available or self._adapter_retry_allowed
+            )
             self.scan_progress.hide()
 
     async def _adapter_ready_for_scan(self) -> bool:
@@ -554,9 +608,20 @@ class ScanPanel(QWidget):
         result = await check_ready() if callable(check_ready) else await check_bluetooth_adapter()
         _write_scan_debug(f"adapter check before scan: {result.status.value} {result.detail}")
         if result.status in (AdapterStatus.NO_ADAPTER, AdapterStatus.DISABLED):
-            title, body = user_facing_message(result)
+            message_provider = getattr(self.ble, "readiness_error_message", None)
+            title, body = (
+                message_provider(result)
+                if callable(message_provider)
+                else user_facing_message(result)
+            )
             QMessageBox.information(self, title, body)
-            self.set_adapter_unavailable(result.status, body)
+            self.set_adapter_unavailable(
+                result.status,
+                body,
+                allow_retry=bool(
+                    getattr(self.ble, "readiness_retry_allowed", False)
+                ),
+            )
             return False
         if result.status is AdapterStatus.OK:
             self.set_adapter_available()
@@ -600,6 +665,23 @@ class ScanPanel(QWidget):
         address = current.data(Qt.ItemDataRole.UserRole)
         if isinstance(address, str) and address:
             self.active_changed.emit(address)
+
+    def _show_connected_context_menu(self, position) -> None:
+        """Offer address-specific actions for the connected-list row clicked."""
+        item = self.connected_list.itemAt(position)
+        if item is None:
+            return
+        address = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(address, str) or not address:
+            return
+
+        menu = QMenu(self)
+        disconnect_action = menu.addAction("中斷此裝置")
+        selected_action = menu.exec(
+            self.connected_list.viewport().mapToGlobal(position)
+        )
+        if selected_action is disconnect_action:
+            self.device_disconnect_requested.emit(address)
 
     def refresh(self, state: DeviceState) -> None:
         if self._is_scanning:
@@ -715,7 +797,7 @@ class ScanPanel(QWidget):
             if isinstance(data, DeviceScanResult):
                 current_addr = data.address
         self.list_widget.clear()
-        for result in self.results:
+        for result in self._available_scan_results():
             self._add_scan_result(result)
         if current_addr:
             for i in range(self.list_widget.count()):

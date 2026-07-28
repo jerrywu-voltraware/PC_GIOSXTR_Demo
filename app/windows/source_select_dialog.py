@@ -3,19 +3,34 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import (
+    QObject,
+    QRunnable,
+    QStandardPaths,
+    QThreadPool,
+    QUrl,
+    pyqtSignal,
+    pyqtSlot,
+)
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QLabel,
+    QMessageBox,
     QPushButton,
     QRadioButton,
     QVBoxLayout,
     QWidget,
 )
+
+from ..constants import APP_VERSION
+from ..updater import UpdateAsset, UpdateCheckResult, UpdateStatus, check_for_update, download_asset
 
 # Nordic Semiconductor USB Vendor ID (nRF52840 dongle CDC).
 NORDIC_VID = 0x1915
@@ -30,6 +45,50 @@ class SourceSelection:
 
     source: str  # SOURCE_PC | SOURCE_DONGLE
     port: str | None = None  # serial port device for the dongle, e.g. "COM5"
+
+
+class _WorkerSignals(QObject):
+    completed = pyqtSignal(object)
+    failed = pyqtSignal(str)
+
+
+class _UpdateCheckWorker(QRunnable):
+    """Run the startup GitHub request without blocking the source dialog."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.signals = _WorkerSignals()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            self.signals.completed.emit(check_for_update(APP_VERSION))
+        except Exception as exc:  # unexpected failure outside updater's mapping
+            self.signals.failed.emit(str(exc))
+
+
+class _UpdateDownloadWorker(QRunnable):
+    """Download an accepted update while keeping the startup dialog responsive."""
+
+    def __init__(self, asset: UpdateAsset, target_path: Path) -> None:
+        super().__init__()
+        self.asset = asset
+        self.target_path = target_path
+        self.signals = _WorkerSignals()
+
+    @pyqtSlot()
+    def run(self) -> None:
+        try:
+            self.signals.completed.emit(
+                download_asset(self.asset, target_path=self.target_path)
+            )
+        except Exception as exc:
+            self.signals.failed.emit(str(exc))
+
+
+def _start_worker(worker: QRunnable) -> None:
+    """Submit a startup worker (small seam for hardware/network-free tests)."""
+    QThreadPool.globalInstance().start(worker)
 
 
 def list_serial_ports() -> list[tuple[str, str, bool]]:
@@ -71,6 +130,12 @@ class SourceSelectDialog(QDialog):
         title = QLabel("請選擇本次使用的資料來源：")
         title.setStyleSheet("font-weight: 600;")
         layout.addWidget(title)
+
+        self._update_status = QLabel("準備檢查是否有新版本...")
+        self._update_status.setObjectName("startupUpdateStatus")
+        self._update_status.setWordWrap(True)
+        self._update_status.setStyleSheet("color: #555; padding: 4px 0 6px 0;")
+        layout.addWidget(self._update_status)
 
         self._group = QButtonGroup(self)
 
@@ -116,6 +181,10 @@ class SourceSelectDialog(QDialog):
         self._buttons.rejected.connect(self.reject)
 
         self._selection: SourceSelection | None = None
+        self._update_check_started = False
+        self._update_check_running = False
+        self._update_download_running = False
+        self._update_worker: _UpdateCheckWorker | _UpdateDownloadWorker | None = None
         self._reload_ports()
 
     # -- internals -----------------------------------------------------------
@@ -146,6 +215,127 @@ class SourceSelectDialog(QDialog):
         else:
             self._selection = SourceSelection(SOURCE_PC, None)
         self.accept()
+
+    def _set_ok_enabled(self, enabled: bool) -> None:
+        button = self._buttons.button(QDialogButtonBox.StandardButton.Ok)
+        if button is not None:
+            button.setEnabled(enabled)
+
+    def _start_automatic_update_check(self) -> None:
+        if self._update_check_started:
+            return
+        self._update_check_started = True
+        self._update_check_running = True
+        self._set_ok_enabled(False)
+        self._update_status.setText("正在檢查是否有新版本，完成後即可繼續...")
+
+        worker = _UpdateCheckWorker()
+        self._update_worker = worker
+        worker.signals.completed.connect(self._handle_update_check_result)
+        worker.signals.failed.connect(self._handle_update_check_failure)
+        _start_worker(worker)
+
+    @pyqtSlot(object)
+    def _handle_update_check_result(self, result: UpdateCheckResult) -> None:
+        self._update_check_running = False
+        self._update_worker = None
+        self._set_ok_enabled(True)
+
+        if result.status is UpdateStatus.UPDATE_AVAILABLE and result.info is not None:
+            info = result.info
+            self._update_status.setText(
+                f"發現新版 {info.latest_version}；可立即下載或稍後再更新。"
+            )
+            answer = QMessageBox.question(
+                self,
+                "發現新版",
+                (
+                    f"目前版本：{info.current_version}\n"
+                    f"最新版本：{info.latest_version}\n\n"
+                    "是否立即下載新版？"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer is QMessageBox.StandardButton.Yes:
+                target_path = self._select_update_download_path(info.asset)
+                if target_path is not None:
+                    self._start_update_download(info.asset, target_path)
+            return
+
+        if result.status is UpdateStatus.UP_TO_DATE:
+            self._update_status.setText(result.message or f"目前版本 {APP_VERSION} 已是最新版本。")
+        else:
+            # Automatic startup checks stay non-blocking when GitHub/network is
+            # unavailable. The Settings dialog still offers a detailed manual
+            # check after entering the application.
+            self._update_status.setText("暫時無法檢查更新；仍可繼續選擇連線方式。")
+
+    @pyqtSlot(str)
+    def _handle_update_check_failure(self, _detail: str) -> None:
+        self._update_check_running = False
+        self._update_worker = None
+        self._set_ok_enabled(True)
+        self._update_status.setText("暫時無法檢查更新；仍可繼續選擇連線方式。")
+
+    def _select_update_download_path(self, asset: UpdateAsset) -> Path | None:
+        downloads_dir = QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.DownloadLocation
+        )
+        base_dir = Path(downloads_dir) if downloads_dir else Path.home() / "Downloads"
+        selected_path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "儲存更新檔",
+            str(base_dir / asset.name),
+            "Windows 執行檔 (*.exe);;所有檔案 (*)",
+        )
+        if not selected_path:
+            return None
+        path = Path(selected_path)
+        if not path.suffix and asset.name.lower().endswith(".exe"):
+            path = path.with_suffix(".exe")
+        return path
+
+    def _start_update_download(self, asset: UpdateAsset, target_path: Path) -> None:
+        if self._update_download_running:
+            return
+        self._update_download_running = True
+        self._set_ok_enabled(False)
+        self._update_status.setText(f"正在下載 {asset.name} ...")
+
+        worker = _UpdateDownloadWorker(asset, target_path)
+        self._update_worker = worker
+        worker.signals.completed.connect(self._handle_update_downloaded)
+        worker.signals.failed.connect(self._handle_update_download_failure)
+        _start_worker(worker)
+
+    @pyqtSlot(object)
+    def _handle_update_downloaded(self, path: Path) -> None:
+        self._update_download_running = False
+        self._update_worker = None
+        self._set_ok_enabled(True)
+        self._update_status.setText(f"新版已下載：{path.name}")
+        answer = QMessageBox.question(
+            self,
+            "更新已下載",
+            f"已下載：\n{path}\n\n是否現在開啟新版？使用新版前請先關閉目前版本。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer is QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    @pyqtSlot(str)
+    def _handle_update_download_failure(self, detail: str) -> None:
+        self._update_download_running = False
+        self._update_worker = None
+        self._set_ok_enabled(True)
+        self._update_status.setText("新版下載失敗；仍可繼續使用目前版本。")
+        QMessageBox.warning(self, "更新下載失敗", detail)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._start_automatic_update_check()
 
     # -- public --------------------------------------------------------------
 

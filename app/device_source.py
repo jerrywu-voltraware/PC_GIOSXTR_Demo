@@ -25,7 +25,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Protocol, runtime_checkable
 
-from .ble_adapter import AdapterCheckResult, AdapterStatus, check_bluetooth_adapter
+from .ble_adapter import (
+    AdapterCheckResult,
+    AdapterStatus,
+    check_bluetooth_adapter,
+    user_facing_message,
+)
 from .ble_manager import BleManager, DeviceScanResult, _write_scan_debug
 from .constants import UUID_IOT_NOTIFY, UUID_NOTIFY_200B
 
@@ -82,6 +87,11 @@ class DeviceSource(ABC):
     #: GATT discovery, so connecting too early hangs it.
     requires_ready_before_next_connect: bool = False
 
+    #: Whether a failed readiness check is expected to be transient. The UI
+    #: keeps the scan button available so the user can retry after Windows
+    #: finishes re-enumerating the source transport.
+    readiness_retry_allowed: bool = False
+
     @abstractmethod
     async def scan(
         self, timeout: float = 5.0, supported_only: bool = True
@@ -99,6 +109,12 @@ class DeviceSource(ABC):
         that do not rely on the OS radio (e.g. the dongle) override this.
         """
         return await check_bluetooth_adapter()
+
+    def readiness_error_message(
+        self, result: AdapterCheckResult
+    ) -> tuple[str, str]:
+        """Return a source-specific readiness error for the UI."""
+        return user_facing_message(result)
 
     async def prepare_reconnect(self, address: str) -> None:
         """Clear any latched per-device link state before a reconnect connects.
@@ -139,6 +155,17 @@ class PcBleSource(DeviceSource):
 # ---------------------------------------------------------------------------
 # Nordic dongle source (USB CDC bridge)
 # ---------------------------------------------------------------------------
+
+
+class DongleTransactionAborted(ConnectionError):
+    """A dongle serial transaction (scan) was invalidated by a transport
+    failure or an in-flight recovery.  str(exc) is the technical detail
+    (log-only); user_message, when set, is the zh-TW text safe for the UI."""
+
+    def __init__(self, detail: str, *, user_message: str = "") -> None:
+        super().__init__(detail)
+        self.user_message = user_message
+
 
 # Binary uplink frame layout (see firmware send_binary_packet):
 #   AA 55 | SITE_ID(2,LE) | DEV_ID(1) | SEQ(2,LE) | LEN(1) | PAYLOAD(LEN) |
@@ -204,6 +231,28 @@ _DONGLE_SERIAL_WRITE_TIMEOUT_SECONDS = 1.0
 # reply; if none arrives, keep needs_recovery set so the next attempt retries.
 _DONGLE_PROBE_TIMEOUT_SECONDS = 1.5
 _DONGLE_PROBE_ATTEMPTS = 3
+# A scan transaction retries at most once after a successful recovery, so a
+# single user click performs at most two complete AT+SCAN..AT+LIST attempts.
+_DONGLE_SCAN_RETRY_ATTEMPTS = 1
+# Poll granularity of the abortable advertisement window: instead of sleeping
+# through a transport death, the scan wakes this often to check its generation.
+_DONGLE_SCAN_ABORT_POLL_SECONDS = 0.2
+# How long the scan waits for the firmware to answer AT+LIST.
+_DONGLE_SCAN_LIST_TIMEOUT_SECONDS = 3.0
+# Bounded wait for the scan to own the dongle command bus (_connect_lock);
+# mirrors the semantics of _DONGLE_PENDING_CONNECT_SCAN_WAIT_SECONDS.
+_DONGLE_SCAN_OWNERSHIP_WAIT_SECONDS = 4.0
+# zh-TW user-facing texts shown by the UI when a scan transaction finally fails.
+_SCAN_UNAVAILABLE_MESSAGE = (
+    "Nordic dongle 連線中斷，程式已自動重置 dongle 並重試掃描，但仍未成功。\n\n"
+    "請確認 dongle 已插好、未被其他程式佔用序列埠；"
+    "若剛重新插拔，請等待數秒後再按一次「搜尋裝置」。"
+)
+_SCAN_RECOVERY_FAILED_MESSAGE = (
+    "Nordic dongle 已中斷連線，且自動重新連接失敗。\n\n"
+    "請重新插拔 dongle，等待 Windows 重新辨識（約數秒）後，"
+    "再按一次「搜尋裝置」。"
+)
 
 
 def _write_dongle_runtime_log(message: str) -> None:
@@ -396,6 +445,7 @@ class DongleSource(DeviceSource):
     display_name = "Nordic dongle"
     supports_control = True
     requires_ready_before_next_connect = True
+    readiness_retry_allowed = True
 
     def __init__(
         self,
@@ -467,6 +517,10 @@ class DongleSource(DeviceSource):
         self._recovering = False
         self._last_transport_error = ""
         self._recovery_lock = asyncio.Lock()
+        # Incremented on every transport failure / recovery start.  A scan
+        # snapshots it and aborts as soon as the transport it started on is no
+        # longer the live one.  Mutated only on the event-loop thread.
+        self._transport_generation: int = 0
 
         self._reader: threading.Thread | None = None
         if start_reader:
@@ -478,6 +532,33 @@ class DongleSource(DeviceSource):
     # -- DeviceSource API ----------------------------------------------------
 
     async def check_ready(self) -> AdapterCheckResult:
+        serial_open = self._serial is not None and getattr(
+            self._serial, "is_open", False
+        )
+        reader_dead = self._reader is not None and not self._reader.is_alive()
+        recovery_needed = (
+            self._needs_recovery
+            or self._recovering
+            or not serial_open
+            or reader_dead
+        )
+
+        # An nRF52840 firmware reset invalidates Windows' existing COM handle.
+        # A transport failure sets _needs_recovery, but the scan UI calls this
+        # readiness gate before scan(). Recover here so that gate does not
+        # permanently block the recovery already implemented by scan/connect.
+        # Injected serial objects belong to tests/callers and must never be
+        # closed or reopened behind their backs.
+        if recovery_needed and self._owns_serial:
+            self._needs_recovery = True
+            try:
+                await self._ensure_recovered(
+                    "readiness check detected unavailable dongle transport"
+                )
+            except Exception as exc:
+                detail = self._last_transport_error or str(exc)
+                return AdapterCheckResult(AdapterStatus.NO_ADAPTER, detail)
+
         if self._serial is not None and getattr(self._serial, "is_open", False):
             if self._reader is not None and not self._reader.is_alive():
                 detail = self._last_transport_error or "Dongle reader thread stopped"
@@ -488,6 +569,21 @@ class DongleSource(DeviceSource):
             return AdapterCheckResult(AdapterStatus.OK, f"Dongle on {self._port_name}")
         return AdapterCheckResult(
             AdapterStatus.NO_ADAPTER, "Dongle serial port is not open"
+        )
+
+    def readiness_error_message(
+        self, result: AdapterCheckResult
+    ) -> tuple[str, str]:
+        detail = result.detail or "unknown dongle transport error"
+        # Keep pyserial/COM details in the diagnostic log.  This readiness
+        # branch runs before scan(), so exposing ``result.detail`` here would
+        # otherwise bypass DongleTransactionAborted's curated UI message.
+        _write_dongle_runtime_log(f"readiness unavailable: {detail}")
+        return (
+            "Nordic dongle 無法使用",
+            "程式已嘗試重新連接 Nordic dongle，但目前仍無法使用。\n\n"
+            "請確認 dongle 已插入、沒有其他程式佔用序列埠；若 Windows "
+            "正在重新辨識 USB，請等待數秒後再按一次「重新連接 dongle」。",
         )
 
     @property
@@ -511,6 +607,9 @@ class DongleSource(DeviceSource):
         """
         mac = address.upper()
         async with self._connect_lock:
+            # Never issue the pre-connect AT+DISC on a transport that is known
+            # to need recovery; heal it first.
+            await self._ensure_recovered("reconnect preparation")
             await self._wait_for_scan_idle()
             await self._wait_for_pending_disconnects()
             try:
@@ -528,40 +627,127 @@ class DongleSource(DeviceSource):
     async def scan(
         self, timeout: float = 5.0, supported_only: bool = True
     ) -> list[DeviceScanResult]:
-        # Hold off concurrent connects (they would multiplex AT+CONN onto the
-        # serial link mid-scan) and let any pending disconnect finish first.
-        self._scan_idle.clear()
+        # Own the command bus (_connect_lock) for the whole transaction —
+        # including the automatic retry after a recovery — so a reconnect's
+        # AT+DISC/AT+CONN can never interleave with AT+SCAN..AT+LIST.
+        await self._acquire_scan_ownership()
         try:
-            await self._wait_for_pending_disconnects()
-            # A connect that never completed leaves the firmware wedged so it
-            # cannot service AT+SCAN. Recover the dongle before scanning, so the
-            # user does not have to restart the app.
-            await self._recover_if_connect_stuck()
-            # Start scanning, let advertisements accumulate, then pull the list.
-            self._scan_lines = []
-            self._scan_expect = None
-            _write_scan_debug("dongle scan: AT+SCAN")
-            self._scan_debug = True
+            self._scan_idle.clear()
+            last_error: Exception = ConnectionError("scan did not start")
+            user_message = _SCAN_UNAVAILABLE_MESSAGE
+            for attempt in range(1 + _DONGLE_SCAN_RETRY_ATTEMPTS):
+                if attempt:
+                    _write_dongle_runtime_log(
+                        f"scan retry {attempt}/{_DONGLE_SCAN_RETRY_ATTEMPTS} "
+                        "after transport recovery"
+                    )
+                try:
+                    # Health gate at the start of every attempt: attempt 1
+                    # absorbs the old needs-recovery preflight; attempt 2 only
+                    # runs when recovery succeeded.
+                    await self._ensure_recovered("scan preflight")
+                except Exception as exc:
+                    last_error = exc
+                    user_message = _SCAN_RECOVERY_FAILED_MESSAGE
+                    break  # recovery itself failed: give up immediately
+                try:
+                    return await self._scan_once(timeout)
+                except ConnectionError as exc:  # incl. DongleTransactionAborted
+                    last_error = exc
+                    _write_dongle_runtime_log(
+                        f"scan attempt {attempt + 1} aborted: {exc}"
+                    )
+            detail = self._last_transport_error or str(last_error)
+            _write_dongle_runtime_log(f"scan gave up: {detail}")
+            raise DongleTransactionAborted(
+                detail, user_message=user_message
+            ) from last_error
+        finally:
+            self._scan_idle.set()
+            self._connect_lock.release()
+
+    async def _acquire_scan_ownership(self) -> None:
+        """Bounded acquire of _connect_lock with two escape hatches."""
+        try:
+            await asyncio.wait_for(
+                self._connect_lock.acquire(), _DONGLE_SCAN_OWNERSHIP_WAIT_SECONDS
+            )
+            return
+        except asyncio.TimeoutError:
+            pass
+        pending = [f for f in self._connect_futures.values() if not f.done()]
+        if pending:
+            # Same semantics as the old _recover_if_connect_stuck: a connect
+            # still unresolved after this wait is wedged; force a recovery so
+            # its future fails and the lock holder exits and releases the lock.
+            self._needs_recovery = True
+            try:
+                await self.recover("scan requested over an unresponsive connect")
+            except Exception as exc:
+                raise DongleTransactionAborted(
+                    f"recovery failed while freeing a wedged connect: {exc}",
+                    user_message=_SCAN_RECOVERY_FAILED_MESSAGE,
+                ) from exc
+        elif self._recovering or self._needs_recovery:
+            # The lock holder is waiting on an in-flight recovery (e.g. the
+            # _connect preflight): wait for it to wind down.
+            try:
+                await self._ensure_recovered("scan waiting for in-flight recovery")
+            except Exception as exc:
+                raise DongleTransactionAborted(
+                    f"recovery failed while scan waited for the bus: {exc}",
+                    user_message=_SCAN_RECOVERY_FAILED_MESSAGE,
+                ) from exc
+        try:
+            await asyncio.wait_for(
+                self._connect_lock.acquire(), _DONGLE_SCAN_OWNERSHIP_WAIT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            raise DongleTransactionAborted(
+                "scan could not obtain the dongle command bus",
+                user_message=_SCAN_UNAVAILABLE_MESSAGE,
+            ) from None
+
+    async def _scan_once(self, timeout: float) -> list[DeviceScanResult]:
+        await self._wait_for_pending_disconnects()  # re-waited every attempt
+        generation = self._transport_generation  # snapshot after the preflight
+        self._scan_lines = []
+        self._scan_expect = None
+        _write_scan_debug("dongle scan: AT+SCAN")
+        self._scan_debug = True
+        try:
             self._send_command("AT+SCAN")
-            await asyncio.sleep(timeout)
+            await self._sleep_scan_window(timeout, generation)
+            # Check the flags BEFORE sending AT+STOP so a transaction that
+            # died mid-window never writes to the new-generation transport.
+            self._check_generation(generation, "scan window")
             _write_scan_debug("dongle scan: AT+STOP")
             self._send_command("AT+STOP")
-
             future: asyncio.Future[bool] = self._loop.create_future()
             self._scan_future = future
             self._scan_expect = None
             _write_scan_debug("dongle scan: AT+LIST")
             try:
                 self._send_command("AT+LIST")
-                await asyncio.wait_for(future, timeout=3.0)
+                await asyncio.wait_for(
+                    future, timeout=_DONGLE_SCAN_LIST_TIMEOUT_SECONDS
+                )
             except asyncio.TimeoutError:
+                if not self._scan_lines and self._scan_expect is None:
+                    # Zero collected lines and not even a "SCAN LIST:" header:
+                    # the firmware is completely silent on AT+LIST, so the
+                    # transport is suspect — abort and take the retry path.
+                    self._needs_recovery = True
+                    raise DongleTransactionAborted(
+                        "AT+LIST unanswered with no live scan lines"
+                    )
                 _write_scan_debug(
-                    "dongle scan: AT+LIST timed out (no SCAN LIST received)"
+                    "dongle scan: AT+LIST timed out; using collected lines"
                 )
             finally:
                 self._consume_future_exception(future)
                 self._scan_future = None
-                self._scan_debug = False
+            self._check_generation(generation, "scan list")
             results = self._parse_scan_results(self._scan_lines)
             _write_scan_debug(
                 f"dongle scan: parsed {len(results)} device(s) from "
@@ -570,7 +756,29 @@ class DongleSource(DeviceSource):
             return results
         finally:
             self._scan_debug = False
-            self._scan_idle.set()
+
+    async def _sleep_scan_window(self, timeout: float, generation: int) -> None:
+        """Abortable advertisement window: poll instead of sleeping through death."""
+        deadline = self._loop.time() + timeout
+        while True:
+            self._check_generation(generation, "scan window")
+            remaining = deadline - self._loop.time()
+            if remaining <= 0:
+                return
+            await asyncio.sleep(min(_DONGLE_SCAN_ABORT_POLL_SECONDS, remaining))
+
+    def _check_generation(self, generation: int, stage: str) -> None:
+        # The predicate deliberately excludes _running: a recovery on an
+        # injected serial port never resets _running, and needs_recovery is
+        # already sufficient (_handle_transport_failure sets it first).
+        if (
+            generation != self._transport_generation
+            or self._needs_recovery
+            or self._recovering
+        ):
+            raise DongleTransactionAborted(
+                f"dongle transport changed during scan ({stage})"
+            )
 
     async def close(self) -> None:
         self.shutdown()
@@ -585,7 +793,11 @@ class DongleSource(DeviceSource):
 
     # -- command sending -----------------------------------------------------
 
-    def _send_command(self, text: str) -> None:
+    def _send_command(self, text: str, *, allow_during_recovery: bool = False) -> None:
+        if self._recovering and not allow_during_recovery:
+            raise DongleTransactionAborted(
+                f"dongle recovery in progress; refused to send {text.split('=')[0]}"
+            )
         try:
             with self._write_lock:
                 if not getattr(self._serial, "is_open", False):
@@ -732,31 +944,6 @@ class DongleSource(DeviceSource):
                 f"dongle scan: {len(pending)} pending disconnect(s) still incomplete"
             )
 
-    async def _recover_if_connect_stuck(self) -> None:
-        """Reset the dongle if a connect attempt left it wedged.
-
-        A wedged firmware (no CONNECTED / error within the connect timeout, or a
-        disconnect that was never acknowledged) cannot service AT+SCAN, so the
-        scan would silently return nothing. Recovering here means the user no
-        longer has to close and reopen the app.
-        """
-        if self._needs_recovery or self._recovering:
-            await self._ensure_recovered(
-                "previous connect/disconnect left the dongle wedged"
-            )
-            return
-        pending = [f for f in self._connect_futures.values() if not f.done()]
-        if not pending:
-            return
-        _write_scan_debug(
-            f"dongle scan: {len(pending)} connect(s) in flight; waiting briefly"
-        )
-        _, still_pending = await asyncio.wait(
-            pending, timeout=_DONGLE_PENDING_CONNECT_SCAN_WAIT_SECONDS
-        )
-        if still_pending:
-            await self.recover("scan requested over an unresponsive connect")
-
     async def _ensure_recovered(self, reason: str) -> None:
         """Wait for an active recovery, then reset only if it is still needed."""
         if self._recovering:
@@ -779,7 +966,7 @@ class DongleSource(DeviceSource):
             future: asyncio.Future[bool] = self._loop.create_future()
             self._probe_future = future
             try:
-                self._send_command("AT+STATUS")
+                self._send_command("AT+STATUS", allow_during_recovery=True)
             except Exception as exc:
                 self._consume_future_exception(future)
                 if self._probe_future is future:
@@ -803,11 +990,20 @@ class DongleSource(DeviceSource):
         Closing a CDC handle does *not* reset an nRF52840.  New firmware accepts
         AT+RESET; AT+DISC remains a compatibility fallback for older firmware.
         """
+        # Declare intent before queueing so a recovery that completes while we
+        # wait on the lock marks our failure as already serviced (coalescing).
+        self._needs_recovery = True
         async with self._recovery_lock:
+            if not self._needs_recovery:
+                _write_dongle_runtime_log(
+                    f"recovery skipped (already completed concurrently): {reason}"
+                )
+                return
             _write_scan_debug(f"dongle recovery: {reason}")
             _write_dongle_runtime_log(f"recovery started: {reason}")
             self._needs_recovery = True
             self._recovering = True
+            self._transport_generation += 1
             self._fail_all_pending_operations(f"dongle reset: {reason}")
             # Notify the UI before touching the port.  This is what preserves
             # state/CSV recording and schedules auto-reconnect.
@@ -817,9 +1013,9 @@ class DongleSource(DeviceSource):
                     # Best effort: old firmware understands AT+DISC; the fixed
                     # firmware then performs a real MCU reset via AT+RESET.
                     try:
-                        self._send_command("AT+DISC")
+                        self._send_command("AT+DISC", allow_during_recovery=True)
                         await asyncio.sleep(0.15)
-                        self._send_command("AT+RESET")
+                        self._send_command("AT+RESET", allow_during_recovery=True)
                         await asyncio.sleep(0.2)
                     except Exception as exc:
                         _write_scan_debug(f"dongle recovery command failed: {exc}")
@@ -991,6 +1187,10 @@ class DongleSource(DeviceSource):
         if self._recovering or not self._running:
             return
         self._needs_recovery = True
+        # This method must run on the event-loop thread (the reader routes it
+        # through call_soon_threadsafe); _transport_generation is only safe
+        # lock-free because every mutation happens on that thread.
+        self._transport_generation += 1
         self._running = False
         self._fail_all_pending_operations(message)
         self._reset_link_state()
@@ -1115,7 +1315,10 @@ class DongleSource(DeviceSource):
             manager._dispatch_notify(uuid, payload)
 
     def _on_line(self, line: str) -> None:
-        if line.startswith("DIAG:"):
+        # Persist reset diagnostics and demoted firmware errors even when scan
+        # debug logging is disabled. DIAG2 carries the fault registers needed
+        # to map a reset back to the failing instruction.
+        if line.startswith(("DIAG", "WARN:", "ERROR:SCAN")):
             _write_dongle_runtime_log(f"firmware {line}")
         if self._scan_debug:
             _write_scan_debug(f"dongle rx: {line!r}")

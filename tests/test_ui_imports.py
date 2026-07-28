@@ -267,6 +267,34 @@ def test_manual_disconnect_removes_state_without_reconnect(monkeypatch):
     window.close()
 
 
+def test_connected_list_disconnect_request_targets_the_requested_address(monkeypatch):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import asyncio
+
+    from PyQt6.QtWidgets import QApplication
+
+    from app.windows.main_window import MainWindow
+
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow()
+    disconnected: list[str] = []
+
+    async def disconnect_address(address: str) -> None:
+        disconnected.append(address)
+
+    monkeypatch.setattr(window, "_disconnect_address", disconnect_address)
+
+    asyncio.run(
+        window._disconnect_requested_address.__wrapped__(
+            window, "2F:7C:13:57:B4:81"
+        )
+    )
+
+    assert disconnected == ["2F:7C:13:57:B4:81"]
+    window._close_after_disconnect = True
+    window.close()
+
+
 def test_connect_device_skips_existing_connected_state_without_manager():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     import asyncio

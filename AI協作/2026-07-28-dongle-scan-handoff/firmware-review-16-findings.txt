@@ -1,0 +1,260 @@
+{
+  "summary": "Three adversarial lenses verify the nRF52840 fault-diagnostic firmware patch without local build",
+  "agentCount": 3,
+  "logs": [
+    "韌體審查完成：16 個 findings"
+  ],
+  "result": {
+    "findings_count": 16,
+    "findings": [
+      {
+        "lens": "build-safety",
+        "file": "PTU_to_Azure/NRF52840-DONGLE/Rpi_USB_BLE/examples/ble_central/ble_app_multilink_central/pca10056/s140/arm5_no_packs/ble_app_multilink_central_pca10056_s140.uvprojx",
+        "line": 3951,
+        "severity": "minor",
+        "claim": "第二個 target `flash_s140_nrf52_7.2.0_softdevice` 的 IRAM1 仍是 0x200043A8+0x3BC58（末端 0x20040000，涵蓋 FAULT_RECORD_ADDR 0x20038000），且該 target 的 Groups 內確實含 main.c（uvprojx:4035，無 IncludeInBuild 排除）——firmware-analysis.md §8.3『該 target 不編譯 main.c』的宣稱錯誤。",
+        "failure_scenario": "日後若有人選錯 target 建置應用程式（或該 layout 下 RW+ZI 成長超過 ~0x33C58 bytes），linker 會把資料配進涵蓋 0x20038000 的 region，scatter-load 清零或資料配置會摧毀跨 reset fault 記錄，且 fault_record_store 在 fault 當下可能覆寫活的 app 變數。現況（RW+ZI 僅 0x94C8、輸出檔名與 flash script 不同）實害趨近零，故列 minor，但文件宣稱需更正。"
+      },
+      {
+        "lens": "build-safety",
+        "file": "PTU_to_Azure/NRF52840-DONGLE/Rpi_USB_BLE/examples/ble_central/ble_app_multilink_central/main.c",
+        "line": 1934,
+        "severity": "minor",
+        "claim": "HardFault_Handler 新增的 fault_record_store(0xFFFF0004UL,0,0,0,0,0) 是 6 參數呼叫，AAPCS 下第 5、6 參數必須壓堆疊，違反該函式 doc comment 明文的『uses no stack data so it remains usable for the common stack-corruption case』不變量。",
+        "failure_scenario": "SP 損毀但仍指向可寫 RAM 且恰落在 0x20038000-0x20038040（record 區）時，handler 的堆疊壓入會與 fault_record_store 對同一區的寫入互踩，產生自我矛盾的記錄。GPREGRET 先寫已保底（0xFF04 標記必存活），且 nRF52840 整段 0x20000000-0x20040000 皆可寫、exception entry 成功即代表堆疊可寫，故實際風險極低。建議至少更新註解。"
+      },
+      {
+        "lens": "build-safety",
+        "file": "PTU_to_Azure/NRF52840-DONGLE/Rpi_USB_BLE/examples/ble_central/ble_app_multilink_central/main.c",
+        "line": 1951,
+        "severity": "minor",
+        "claim": "wdt_event_handler 在 SoftDevice 啟用中、WDT IRQ context 直寫 NRF_POWER->GPREGRET/GPREGRET2（POWER 是 SD 受限週邊，位於 PREGION[0] 子區 0）；若 MWU 監看該區，會產生 NRF_FAULT_ID_APP_MEMACC，經 app_error_fault_handler 寫入一筆偽造的 0xFF03 fault record，且其 NVIC_SystemReset 會搶在 WDT 硬體 reset 之前完成，RESETREAS 只剩 SREQ 沒有 DOG 位元。",
+        "failure_scenario": "主迴圈真的 wedge 一次 → WDT 逾時 → DIAG 顯示 RESETREAS=SREQ + last_err=0xFF03 + n 遞增——與本次要獵捕的目標故障特徵完全相同，使用者可能把唯一一次上機重現額度浪費在偽造訊號上。緩解：fault_pc 會指向 wdt_event_handler 可自我識別，但 §6 判讀表未寫這條陷阱；建議採納 A1（改用 sd_power_gpregret_set 或空函式）或在判讀表補註。"
+      },
+      {
+        "lens": "build-safety",
+        "file": "PTU_to_Azure/NRF52840-DONGLE/Rpi_USB_BLE/examples/ble_central/ble_app_multilink_central/main.c",
+        "line": 1952,
+        "severity": "minor",
+        "claim": "WDT-origin 標記選用 GPREGRET2=0x02（→ last_err=0xFF02），與既有 SDK-assert 標記 0xFF02（main.c:1898）碰撞；handler 註解宣稱的『獨特標記』不成立。",
+        "failure_scenario": "WDT reset 後 DIAG 顯示 last_err=0xFF02，與 nrf_assert 失敗無法單靠 last_err 區分；須額外核對 RESETREAS DOG 位元與 fault record 是否存在（WDT 路徑不寫 record、fault_id 為 0）。判讀規則若只看 last_err 對照表會誤判為 SDK assert。"
+      },
+      {
+        "lens": "build-safety",
+        "file": "app/device_source.py",
+        "line": 1315,
+        "severity": "minor",
+        "claim": "PC 端 _on_line 只對 startswith(\"DIAG:\") 的行寫 dongle_runtime.log，新韌體的 \"DIAG2:\" 行（err/line/file/hfsr/cfsr/bfar/mmfar）不符合該前綴，不會被記錄。",
+        "failure_scenario": "故障重現時 PC App 正佔用 COM port（使用者無法同時開終端機），DIAG2 的 SCB 故障暫存器與 err/line 資訊全數遺失，只剩 DIAG 行的 fault_pc/fault_id/fault_info/n（主診斷欄位仍在，故為 minor）。修法：把條件放寬為 startswith(\"DIAG\")。"
+      },
+      {
+        "lens": "semantics",
+        "file": "PTU_to_Azure/NRF52840-DONGLE/Rpi_USB_BLE/examples/ble_central/ble_app_multilink_central/main.c",
+        "line": 1952,
+        "severity": "major",
+        "claim": "WDT reset marker collides with SDK assert marker: wdt_event_handler writes GPREGRET=0xFF/GPREGRET2=0x02, producing last_err=0xFF02, which is exactly the code app_error_fault_handler writes for NRF_FAULT_ID_SDK_ASSERT (main.c:1898). The comment claims 0xFF02 means 'reset was watchdog-triggered' — that is a lie whenever an nrf_assert fires.",
+        "failure_scenario": "An nrf_assert (SDK assert) fires during unattended recording -> NVIC_SystemReset -> next boot DIAG shows last_err=0xFF02. Operator following the wdt_event_handler comment (and MEMORY.md's validation rule '看門狗生效=last_err=0xFF02') concludes the watchdog fired and the wedge-recovery works, when actually the firmware has an assert bug. Disambiguation requires cross-checking RESETREAS DOG(0x02) vs SREQ(0x04), which the marker documentation does not state. A unique value (e.g. 0xFF05, since 0xFF01-0xFF04 are taken) would remove the ambiguity."
+      },
+      {
+        "lens": "semantics",
+        "file": "app/device_source.py",
+        "line": 1315,
+        "severity": "major",
+        "claim": "PC persists only lines starting exactly with 'DIAG:'. The new 'DIAG2:' line ('DIAG2:'[:5] != 'DIAG:') and all new 'WARN:*' / 'ERROR:SCAN START' / 'ERROR:SCAN RESUME' lines fall through _on_line and are discarded unless verbose scan-debug is on — the detailed fault data (err/line/file/hfsr/cfsr/bfar/mmfar) and the demoted-error reports never reach the persistent dongle runtime log.",
+        "failure_scenario": "Overnight fault -> reboot -> firmware emits DIAG (logged) + DIAG2 (dropped). Engineer inspecting logs/ gets fault_pc but loses line/file/CFSR/BFAR — the exact fields the patch was added to capture. Worse: a persistent SDK error demoted from APP_ERROR_CHECK to 'WARN:...' (e.g. NRF_ERROR_NO_MEM on conn_param_update) now leaves zero persisted evidence, whereas before the patch it reset the chip and left last_err in the next boot's DIAG line. Verified read-only against both HEAD and working tree; caveat: device_source.py is being modified by another workflow, but its current diff does not touch DIAG handling."
+      },
+      {
+        "lens": "semantics",
+        "file": "PTU_to_Azure/NRF52840-DONGLE/Rpi_USB_BLE/flash_app_sectorerase.ps1",
+        "line": 21,
+        "severity": "major",
+        "claim": "The checked-in build artifacts are stale: _build/nrf52840_xxaa.hex and .map are dated 2026-07-21 16:07 and contain zero fault_record_store symbols (map grep = 0), while main.c (2026-07-28 15:32) and the uvprojx IRAM1 shrink to 0x28000 (2026-07-28 15:14) postdate them. The flash script hard-codes this stale hex, and the map contradicts the patch's safety comment: RW_IRAM1 shows Max 0x00030000 (region extends to 0x20040000, containing 0x20038000), not the claimed 0x28000.",
+        "failure_scenario": "Running flash_app_sectorerase.ps1 today deploys firmware with the WDT change but WITHOUT the fault-record/DIAG2/APP_ERROR_CHECK patch: after the next fault, DIAG stays in the old short format, the operator concludes 'no fault details recorded', and the entire 07-28 diagnostic patch is silently absent from the device. Additionally the C code has never been through a compiler since the edit, so even compile-level correctness is unverified (NRF_DRV_WDT_DEAFULT_CONFIG was checked — it is the SDK's real macro name — but nothing else has link-level proof)."
+      },
+      {
+        "lens": "semantics",
+        "file": "PTU_to_Azure/NRF52840-DONGLE/Rpi_USB_BLE/examples/ble_central/ble_app_multilink_central/main.c",
+        "line": 1984,
+        "severity": "minor",
+        "claim": "Single-slot record + read-and-clear-magic-at-boot loses the root-cause fault in the consecutive-two-faults scenario: the boot snapshot lives in ZI statics that are wiped by the next reset, and the record is only transmitted much later (first_message_timer after USB enumeration), so a second fault before transmission permanently destroys the first fault's pc/CFSR.",
+        "failure_scenario": "Fault A (e.g. MEMACC with the diagnostic pc) -> reset -> boot #2 reads A into m_fault_*, clears magic -> during init, secondary fault B (e.g. NO_MEM in nrf_sdh_ble_enable) fires before first_message_timer -> fault_record_store overwrites the slot with B -> reset wipes the A snapshot -> boot #3 reports only B. The root-cause pc of A is unrecoverable; only n=2 hints that something preceded B. In a crash-loop faster than USB enumeration, no DIAG/DIAG2 is ever transmitted at all and only the last fault survives when the loop breaks."
+      },
+      {
+        "lens": "semantics",
+        "file": "PTU_to_Azure/NRF52840-DONGLE/Rpi_USB_BLE/examples/ble_central/ble_app_multilink_central/main.c",
+        "line": 134,
+        "severity": "minor",
+        "claim": "UNCONFIRMED: whether a resident bootloader (Nordic Open Bootloader at 0xE0000, standard on retail nRF52840 dongles) survives the sector-erase flash flow and clobbers 0x20038000-0x2003803F during its brief run on every reset could not be verified from the repo. The deploy path uses nrfjprog/J-Link (no DFU), and typical open-bootloader RAM usage (data near 0x20000008, MSP descending from 0x20040000) should miss the record by ~32KB, but no map/scatter for the actual on-device bootloader was available to check.",
+        "failure_scenario": "If the physical dongles retain a bootloader whose .bss/stack touches 0x20038000-0x2003803F, every reset invalidates or corrupts the record before the app reads it: magic mismatch -> m_fault_valid=false -> DIAG2 never prints and fault_pc reads 0, i.e. the mechanism silently reports 'no record' after every real fault. Needs one on-device check (write magic, reset, read back) to confirm."
+      },
+      {
+        "lens": "semantics",
+        "file": "PTU_to_Azure/NRF52840-DONGLE/Rpi_USB_BLE/examples/ble_central/ble_app_multilink_central/main.c",
+        "line": 1934,
+        "severity": "minor",
+        "claim": "HardFault_Handler's own doc-comment ('uses no stack data so it remains usable for the common stack-corruption case') is invalidated by the added fault_record_store() call: the call/prologue may push LR/registers onto the possibly-corrupt MSP, risking a derived fault -> LOCKUP instead of a clean SREQ reset.",
+        "failure_scenario": "Stack overflow into an invalid/protected region -> HardFault -> handler entry frame push happens to succeed but the extra prologue pushes from fault_record_store cross into the bad region -> second fault in handler mode -> ARM lockup -> LOCKUP reset. GPREGRET 0xFF04 is written first (mitigated, and acknowledged in the comment at line 1928), but the fault record is lost mid-write; the count/count_magic pair may also have been updated before magic, inflating n= by one for a single event. Impact is bounded, but the stale 'uses no stack data' comment should be corrected."
+      },
+      {
+        "lens": "semantics",
+        "file": "PTU_to_Azure/NRF52840-DONGLE/Rpi_USB_BLE/examples/ble_central/ble_app_multilink_central/main.c",
+        "line": 1617,
+        "severity": "minor",
+        "claim": "All 5 APP_ERROR_CHECK replacements pass through EVERY error code, not just the documented transient ones. Verified against the in-tree S140 headers: conn_param_update legitimately returns INVALID_STATE/BUSY (ble_gap.h:1987-1988), disconnect returns INVALID_STATE while tearing down (ble_gap.h:2014), phy_update returns INVALID_STATE/BUSY (ble_gap.h:2697,2701), scan_start returns RESOURCES with no free role slots (ble_gap.h:2571), and nrf_ble_scan_start really does swallow only INVALID_STATE (nrf_ble_scan.c:1134) — so the comments' claimed legal codes are accurate. But programming-error codes (NRF_ERROR_INVALID_ADDR/INVALID_PARAM/NO_MEM) are now demoted to one-shot WARN prints that the PC discards (see device_source.py finding), and a failed sd_ble_gap_phy_update response leaves the peer's LL PHY-request unanswered.",
+        "failure_scenario": "A misconfigured conn-param or a real NO_MEM condition fires on every conn_param_update_request: before the patch the chip reset once and the persistent DIAG line named the error code; after the patch the dongle prints WARN:CONN_PARAM_UPDATE forever over CDC, the PC never persists it, and the recurring defect becomes invisible in unattended operation. Secondary: if phy_update fails with NRF_ERROR_BUSY, the request is never answered and the peer may drop the link on LL procedure-response timeout (~40s) with no retry path — a degradation the WDT cannot catch because the main loop keeps spinning."
+      },
+      {
+        "lens": "repo-hygiene",
+        "file": "C:/Users/USER01/AppData/Local/Temp/claude/d--jerry-Python-PC-GIOSXTR-Demo/ea077680-aea7-457b-a39f-69f62f90c8d0/scratchpad/firmware-analysis.md",
+        "line": 200,
+        "severity": "minor",
+        "claim": "Hunk accounting gap: report says the non-tabled hunks are '+77, +1038, +2034, +2051' (all 2026-07-21 WDT work), but actual `git diff --unified=0` also contains hunk +1941,14 (the whole `wdt_event_handler` function, main.c:1941-1954) which appears in neither the applied-changes table nor the 07-21 list; also line 117 (`m_wdt_channel`, WDT-related) sits inside the range 117-206 labeled entirely as 'fault record region'.",
+        "failure_scenario": "Anyone using the report's hunk list to split the working tree into two commits (07-21 WDT vs this diagnostic patch), or to revert one of them, will misplace wdt_event_handler: reverting 'this patch' by exclusion strands the handler that nrf_drv_wdt_init(main.c:2044) references, or a WDT-only commit omits it and the build breaks with an undefined callback."
+      },
+      {
+        "lens": "repo-hygiene",
+        "file": "PTU_to_Azure/NRF52840-DONGLE/Rpi_USB_BLE/examples/ble_central/ble_app_multilink_central/main.c",
+        "line": 1952,
+        "severity": "minor",
+        "claim": "wdt_event_handler writes GPREGRET=0xFF/GPREGRET2=0x02 so the next boot reports last_err=0xFF02, but 0xFF02 is already the code app_error_fault_handler assigns to NRF_FAULT_ID_SDK_ASSERT (main.c:1897); the in-code comment ('顯示 0xFF02 表示本次重置由看門狗觸發') presents it as a unique WDT marker, which it is not.",
+        "failure_scenario": "WDT actually fires (main-loop wedge, the exact bug this WDT exists for) -> next boot DIAG shows last_err=0xFF02 -> operator following the report's own §6 lookup table diagnoses an SDK ASSERT() failure and hunts a nonexistent assert; the only disambiguator is the RESETREAS DOG bit, which the misleading comment steers readers away from checking. Report A1 mentions the semantic overlap but the code comment asserting uniqueness remains wrong."
+      },
+      {
+        "lens": "repo-hygiene",
+        "file": "C:/Users/USER01/AppData/Local/Temp/claude/d--jerry-Python-PC-GIOSXTR-Demo/ea077680-aea7-457b-a39f-69f62f90c8d0/scratchpad/firmware-analysis.md",
+        "line": 233,
+        "severity": "minor",
+        "claim": "The 'nothing else touched' cross-check cites stale evidence: it claims PC-side files were modified 14:46-14:48, 'earlier than main.c at 15:14'. Actual mtimes: app/device_source.py 15:43, app/windows/scan_panel.py 15:38 — both LATER than main.c (15:32, not 15:14; 15:14 is the uvprojx) and later than the report itself (15:37). Also 'map:10082' is actually map:10084 (the 38088 figure itself is correct).",
+        "failure_scenario": "A verifier re-running the mtime cross-check gets the opposite ordering from what the report asserts and cannot use it to prove the firmware task didn't touch PC-side files; the attribution to 'another agent' is now unsupported by the cited evidence (the timestamps were overwritten by later PC-side edits after the report was written and never re-verified)."
+      },
+      {
+        "lens": "repo-hygiene",
+        "file": "PTU_to_Azure/NRF52840-DONGLE/Rpi_USB_BLE/examples/ble_central/ble_app_multilink_central/main.c",
+        "line": 1211,
+        "severity": "minor",
+        "claim": "scan_start()'s new no-reset failure path (report §2.1) leaves the dongle alive but permanently not scanning until the PC re-issues AT+SCAN, and the emitted 'ERROR:SCAN START 0x%04X' line is parsed nowhere in app/device_source.py (grep for 'ERROR:SCAN' finds no handler).",
+        "failure_scenario": "Unattended recording: device disconnects -> scan_start() hits transient NRF_ERROR_RESOURCES -> m_scanning=false, no firmware-side retry timer. Previously the chip reset and USB re-enumeration triggered the PC's never-give-up reconnect; now recovery depends entirely on the PC-side reconnect loop eventually sending another AT+SCAN. If that loop only reacts to port loss (which no longer occurs), the device stays unrecorded silently. Mitigated only if the V1.0.26 reconnect cycle re-issues AT+SCAN on data-gap, which was not verified in this review."
+      }
+    ],
+    "attack_paths": [
+      {
+        "lens": "build-safety",
+        "tried": [
+          "armcc AC5 C90/C99 相容性：確認 uvprojx <uC99>1</uC99>（target 層）、per-file uC99=2（繼承）；mid-function 宣告、中文/emoji 註解、legacy WDT API 已由 Jul 21 的實際 build 產物（main.d/nrfx_wdt.d/hex 同時刻）證明可編譯；新增碼逐行檢查宣告位置、識別字碰撞（m_fault_*、fault_record_store 無重複）、prototype-before-use（usb_printf 在 main.c:97）",
+          "標頭與型別存在性：assert_info_t/error_info_t 於 components/libraries/util/app_error.h:93（main.c:85 已 include）；SCB 經既有 NVIC_SystemReset 證明 core_cm4.h 在 scope；NRF_DRV_WDT_DEAFULT_CONFIG（SDK 原廠拼錯字）與全部 nrf_drv_wdt_* 別名在 integration/nrfx/legacy/nrf_drv_wdt.h:62-95 確認；NRFX_WDT_ENABLED/WDT_ENABLED=1、NO_IRQ=0、IRQ_PRIORITY=6（app 合法）",
+          "uvprojx XML 結構：以 xml.etree.ElementTree 實際解析通過；兩個 target 的 OCR_RVCT9 逐一讀出（nrf52840_xxaa=0x20010000/0x28000，flash_s140=0x200043A8/0x3BC58）；IRAM2(OCR_RVCT10) 確認為空；umfTarg=1 + 空 ScatterFile 確認 rebuild 時 scatter 由 dialog 值重生；nrfx_wdt.c 已加入兩個 target 的檔案清單",
+          "IRAM1 縮小與 .map 實算：region 末端 0x20010000+0x28000=0x20038000（exclusive），FAULT_RECORD 0x20038000-0x2003803F 恰好完全在區外（fault_record_t 手算 16 words=64B）；map 檔 RW+ZI 總量 38,088B=0x94C8（含 STACK 0x2000 於 0x200174C8，__initial_sp=0x200194C8，__HEAP_SIZE=0）→ 塞進 0x28000 有 ~4 倍餘裕，新增 statics ~60B 不影響；發現 _build 產物全為 Jul 21（本 patch 從未編譯，_build/nrf52840_xxaa.sct 仍是 0x30000 舊值——驗證步驟已含 Rebuild）",
+          "其他 target/scatter 引用舊值：第二 target flash_s140_nrf52_7.2.0_softdevice 的 IRAM 涵蓋 0x20038000 且其 Groups 實際含 main.c（推翻分析文件『不編譯 main.c』宣稱）→ 列為 finding；確認其 OutputName/OutputDirectory 與 flash_app_sectorerase.ps1 讀的 _build/nrf52840_xxaa.hex 不同路徑，無 hex 覆寫攻擊面",
+          "printf/usb_printf 格式符逐一對數：DIAG 11:11、DIAG2 7:7、WARN:CONN_PARAM_UPDATE/PHY_UPDATE/GATTC/GATTS 各 2:2、ERROR:SCAN START/RESUME 各 1:1；%lX/%lu 實參全部有 (unsigned long) cast，%u 收 uint16_t（int promotion 安全），%04X 收 uint32_t（AC5 unsigned int 精確匹配）；usb_printf 底層 microlib vsnprintf（useUlib=1）支援 l modifier，既有 %08lX 為先例；最長 DIAG 行 ~140 字元 < MAX_LOG_LENGTH 384",
+          "Fault handler 呼叫鏈：app_error_fault_handler→fault_record_store 為純 RAM/暫存器寫入 leaf，無 sd_* SVC（符合 nrf_sdm.h:281 HardFault-context 限制）、無 printf、MEMACC 路徑不解參考 info；magic 最後寫入的順序正確；HardFault_Handler 的 6 參數呼叫壓堆疊（finding）；wdt_event_handler 直寫受限週邊 POWER（finding）；0xFF02 標記碰撞（finding）",
+          "PC 端相容性：app/device_source.py _on_line 對 DIAG 行僅原樣寫 log（附加欄位相容），但 DIAG2 前綴不匹配 startswith(\"DIAG:\")（finding）；WARN:/ERROR: 新行不撞 _CONNECTED/SCAN 收集 regex"
+        ]
+      },
+      {
+        "lens": "semantics",
+        "tried": [
+          "Per-site audit of all 5 APP_ERROR_CHECK replacements against the in-tree S140 7.2 headers (ble_gap.h retval lists) and nrf_ble_scan.c source — the comments' claimed legal codes (INVALID_STATE/BUSY/RESOURCES) are all documented and accurate; the defect found is over-broad pass-through plus PC-side non-persistence, not wrong code lists.",
+          "fault_record_store write ordering and pre-SREQ completion: volatile pointer guarantees compiler ordering, magic written last, CMSIS NVIC_SystemReset executes __DSB() before the AIRCR write, Cortex-M4 has no data cache — no lost-write window found. Store is called before GPREGRET writes and before NVIC_SystemReset in app_error_fault_handler (main.c:1911-1916); in HardFault_Handler GPREGRET is written first as a fallback.",
+          "Double-fault mid-store: a second fault between magic=0 and magic=MAGIC leaves the record invalid-by-design (magic-last), but count/count_magic are updated before magic, so n= can double-count a cascading single event (folded into HardFault finding).",
+          "Boot read-report-clear ordering under consecutive faults: traced main() (reads+clears magic at main.c:1969-1984, before USB init) vs first_message_timer transmission — confirmed root-cause record loss scenario (reported).",
+          "DIAG appended fields + DIAG2 vs PC parser (read-only; PC under another workflow): DIAG regex-free logging is append-safe; DIAG2/WARN/ERROR lines cannot match _SCAN_LINE (^\\d+:), _SCAN_EVENT_LINE, _CONNECTED, _DISCONNECTED, or _CONNECT_ERROR_PREFIXES ('ERROR:SCAN...' does not prefix-match 'ERROR:CONN'), so no crash or connect-future misfire — but DIAG2/WARN/ERROR are silently discarded (reported). Confirmed the concurrent PC workflow diff does not touch DIAG handling.",
+          "Bootloader/DFU clearing 0x20038000: deploy path is nrfjprog sector-erase of app hex (no DFU); open-bootloader RAM layout could not be verified from repo — marked unconfirmed. Also checked GPREGRET DFU-trigger collision: fault markers use 0xFF, not the bootloader's 0xB1 magic — no accidental DFU entry.",
+          "RAM/GPREGRET retention across reset types: nRF52 GPREGRET and RAM retained across SREQ and WDT resets (cleared only on power loss) — mechanism assumptions hold; RESETREAS is cleared each boot (main.c:1962) so DOG vs SREQ disambiguation for the 0xFF02 collision works if the reader knows to use it.",
+          "n= counter overflow/garbage: uint32 wrap needs 2^32 faults (unreachable); power-on RAM garbage matching count_magic is a 2^-32 event — no practical issue. Noted display semantics: n= shows 0 on any boot not preceded by a fault even though the RAM counter persists.",
+          "Linker/stack collision with 0x20038000: map shows __initial_sp=0x200194C8 and RW_IRAM1 allocation ends at 0x200194C8, far below the record — but the map also shows Max 0x30000, proving the checked-in binary predates the IRAM1 shrink (stale-artifact finding).",
+          "usb_printf truncation of extended DIAG/DIAG2 lines: MAX_LOG_LENGTH=384 vs ~110-140 char lines, TX ring 4096 — no truncation. scan_resume_fast's usb_printf runs in the same SoftDevice callback context as pre-existing prints — no new stack risk beyond the already-mitigated pattern.",
+          "WDT config semantics: NRFX_WDT/WDT_ENABLED=1, reload 15000ms, BEHAVIOUR=1 (runs during sd_app_evt_wait sleep — no false trigger on idle), IRQ priority 6, keeper timer wakes CPU every 2s (7.5x margin) — feed/timeout logic sound; wedge-in-higher-priority-ISR loses the GPREGRET marker but RESETREAS DOG bit still records the cause."
+        ]
+      },
+      {
+        "lens": "repo-hygiene",
+        "tried": [
+          "git status + git diff --stat in nested repo PTU_to_Azure/NRF52840-DONGLE/Rpi_USB_BLE: enumerated all 14 modified + 1 untracked file; cross-checked mtimes to attribute each to this patch (main.c 15:32, uvprojx 15:14) vs 07-21 leftovers (sdk_config.h, uvoptx, uvguix, JLinkLog.txt, all _build/* at 07-21) — attribution holds",
+          "sdk_config.h diff: verified NRFX_WDT_ENABLED=1, WDT_ENABLED=1, both reload values 15000 still present (07-21 WDT change preserved, not reverted by patch)",
+          "main.c full diff hunk-by-hunk: checked every hunk for changes unrelated to the diagnosis/5-fix plan — all hunks map to fault-record diagnostics, the 5 APP_ERROR_CHECK fixes, 2 bounds checks, DIAG extension, or 07-21 WDT work; found the unattributed wdt_event_handler hunk and the 0xFF02 marker collision",
+          "07-21 WDT integrity: main-loop feed at main.c:2050, wdt init at 2044, scan_resume_fast guard preserved, nrfx_wdt.c added to both uvprojx targets, uvoptx changes are pure mechanical renumbering from that file addition",
+          "uvprojx diff: only IRAM1 0x30000->0x28000 plus the two 07-21 nrfx_wdt.c entries; verified 0x20010000+0x28000=0x20038000 matches FAULT_RECORD_ADDR and record end 0x20038040 < 0x20040000 RAM top",
+          "Report line-number audit (20+ spots): main.c 117/206/1202/1214/1584/1590/1619/1624/1635/1640/1650/1655/1665/1669/1765/1770/1823/1844/1885/1912/1928/1934/1967/1985 all match claimed content; file is 2802 lines as claimed; uvprojx:304, sdk_config 250/4948/6275/11603/11610, map 8364/8913/9942 verified; map:10082 off by 2 (10084)",
+          "Fault-ID table verification against SDK headers (suspected swap of SDK_ERROR/SDK_ASSERT): app_error.h:74-75 confirms SDK_ERROR=0x4001, SDK_ASSERT=0x4002 — report table is CORRECT, attack failed",
+          "nrf_ble_scan.c claims: confirmed module self-re-arms scanner after evt handler (UNUSED_RETURN_VALUE sd_ble_gap_scan_start) and nrf_ble_scan_start swallows only NRF_ERROR_INVALID_STATE — report citations accurate",
+          "WDT 15s feed premise: m_200b_keeper_timer is REPEATED, 2000ms, started in main() before the loop (main.c:2023) — safety argument for unconditional feed holds",
+          "printf format-specifier vs argument counts for new DIAG (11:11), DIAG2 (7:7), 4x WARN (2:2), ERROR:SCAN (1:1) — all match; bounds check uses correct array size m_device_rssi[NRF_SDH_BLE_CENTRAL_LINK_COUNT]",
+          "Stale-build check: _build/nrf52840_xxaa.sct still contains RW_IRAM1 0x30000 and hex/axf are dated 07-21 — flashed artifact does NOT contain this patch, consistent with report's mandatory rebuild step 1 (not a finding, but confirmed)",
+          "Main repo hygiene: .gitignore mtime 07-21 (its 1-line diff adds PTU_to_Azure/NRF52840-DONGLE.rar, pre-session), PTU_to_Azure/ exists and remains untracked — untouched as claimed",
+          "PC-side mtime cross-check replication: report's 14:46-14:48-before-15:14 ordering does not reproduce (files now 15:38/15:43, after main.c 15:32) — finding 3",
+          "Checked whether PC app parses the new ERROR:SCAN START line (grep app/device_source.py) — it does not; finding 4"
+        ]
+      }
+    ],
+    "dead_lenses": []
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Verify"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "fw:build-safety",
+      "phaseIndex": 1,
+      "phaseTitle": "Verify",
+      "agentId": "a758049a2a7e54349",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1785224410620,
+      "queuedAt": 1785224410605,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "undefined\n\n## 你的 lens：build-safety\nBuild 安全：這包 patch 拿去 Keil 編會不會炸、燒進去會不會更糟。攻擊點：armcc(AC5) 相容性（C90/C99 模式下宣告位置、__attribute__ vs #pragma、inline 語法）；uvprojx XML 結構是否仍合法、IRAM1 base+size 實算（用 .map 檔與 uvprojx 原值核對：縮小後 0x20038000 是否真的在 execution region 外、既有 RW+ZI+STACK+HEAP 總量塞不塞得進縮小後的 IRAM1、有無其他 target/scatter 引用舊值）；printf/usb_printf 格式符與實參型別逐一對數（%lX vs uint32_t 在 AC5）；fault handler 內呼叫鏈的 stack 深度與是否呼叫…",
+      "lastProgressAt": 1785225096246,
+      "tokens": 117643,
+      "toolCalls": 27,
+      "durationMs": 685626,
+      "resultPreview": "{\"findings\":[{\"file\":\"PTU_to_Azure/NRF52840-DONGLE/Rpi_USB_BLE/examples/ble_central/ble_app_multilink_central/pca10056/s140/arm5_no_packs/ble_app_multilink_central_pca10056_s140.uvprojx\",\"line\":3951,\"severity\":\"minor\",\"claim\":\"第二個 target `flash_s140_nrf52_7.2.0_softdevice` 的 IRAM1 仍是 0x200043A8+0x3BC58（末端 0x20040000，涵蓋 FAULT_RECORD_ADDR 0x20038000），且該 target 的 Groups 內確實含 main.c（uvprojx:4035，無 Inc…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "fw:semantics",
+      "phaseIndex": 1,
+      "phaseTitle": "Verify",
+      "agentId": "af446fd7261940281",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1785224410621,
+      "queuedAt": 1785224410605,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "undefined\n\n## 你的 lens：semantics\n語意：診斷機制與 5 處修法會不會說謊或誤吞。攻擊點：5 處 APP_ERROR_CHECK 替換是否只放行文件明載的合法錯誤碼、還是連真 fault 也吞掉（逐處對照 nRF5 SDK/S140 文件行為，不確定的標未確認）；fault_record_store 在 app_error_fault_handler 的呼叫時序（存檔是否在任何可能二次 fault 的動作之前、SREQ 前是否保證寫完—記憶體屏障/volatile）；開機讀取-回報-清 magic 的順序在「連續兩次 fault」情境下會不會丟資料；DIAG 行附加欄位與新 DIAG2 行 vs PC 端 app/device_source.py 的 DIAG 解析（會不會讓 PC 端炸掉或誤判；PC 端正被另一 workflow 改，唯讀查看即可並註記此 ca…",
+      "lastProgressAt": 1785225079557,
+      "tokens": 102641,
+      "toolCalls": 37,
+      "durationMs": 668936,
+      "resultPreview": "{\"findings\":[{\"file\":\"PTU_to_Azure/NRF52840-DONGLE/Rpi_USB_BLE/examples/ble_central/ble_app_multilink_central/main.c\",\"line\":1952,\"severity\":\"major\",\"claim\":\"WDT reset marker collides with SDK assert marker: wdt_event_handler writes GPREGRET=0xFF/GPREGRET2=0x02, producing last_err=0xFF02, which is exactly the code app_error_fault_handler writes for NRF_FAULT_ID_SDK_ASSERT (main.c:1898). The commen…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "fw:repo-hygiene",
+      "phaseIndex": 1,
+      "phaseTitle": "Verify",
+      "agentId": "ad55ddba0160a01f9",
+      "model": "claude-fable-5",
+      "state": "done",
+      "startedAt": 1785224410621,
+      "queuedAt": 1785224410605,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "promptPreview": "undefined\n\n## 你的 lens：repo-hygiene\nRepo 衛生與回歸：在巢狀 repo（PTU_to_Azure\\\\NRF52840-DONGLE\\\\Rpi_USB_BLE）跑 git status 與 git diff --stat，攻擊點：改動是否只落在 main.c 與該 uvprojx（其他被動到的檔案都是 finding）；2026-07-21 的 WDT 相關改動（sdk_config 的 NRFX_WDT_ENABLED/WDT_ENABLED、主迴圈餵狗、scan_resume_fast 檢查）是否原樣保留未被此次 patch 破壞；main.c 的 diff 逐塊看有無與診斷/5 處修法無關的意外改動；主 repo 的 .gitignore 與 PTU_to_Azure/ 存在性未被動過；報告 firmware-analysis.md 中宣稱的行號抽…",
+      "lastProgressAt": 1785224836878,
+      "tokens": 80005,
+      "toolCalls": 21,
+      "durationMs": 426257,
+      "resultPreview": "{\"findings\":[{\"file\":\"C:/Users/USER01/AppData/Local/Temp/claude/d--jerry-Python-PC-GIOSXTR-Demo/ea077680-aea7-457b-a39f-69f62f90c8d0/scratchpad/firmware-analysis.md\",\"line\":200,\"severity\":\"minor\",\"claim\":\"Hunk accounting gap: report says the non-tabled hunks are '+77, +1038, +2034, +2051' (all 2026-07-21 WDT work), but actual `git diff --unified=0` also contains hunk +1941,14 (the whole `wdt_event…"
+    }
+  ],
+  "totalTokens": 300289,
+  "totalToolCalls": 85
+}

@@ -63,6 +63,22 @@ class WriteFailSerial(FakeSerial):
         raise OSError("simulated serial write failure")
 
 
+class FlakyWriteSerial(FakeSerial):
+    """Fail writes whose command starts with `fail_on`, `times` times, then heal."""
+
+    def __init__(self, fail_on: str, times: int = 1) -> None:
+        super().__init__()
+        self._fail_on = fail_on
+        self._times = times
+
+    def write(self, data: bytes) -> None:
+        text = data.decode("ascii").strip()
+        if self._times > 0 and text.startswith(self._fail_on):
+            self._times -= 1
+            raise OSError(f"simulated flaky write failure for {text}")
+        super().write(data)
+
+
 def _make_source_with_fake_serial() -> tuple[DongleSource, FakeSerial]:
     loop = asyncio.new_event_loop()
     serial = FakeSerial()
@@ -163,6 +179,28 @@ def test_mixed_text_and_binary_stream():
     assert received == [payload]
 
 
+def test_firmware_diagnostics_and_scan_warnings_are_persisted(monkeypatch):
+    src = _make_source()
+    persisted: list[str] = []
+    monkeypatch.setattr(ds, "_write_dongle_runtime_log", persisted.append)
+
+    for line in (
+        "DIAG: RESETREAS=0x00000004 last_err=0xFF03",
+        "DIAG2: err=0x00000000 cfsr=0x00000000",
+        "WARN:PHY_UPDATE handle=0 0x0008",
+        "ERROR:SCAN START 0x0013",
+        "UNRELATED LINE",
+    ):
+        src._on_line(line)  # type: ignore[attr-defined]
+
+    assert persisted == [
+        "firmware DIAG: RESETREAS=0x00000004 last_err=0xFF03",
+        "firmware DIAG2: err=0x00000000 cfsr=0x00000000",
+        "firmware WARN:PHY_UPDATE handle=0 0x0008",
+        "firmware ERROR:SCAN START 0x0013",
+    ]
+
+
 def test_connected_line_builds_devid_mapping():
     src = _make_source()
     src._on_line("CONNECTED handle=2 #7 GIOS0403ST#7 MAC=AA:BB:CC:01:10:90")  # type: ignore[attr-defined]
@@ -245,6 +283,61 @@ def test_reader_exception_disconnects_all_managers_and_marks_source_unready():
     assert isinstance(pending_disconnect.exception(), ConnectionError)
     assert readiness.status is not AdapterStatus.OK
     loop.close()
+
+
+def test_readiness_check_recovers_owned_dongle_after_reader_failure(monkeypatch):
+    source, serial = _make_source_with_fake_serial()
+    loop = source._loop  # type: ignore[attr-defined]
+    recovery_reasons: list[str] = []
+
+    class DeadReader:
+        @staticmethod
+        def is_alive() -> bool:
+            return False
+
+    source._owns_serial = True  # type: ignore[attr-defined]
+    source._running = False  # type: ignore[attr-defined]
+    source._needs_recovery = True  # type: ignore[attr-defined]
+    source._reader = DeadReader()  # type: ignore[attr-defined]
+
+    async def recover(reason: str) -> None:
+        recovery_reasons.append(reason)
+        serial.is_open = True
+        source._reader = _LiveReader()  # type: ignore[attr-defined]
+        source._running = True  # type: ignore[attr-defined]
+        source._needs_recovery = False  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(source, "recover", recover)
+
+    readiness = loop.run_until_complete(source.check_ready())
+
+    assert readiness.status is AdapterStatus.OK
+    assert recovery_reasons == [
+        "readiness check detected unavailable dongle transport"
+    ]
+    loop.close()
+
+
+def test_dongle_readiness_message_hides_raw_serial_error(monkeypatch):
+    source, _serial = _make_source_with_fake_serial()
+    runtime_messages: list[str] = []
+    monkeypatch.setattr(ds, "_write_dongle_runtime_log", runtime_messages.append)
+
+    title, body = source.readiness_error_message(
+        ds.AdapterCheckResult(
+            AdapterStatus.NO_ADAPTER,
+            "serial read failed on COM8: ClearCommError failed",
+        )
+    )
+
+    assert title == "Nordic dongle 無法使用"
+    assert "COM8" not in body
+    assert "ClearCommError" not in body
+    assert "serial read failed" not in body
+    assert runtime_messages == [
+        "readiness unavailable: serial read failed on COM8: ClearCommError failed"
+    ]
+    source._loop.close()  # type: ignore[attr-defined]
 
 
 def test_serial_write_exception_fails_connect_immediately_and_marks_recovery():
@@ -781,4 +874,348 @@ def test_prepare_reconnect_sends_per_device_disc_before_at_conn():
     assert serial.writes == [f"AT+DISC={mac}"]
     # The disconnect timestamp is recorded so the following AT+CONN settles.
     assert src._last_disconnect_monotonic is not None  # type: ignore[attr-defined]
+    loop.close()
+
+
+# ---------------------------------------------------------------------------
+# Scan-transaction fault tolerance (transport death mid-scan, coalesced
+# recovery, bounded automatic retry).
+# ---------------------------------------------------------------------------
+
+
+def test_scan_aborts_before_at_stop_when_transport_dies_in_window():
+    # Transport dies during the 5s advertisement window: the old transaction
+    # must abort BEFORE sending AT+STOP, then recovery + a full retry succeed
+    # within the same scan() call.
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+
+    async def drive():
+        task = loop.create_task(src.scan(timeout=0.3))
+        while "AT+SCAN" not in serial.writes:
+            await asyncio.sleep(0.01)
+        src._handle_transport_failure("simulated CDC death mid-window")  # type: ignore[attr-defined]
+        while "AT+LIST" not in serial.writes:
+            await asyncio.sleep(0.01)
+        src._on_line("SCAN LIST: 0")  # type: ignore[attr-defined]
+        return await task
+
+    results = loop.run_until_complete(asyncio.wait_for(drive(), timeout=5))
+
+    assert results == []
+    # Attempt 1 was aborted before AT+STOP; attempt 2 ran the full transaction.
+    assert serial.writes == ["AT+SCAN", "AT+SCAN", "AT+STOP", "AT+LIST"]
+    assert src._needs_recovery is False  # type: ignore[attr-defined]
+    loop.close()
+
+
+def test_scan_checks_needs_recovery_flag_before_at_stop():
+    # Even with no exception and no generation change, a raised needs_recovery
+    # flag alone must abort the window before AT+STOP goes out.
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+
+    async def drive():
+        task = loop.create_task(src.scan(timeout=0.3))
+        while "AT+SCAN" not in serial.writes:
+            await asyncio.sleep(0.01)
+        src._needs_recovery = True  # type: ignore[attr-defined]
+        while "AT+LIST" not in serial.writes:
+            await asyncio.sleep(0.01)
+        src._on_line("SCAN LIST: 0")  # type: ignore[attr-defined]
+        return await task
+
+    results = loop.run_until_complete(asyncio.wait_for(drive(), timeout=5))
+
+    assert results == []
+    # Flag is checked before AT+STOP: attempt 1 stops at AT+SCAN.
+    assert serial.writes == ["AT+SCAN", "AT+SCAN", "AT+STOP", "AT+LIST"]
+    loop.close()
+
+
+def test_scan_send_failure_mid_transaction_recovers_and_retries():
+    # AT+STOP write blows up mid-transaction: the scan aborts, recovers, and
+    # the retry completes within the same scan() call.
+    loop = asyncio.new_event_loop()
+    serial = FlakyWriteSerial("AT+STOP", times=1)
+    src = DongleSource("TEST", loop, serial_port=serial, start_reader=False)
+
+    async def drive():
+        task = loop.create_task(src.scan(timeout=0.01))
+        while "AT+LIST" not in serial.writes:
+            await asyncio.sleep(0.01)
+        src._on_line("SCAN LIST: 0")  # type: ignore[attr-defined]
+        return await task
+
+    results = loop.run_until_complete(asyncio.wait_for(drive(), timeout=5))
+
+    assert results == []
+    assert serial.writes == ["AT+SCAN", "AT+SCAN", "AT+STOP", "AT+LIST"]
+    assert src._needs_recovery is False  # type: ignore[attr-defined]
+    loop.close()
+
+
+def test_scan_gives_up_after_one_retry():
+    # Both attempts abort -> exactly two AT+SCAN, then a friendly-message
+    # failure (no infinite retry loop).
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+
+    async def drive():
+        task = loop.create_task(src.scan(timeout=0.3))
+        for expected_scans in (1, 2):
+            while serial.writes.count("AT+SCAN") < expected_scans:
+                await asyncio.sleep(0.01)
+            # Recovery on an injected serial port does not restart the reader,
+            # so re-arm _running to let the failure handler run again.
+            src._running = True  # type: ignore[attr-defined]
+            src._handle_transport_failure(  # type: ignore[attr-defined]
+                f"simulated death #{expected_scans}"
+            )
+        with pytest.raises(ds.DongleTransactionAborted) as excinfo:
+            await task
+        return excinfo.value
+
+    exc = loop.run_until_complete(asyncio.wait_for(drive(), timeout=5))
+
+    assert serial.writes.count("AT+SCAN") == 2
+    assert "AT+STOP" not in serial.writes
+    assert exc.user_message == ds._SCAN_UNAVAILABLE_MESSAGE
+    loop.close()
+
+
+def test_scan_raises_recovery_failed_message_when_recovery_fails(monkeypatch):
+    # When recovery itself fails, the scan gives up immediately (no second
+    # attempt) and surfaces the recovery-failed message without serial jargon.
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    src._owns_serial = True  # type: ignore[attr-defined]
+    monkeypatch.setattr(ds, "_DONGLE_POST_RESET_SETTLE_SECONDS", 0.0)
+
+    def reopen_fails() -> None:
+        raise OSError("simulated reopen failure")
+
+    monkeypatch.setattr(src, "_reopen_serial", reopen_fails)
+
+    async def drive():
+        task = loop.create_task(src.scan(timeout=0.3))
+        while "AT+SCAN" not in serial.writes:
+            await asyncio.sleep(0.01)
+        src._handle_transport_failure("simulated death in window")  # type: ignore[attr-defined]
+        with pytest.raises(ds.DongleTransactionAborted) as excinfo:
+            await task
+        return excinfo.value
+
+    exc = loop.run_until_complete(asyncio.wait_for(drive(), timeout=5))
+
+    assert exc.user_message == ds._SCAN_RECOVERY_FAILED_MESSAGE
+    assert "serial" not in exc.user_message
+    assert src._needs_recovery is True  # type: ignore[attr-defined]
+    assert serial.writes.count("AT+SCAN") == 1  # no second attempt burned
+    loop.close()
+
+
+def test_at_list_timeout_without_lines_aborts_and_retries(monkeypatch):
+    # AT+LIST completely silent (no header, no lines): transport is suspect,
+    # the scan aborts and the retry succeeds.
+    monkeypatch.setattr(ds, "_DONGLE_SCAN_LIST_TIMEOUT_SECONDS", 0.1)
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+
+    async def drive():
+        task = loop.create_task(src.scan(timeout=0.01))
+        while serial.writes.count("AT+LIST") < 2:
+            await asyncio.sleep(0.005)
+        src._on_line("SCAN LIST: 0")  # type: ignore[attr-defined]
+        return await task
+
+    results = loop.run_until_complete(asyncio.wait_for(drive(), timeout=5))
+
+    assert results == []
+    assert serial.writes.count("AT+SCAN") == 2  # the retry actually happened
+    assert src._needs_recovery is False  # type: ignore[attr-defined]
+    loop.close()
+
+
+def test_at_list_timeout_with_live_lines_returns_partial_results(monkeypatch):
+    # AT+LIST unanswered, but FOUND lines arrived during the window: keep the
+    # lenient behaviour (return partial results, no retry).
+    monkeypatch.setattr(ds, "_DONGLE_SCAN_LIST_TIMEOUT_SECONDS", 0.05)
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+
+    async def drive():
+        task = loop.create_task(src.scan(timeout=0.05))
+        while "AT+SCAN" not in serial.writes:
+            await asyncio.sleep(0.005)
+        src._on_line("FOUND 1: #7 GIOS0403ST RSSI=-60 MAC=AA:BB:CC:01:10:90")  # type: ignore[attr-defined]
+        return await task
+
+    results = loop.run_until_complete(asyncio.wait_for(drive(), timeout=5))
+
+    assert [result.address for result in results] == ["AA:BB:CC:01:10:90"]
+    assert serial.writes.count("AT+SCAN") == 1  # no retry
+    assert src._needs_recovery is False  # type: ignore[attr-defined]
+    loop.close()
+
+
+def test_at_list_timeout_with_header_but_no_rows_is_lenient(monkeypatch):
+    # The "SCAN LIST:" header arrived but the rows were lost: the firmware is
+    # alive, so the narrow silent-timeout condition must NOT trigger a retry.
+    monkeypatch.setattr(ds, "_DONGLE_SCAN_LIST_TIMEOUT_SECONDS", 0.1)
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+
+    async def drive():
+        task = loop.create_task(src.scan(timeout=0.01))
+        while "AT+LIST" not in serial.writes:
+            await asyncio.sleep(0.005)
+        src._on_line("SCAN LIST: 2")  # type: ignore[attr-defined]
+        return await task
+
+    results = loop.run_until_complete(asyncio.wait_for(drive(), timeout=5))
+
+    assert results == []
+    assert serial.writes.count("AT+SCAN") == 1  # no retry
+    assert src._needs_recovery is False  # type: ignore[attr-defined]
+    loop.close()
+
+
+def test_concurrent_ensure_recovered_triggers_reset_only_once():
+    src, _serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    reset_calls: list[int] = []
+    original_reset = src._reset_link_state  # type: ignore[attr-defined]
+
+    def counting_reset() -> None:
+        reset_calls.append(1)
+        original_reset()
+
+    src._reset_link_state = counting_reset  # type: ignore[method-assign]
+    src._needs_recovery = True  # type: ignore[attr-defined]
+
+    async def drive() -> None:
+        await asyncio.gather(
+            src._ensure_recovered("a"),  # type: ignore[attr-defined]
+            src._ensure_recovered("b"),  # type: ignore[attr-defined]
+        )
+
+    loop.run_until_complete(drive())
+
+    assert len(reset_calls) == 1
+    assert src._needs_recovery is False  # type: ignore[attr-defined]
+    loop.close()
+
+
+def test_direct_concurrent_recover_calls_coalesce(monkeypatch):
+    # The coalescing guard lives in recover() itself, so even direct callers
+    # (e.g. _handle_stream_stale) are covered: one physical reset serves both.
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    src._owns_serial = True  # type: ignore[attr-defined]
+    monkeypatch.setattr(ds, "_DONGLE_POST_RESET_SETTLE_SECONDS", 0.0)
+    reset_calls: list[int] = []
+    original_reset = src._reset_link_state  # type: ignore[attr-defined]
+
+    def counting_reset() -> None:
+        reset_calls.append(1)
+        original_reset()
+
+    monkeypatch.setattr(src, "_reset_link_state", counting_reset)
+
+    def reopen_ok() -> None:
+        serial.is_open = True
+        src._reader = _LiveReader()  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(src, "_reopen_serial", reopen_ok)
+
+    async def probe_ok() -> bool:
+        return True
+
+    monkeypatch.setattr(src, "_probe_firmware_alive", probe_ok)
+
+    async def drive() -> None:
+        await asyncio.gather(src.recover("a"), src.recover("b"))
+
+    loop.run_until_complete(drive())
+
+    assert len(reset_calls) == 1
+    assert src._needs_recovery is False  # type: ignore[attr-defined]
+    loop.close()
+
+
+def test_send_command_refused_during_recovery():
+    src, serial = _make_source_with_fake_serial()
+    src._recovering = True  # type: ignore[attr-defined]
+
+    with pytest.raises(ds.DongleTransactionAborted):
+        src._send_command("AT+CONN=AA:BB:CC:01:10:90")  # type: ignore[attr-defined]
+
+    assert serial.writes == []
+    assert src._needs_recovery is False  # refusal must not flag recovery  # type: ignore[attr-defined]
+
+    src._send_command("AT+STATUS", allow_during_recovery=True)  # type: ignore[attr-defined]
+    assert serial.writes == ["AT+STATUS"]
+    src._loop.close()  # type: ignore[attr-defined]
+
+
+def test_scan_retry_serializes_ahead_of_reconnect_connect():
+    # Core invariant: the post-recovery scan retry happens within the same
+    # _connect_lock hold, so a reconnect's AT+CONN can only run after the
+    # whole scan transaction (including the retry) finished.
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+    manager = src.create_manager()
+
+    async def drive():
+        scan_task = loop.create_task(src.scan(timeout=0.3))
+        while "AT+SCAN" not in serial.writes:
+            await asyncio.sleep(0.01)
+        src._handle_transport_failure("simulated death in window")  # type: ignore[attr-defined]
+        connect_task = loop.create_task(manager.connect(mac))
+        while "AT+LIST" not in serial.writes:
+            await asyncio.sleep(0.01)
+        src._on_line("SCAN LIST: 0")  # type: ignore[attr-defined]
+        results = await scan_task
+        while f"AT+CONN={mac}" not in serial.writes:
+            await asyncio.sleep(0.01)
+        src._on_line(f"CONNECTED handle=0 #7 GIOS0403ST#7 MAC={mac}")  # type: ignore[attr-defined]
+        await connect_task
+        return results
+
+    results = loop.run_until_complete(asyncio.wait_for(drive(), timeout=10))
+
+    assert results == []
+    assert serial.writes.index("AT+LIST") < serial.writes.index(f"AT+CONN={mac}")
+    loop.close()
+
+
+def test_scan_recovers_wedged_connect_then_scans(monkeypatch):
+    # A wedged in-flight connect holds _connect_lock; the scan's bounded
+    # ownership wait escapes by forcing a recovery that fails the connect
+    # future, then acquires the freed lock and scans normally.
+    monkeypatch.setattr(ds, "_DONGLE_SCAN_OWNERSHIP_WAIT_SECONDS", 0.05)
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+
+    async def drive():
+        connect_task = loop.create_task(src._connect(mac))  # type: ignore[attr-defined]
+        await asyncio.sleep(0.01)  # AT+CONN goes out; the firmware never answers
+        assert serial.writes == [f"AT+CONN={mac}"]
+        scan_task = loop.create_task(src.scan(timeout=0.01))
+        while "AT+LIST" not in serial.writes:
+            await asyncio.sleep(0.01)
+        src._on_line("SCAN LIST: 0")  # type: ignore[attr-defined]
+        results = await scan_task
+        with pytest.raises(ConnectionError):
+            await connect_task
+        return results
+
+    results = loop.run_until_complete(asyncio.wait_for(drive(), timeout=10))
+
+    assert results == []
+    assert serial.writes[0] == f"AT+CONN={mac}"
+    assert "AT+SCAN" in serial.writes
     loop.close()

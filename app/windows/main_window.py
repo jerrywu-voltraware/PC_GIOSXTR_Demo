@@ -201,6 +201,9 @@ class MainWindow(QMainWindow):
         self.scan_panel.setFixedWidth(380)
         self.scan_panel.device_connect_requested.connect(self._connect_device)
         self.scan_panel.disconnect_requested.connect(self._disconnect_active)
+        self.scan_panel.device_disconnect_requested.connect(
+            self._disconnect_requested_address
+        )
         self.scan_panel.disconnect_all_requested.connect(self._disconnect_all)
         self.scan_panel.packet_counts_clear_requested.connect(self.clear_packet_counts_active)
         self.scan_panel.active_changed.connect(self._set_active)
@@ -270,9 +273,6 @@ class MainWindow(QMainWindow):
         self.scan_panel.set_recent_devices(self.recent_device_store.load())
         if os.getenv("QT_QPA_PLATFORM", "").lower() != "offscreen":
             QTimer.singleShot(0, self._start_initial_adapter_check)
-        if os.getenv("QT_QPA_PLATFORM", "").lower() != "offscreen":
-            QTimer.singleShot(1500, self._start_automatic_update_check)
-
         # Background safety net: no matter how a reconnect loop exited (crash,
         # never-scheduled, transport wedge), this periodically re-arms every
         # kept-but-disconnected device so reconnect can never be lost for good.
@@ -295,10 +295,21 @@ class MainWindow(QMainWindow):
     def _handle_adapter_check_result(self, result: AdapterCheckResult, *, show_warning: bool) -> None:
         self._last_adapter_status = result.status
         if result.status in (AdapterStatus.NO_ADAPTER, AdapterStatus.DISABLED):
-            title, body = user_facing_message(result)
+            message_provider = getattr(self.source, "readiness_error_message", None)
+            title, body = (
+                message_provider(result)
+                if callable(message_provider)
+                else user_facing_message(result)
+            )
             if show_warning:
                 QMessageBox.warning(self, title, body)
-            self.scan_panel.set_adapter_unavailable(result.status, body)
+            self.scan_panel.set_adapter_unavailable(
+                result.status,
+                body,
+                allow_retry=bool(
+                    getattr(self.source, "readiness_retry_allowed", False)
+                ),
+            )
             return
         if result.status is AdapterStatus.OK:
             self.scan_panel.set_adapter_available()
@@ -402,21 +413,15 @@ class MainWindow(QMainWindow):
             QProcess.startDetached(sys.executable, sys.argv)
         QApplication.quit()
 
-    def _start_automatic_update_check(self) -> None:
-        if self._update_check_running:
-            return
-        asyncio.create_task(self._check_for_updates(automatic=True))
-
     def _start_manual_update_check(self, dialog: SettingsDialog) -> None:
         if self._update_check_running:
             return
         dialog.set_update_checking(True)
-        asyncio.create_task(self._check_for_updates(automatic=False, settings_dialog=dialog))
+        asyncio.create_task(self._check_for_updates(settings_dialog=dialog))
 
     async def _check_for_updates(
         self,
         *,
-        automatic: bool,
         settings_dialog: SettingsDialog | None = None,
     ) -> None:
         self._update_check_running = True
@@ -427,11 +432,9 @@ class MainWindow(QMainWindow):
             if settings_dialog is not None:
                 settings_dialog.set_update_checking(False)
 
-        if automatic and result.status is not UpdateStatus.UPDATE_AVAILABLE:
-            return
-        self._show_update_result(result, automatic=automatic)
+        self._show_update_result(result)
 
-    def _show_update_result(self, result: UpdateCheckResult, *, automatic: bool) -> None:
+    def _show_update_result(self, result: UpdateCheckResult) -> None:
         if result.status is UpdateStatus.UPDATE_AVAILABLE and result.info is not None:
             info = result.info
             answer = QMessageBox.question(
@@ -447,9 +450,6 @@ class MainWindow(QMainWindow):
             )
             if answer is QMessageBox.StandardButton.Yes:
                 asyncio.create_task(self._download_update(info.asset))
-            return
-
-        if automatic:
             return
 
         title = "檢查更新"
@@ -790,6 +790,13 @@ class MainWindow(QMainWindow):
         if not addr:
             return
         await self._disconnect_address(addr)
+
+    @asyncSlot(str)
+    async def _disconnect_requested_address(self, address: str) -> None:
+        """Disconnect the exact row chosen from the connected-list menu."""
+        if not address:
+            return
+        await self._disconnect_address(address)
 
     @asyncSlot()
     async def _disconnect_all(self) -> None:
