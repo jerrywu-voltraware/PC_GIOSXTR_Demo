@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -52,6 +52,24 @@ class NumberPage(QWidget):
     def _ble(self) -> BleManager | None:
         return self._ble_provider()
 
+    def _show_number_updated(self, number: int) -> None:
+        """Show confirmation without entering a nested Qt event loop.
+
+        Static QMessageBox helpers call ``exec()`` internally.  Calling one
+        while an ``@asyncSlot`` coroutine is still active lets the nested Qt
+        loop wake another asyncio task, which qasync rejects as task re-entry.
+        ``open()`` is asynchronous and returns immediately.
+        """
+        box = QMessageBox(
+            QMessageBox.Icon.Information,
+            "裝置編號已更新",
+            f"裝置編號已設定為 {number}。\n將在下次掃描後看到新的編號。",
+            QMessageBox.StandardButton.Ok,
+            self,
+        )
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.open()
+
     @asyncSlot()
     async def write_number(self) -> None:
         ble = self._ble()
@@ -65,11 +83,7 @@ class NumberPage(QWidget):
             await ble.write_device_number(number)
             self.status.setText(f"Number set to {number}")
             self.log_message.emit(f"Device number set to {number}")
-            QMessageBox.information(
-                self,
-                "裝置編號已更新",
-                f"裝置編號已設定為 {number}。\n將在下次掃描後看到新的編號。",
-            )
+            self._show_number_updated(number)
         except Exception as exc:
             self.status.setText(f"Write failed: {exc}")
             self.log_message.emit(f"Device number write failed: {exc}")
