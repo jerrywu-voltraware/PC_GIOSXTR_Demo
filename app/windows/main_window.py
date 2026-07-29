@@ -939,6 +939,7 @@ class MainWindow(QMainWindow):
                 f"Unexpected disconnect address={address} "
                 f"auto_reconnect={self.auto_reconnect_enabled}",
                 level="WARNING",
+                show_in_gui=False,
             )
         self._manual_disconnect_addresses.discard(address)
         self._cleanup_address(address, allow_reconnect=self.auto_reconnect_enabled and not manual)
@@ -986,7 +987,10 @@ class MainWindow(QMainWindow):
         _write_dongle_runtime_log(f"reconnect loop crashed for {address}: {exc!r}")
         state = self.states.get(address)
         if state is not None:
-            state.add_log(f"重新連線流程異常，重新排程: {exc}")
+            state.add_log(
+                f"重新連線流程異常，重新排程: {exc}",
+                show_in_batch_gui=False,
+            )
         if self._reconnect_tasks.get(address) is task:
             self._reconnect_tasks.pop(address, None)
         if (
@@ -1018,7 +1022,11 @@ class MainWindow(QMainWindow):
         # on: auto-reconnect off, address removed, a successful reconnect, or
         # task cancellation (manual disconnect).
         attempt_index = 0
-        batch_log("RECONNECT", f"Automatic reconnect loop started address={address}")
+        batch_log(
+            "RECONNECT",
+            f"Automatic reconnect loop started address={address}",
+            show_in_gui=False,
+        )
         try:
             while True:
                 if not self.auto_reconnect_enabled or address not in self.states:
@@ -1054,7 +1062,8 @@ class MainWindow(QMainWindow):
                         try:
                             state.add_log(
                                 f"重新連線失敗 (第 {attempt_index + 1} 次): "
-                                f"{exc}{recovery_note}"
+                                f"{exc}{recovery_note}",
+                                show_in_batch_gui=False,
                             )
                             self.refresh_pages()
                         except Exception:
@@ -1091,7 +1100,10 @@ class MainWindow(QMainWindow):
             try:
                 await prepare_reconnect(address)
             except Exception as exc:
-                state.add_log(f"重連前清除連線狀態略過: {exc}")
+                state.add_log(
+                    f"重連前清除連線狀態略過: {exc}",
+                    show_in_batch_gui=False,
+                )
         manager = self._create_ble_manager()
         manager.set_notify_callback(self._make_notify_emitter())
         manager.set_disconnect_callback(self._make_disconnect_emitter())
@@ -1101,7 +1113,10 @@ class MainWindow(QMainWindow):
             try:
                 await manager.request_200b()
             except Exception as exc:
-                state.add_log(f"重新連線 200B 要求略過: {exc}")
+                state.add_log(
+                    f"重新連線 200B 要求略過: {exc}",
+                    show_in_batch_gui=False,
+                )
             manager.start_200b_keeper()
         except Exception:
             self._connect_in_progress.discard(address)

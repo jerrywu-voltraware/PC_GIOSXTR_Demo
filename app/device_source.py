@@ -286,7 +286,9 @@ def _write_dongle_runtime_log(message: str) -> None:
     ) else "INFO"
     if "warn:" in message.lower() and level == "INFO":
         level = "WARNING"
-    batch_log("DONGLE", message, level=level)
+    # Keep raw transport/firmware diagnostics out of the user-facing Batch Log.
+    # They remain complete in batch.txt and dongle_runtime.log for analysis.
+    batch_log("DONGLE", message, level=level, show_in_gui=False)
     try:
         log_dir = Path.cwd() / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)

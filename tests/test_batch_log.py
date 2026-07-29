@@ -122,6 +122,63 @@ def test_concurrent_writers_keep_file_and_live_view_in_the_same_order(
         qt_application.processEvents()
 
 
+def test_gui_hidden_events_stay_in_batch_file_but_not_overview(
+    isolated_batch_file,
+    qt_application,
+):
+    from app.windows.overview_page import OverviewPage
+
+    batch_log(
+        "DONGLE",
+        "serial read failed on COM7: ClearCommError failed",
+        level="ERROR",
+        show_in_gui=False,
+    )
+    batch_log("DEVICE", "裝置斷線，準備自動重新連線")
+
+    page = OverviewPage()
+    try:
+        batch_log(
+            "DONGLE",
+            "firmware DIAG: last_err=0x0011",
+            level="ERROR",
+            show_in_gui=False,
+        )
+        batch_log("DEVICE", "已重新連線")
+        qt_application.processEvents()
+
+        persisted_text = isolated_batch_file.read_text(encoding="utf-8")
+        visible_text = page.batch_log_text.toPlainText()
+
+        assert "ClearCommError failed" in persisted_text
+        assert "last_err=0x0011" in persisted_text
+        assert "ClearCommError failed" not in visible_text
+        assert "last_err=0x0011" not in visible_text
+        assert "裝置斷線，準備自動重新連線" in visible_text
+        assert "已重新連線" in visible_text
+        assert page._batch_visible_line_count == 2
+        assert len(current_batch_lines()) == 2
+    finally:
+        page.close()
+        page.deleteLater()
+        qt_application.processEvents()
+
+
+def test_device_state_can_keep_technical_detail_out_of_batch_gui(
+    isolated_batch_file,
+):
+    from app.models import DeviceState
+
+    state = DeviceState(device_address="90:04:22:B6:96:00")
+    detail = "重新連線失敗: ClearCommError failed"
+
+    state.add_log(detail, show_in_batch_gui=False)
+
+    assert detail in isolated_batch_file.read_text(encoding="utf-8")
+    assert detail in state.log_messages[0]
+    assert all(detail not in line for line in current_batch_lines())
+
+
 def test_device_state_log_is_mirrored_with_identity_and_error_level(
     isolated_batch_file,
 ):

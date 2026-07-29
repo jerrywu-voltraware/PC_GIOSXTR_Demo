@@ -12,7 +12,11 @@ import asyncio
 import pytest
 
 from app import device_source as ds
-from app.batch_log import disable_batch_log_file, initialize_batch_log
+from app.batch_log import (
+    current_batch_lines,
+    disable_batch_log_file,
+    initialize_batch_log,
+)
 from app.ble_adapter import AdapterStatus
 from app.constants import UUID_IOT_NOTIFY, UUID_NOTIFY_200B
 from app.device_source import DongleSource, _crc16_ccitt
@@ -238,6 +242,7 @@ def test_firmware_disconnect_reason_is_written_to_batch_and_runtime(
         runtime_text = (tmp_path / "logs" / "dongle_runtime.log").read_text(
             encoding="utf-8"
         )
+        visible_lines = current_batch_lines()
     finally:
         disable_batch_log_file(clear_display=True)
         src._loop.close()  # type: ignore[attr-defined]
@@ -249,6 +254,41 @@ def test_firmware_disconnect_reason_is_written_to_batch_and_runtime(
         assert "command_pending=false requested_by_app=false" in text
         assert "trigger=unsolicited ignored=false" in text
         assert raw_line in text
+    assert all("event=ble_disconnect" not in line for line in visible_lines)
+
+
+def test_low_level_dongle_diagnostics_are_complete_on_disk_and_hidden_from_gui(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.chdir(tmp_path)
+    batch_path = initialize_batch_log(tmp_path / "batch.txt")
+    messages = [
+        "serial read failed on COM7: ClearCommError failed",
+        "serial write failed on COM7: WriteFile failed",
+        "firmware DIAG: RESETREAS=0x00000004 last_err=0x0011",
+        "firmware DIAG2: err=0x00000011 line=0",
+        "event=ble_disconnect reason_code=0x13",
+        "event=ble_disconnect reason_code=0x3E",
+    ]
+
+    try:
+        for message in messages:
+            ds._write_dongle_runtime_log(message)  # type: ignore[attr-defined]
+        persisted_lines = batch_path.read_text(encoding="utf-8").splitlines()
+        runtime_lines = (tmp_path / "logs" / "dongle_runtime.log").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        visible_lines = current_batch_lines()
+    finally:
+        disable_batch_log_file(clear_display=True)
+
+    assert len(persisted_lines) == len(messages)
+    assert len(runtime_lines) == len(messages)
+    for message in messages:
+        assert any(message in line for line in persisted_lines)
+        assert any(message in line for line in runtime_lines)
+    assert visible_lines == []
 
 
 def test_connected_line_builds_devid_mapping():

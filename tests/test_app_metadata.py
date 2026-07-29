@@ -3,14 +3,21 @@ from pathlib import Path
 
 
 def test_app_metadata_uses_requested_version_and_icon():
-    from app.constants import APP_ICON_FILENAME, APP_NAME, APP_VERSION, APP_WINDOW_TITLE
+    from app.constants import (
+        APP_EXECUTABLE_NAME,
+        APP_ICON_FILENAME,
+        APP_NAME,
+        APP_VERSION,
+        APP_WINDOW_TITLE,
+    )
     from app.resources import resource_path
 
     icon_path = resource_path(APP_ICON_FILENAME)
 
     assert APP_NAME == "PC GIOSXTR Demo"
-    assert APP_VERSION == "V1.0.30"
-    assert APP_WINDOW_TITLE == "PC GIOSXTR Demo V1.0.30"
+    assert APP_VERSION == "V2.0.0"
+    assert APP_WINDOW_TITLE == "PC GIOSXTR Demo V2.0.0"
+    assert APP_EXECUTABLE_NAME == "PC_GIOSXTR_Demo_V2.0.0"
     assert APP_ICON_FILENAME == "1024.png"
     assert icon_path.exists()
 
@@ -38,14 +45,15 @@ def test_pyinstaller_spec_uses_versioned_exe_icon_and_version_info():
     assert 'collect_submodules("numpy._core")' in spec
     assert 'collect_submodules("winrt")' in spec
     assert '("1024.png", ".")' in spec
-    assert 'name="PC_GIOSXTR_Demo_V1.0.30"' in spec
+    assert 'name="PC_GIOSXTR_Demo_V2.0.0"' in spec
     assert 'icon="app_icon.ico"' in spec
     assert 'version="version_info.txt"' in spec
     assert Path("app_icon.ico").exists()
-    assert "filevers=(1, 0, 30, 0)" in version_info
-    assert "prodvers=(1, 0, 30, 0)" in version_info
-    assert "StringStruct('FileVersion', 'V1.0.30')" in version_info
-    assert "StringStruct('ProductVersion', 'V1.0.30')" in version_info
+    assert "filevers=(2, 0, 0, 0)" in version_info
+    assert "prodvers=(2, 0, 0, 0)" in version_info
+    assert "StringStruct('FileVersion', 'V2.0.0')" in version_info
+    assert "StringStruct('ProductVersion', 'V2.0.0')" in version_info
+    assert "StringStruct('OriginalFilename', 'PC_GIOSXTR_Demo_V2.0.0.exe')" in version_info
 
 
 def test_settings_dialog_exposes_manual_update_check_button():

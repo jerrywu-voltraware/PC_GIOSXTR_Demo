@@ -147,6 +147,7 @@ def batch_log_path() -> Path:
 
 
 def current_batch_lines() -> list[str]:
+    """Return the user-facing lines currently retained for the GUI."""
     with _lock:
         return list(_display_lines)
 
@@ -179,16 +180,29 @@ def _write_line(path: Path, line: str) -> None:
         file.write(line + "\n")
 
 
-def batch_log(category: str, message: object, *, level: str = "INFO") -> str:
-    """Append one timestamped event to batch.txt and notify live viewers."""
+def batch_log(
+    category: str,
+    message: object,
+    *,
+    level: str = "INFO",
+    show_in_gui: bool = True,
+) -> str:
+    """Persist one event and optionally publish it to the GUI Batch Log.
+
+    ``show_in_gui=False`` suppresses only the live/snapshot display. The exact
+    same timestamped line is still appended to ``batch.txt`` so low-level
+    transport diagnostics remain available for later analysis.
+    """
     global _bus, _path
 
     with _lock:
         # Timestamping, persistence, and emission share one ordering lock so
         # simultaneous dongle/worker events stay in the same order everywhere.
         line = _format_line(category, message, level)
-        _append_display_locked(line)
-        emitted_lines = [line]
+        emitted_lines: list[str] = []
+        if show_in_gui:
+            _append_display_locked(line)
+            emitted_lines.append(line)
         selected_path = _path
         if selected_path is not None:
             try:

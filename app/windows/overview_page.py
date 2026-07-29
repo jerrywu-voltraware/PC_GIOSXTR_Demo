@@ -61,7 +61,8 @@ class OverviewPage(QWidget):
         self.batch_title = QLabel("Batch Log")
         self.batch_title.setObjectName("batchLogTitle")
         self.batch_hint = QLabel(
-            f"畫面最多 {BATCH_DISPLAY_LINE_LIMIT} 行；完整歷程保存在 batch.txt"
+            f"畫面只顯示主要狀態（最多 {BATCH_DISPLAY_LINE_LIMIT} 行）；"
+            "完整技術歷程保存在 batch.txt"
         )
         self.batch_hint.setObjectName("batchLogHint")
         self.batch_hint.setWordWrap(True)
@@ -76,7 +77,7 @@ class OverviewPage(QWidget):
         self.batch_log_text.setObjectName("batchLogText")
         self.batch_log_text.setReadOnly(True)
         self.batch_log_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.batch_log_text.setPlaceholderText("APP 狀態與錯誤會即時顯示在這裡。")
+        self.batch_log_text.setPlaceholderText("APP 主要狀態會即時顯示在這裡。")
         self._batch_bus, initial_lines = subscribe_batch_log(
             self.append_batch_log_line
         )

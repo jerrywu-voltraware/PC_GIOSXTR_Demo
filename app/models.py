@@ -96,7 +96,7 @@ class DeviceState:
     log_messages: list[str] = field(default_factory=list)
     latest_error_time: str = ""
 
-    def add_log(self, message: str) -> None:
+    def add_log(self, message: str, *, show_in_batch_gui: bool = True) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         self.log_messages.insert(0, f"{timestamp}  {message}")
         del self.log_messages[500:]
@@ -114,7 +114,12 @@ class DeviceState:
             level = "WARNING"
         else:
             level = "INFO"
-        batch_log("DEVICE", f"[{identity}] {message}", level=level)
+        batch_log(
+            "DEVICE",
+            f"[{identity}] {message}",
+            level=level,
+            show_in_gui=show_in_batch_gui,
+        )
 
     @property
     def input_power_w(self) -> float:
