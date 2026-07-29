@@ -7,14 +7,13 @@ from pathlib import Path
 
 from PyQt6.QtCore import (
     QObject,
+    QProcess,
     QRunnable,
     QStandardPaths,
     QThreadPool,
-    QUrl,
     pyqtSignal,
     pyqtSlot,
 )
-from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QComboBox,
@@ -90,6 +89,14 @@ class _UpdateDownloadWorker(QRunnable):
 def _start_worker(worker: QRunnable) -> None:
     """Submit a startup worker (small seam for hardware/network-free tests)."""
     QThreadPool.globalInstance().start(worker)
+
+
+def _start_detached_update(path: Path) -> bool:
+    """Launch a downloaded EXE independently of the current application."""
+    result = QProcess.startDetached(str(path), [], str(path.parent))
+    if isinstance(result, tuple):
+        return bool(result[0])
+    return bool(result)
 
 
 def list_serial_ports() -> list[tuple[str, str, bool]]:
@@ -348,12 +355,23 @@ class SourceSelectDialog(QDialog):
         answer = QMessageBox.question(
             self,
             "更新已下載",
-            f"已下載：\n{path}\n\n是否現在開啟新版？使用新版前請先關閉目前版本。",
+            f"已下載：\n{path}\n\n是否現在開啟新版？成功開啟後，目前版本會自動關閉。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
         if answer is QMessageBox.StandardButton.Yes:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+            if not _start_detached_update(path):
+                detail = f"無法啟動新版：{path}"
+                self._update_status.setText("新版已下載，但無法自動開啟。")
+                batch_log("UPDATE", detail, level="ERROR")
+                QMessageBox.warning(self, "無法開啟新版", detail)
+                return
+            batch_log("UPDATE", f"Launched {path}; closing current version")
+            self._update_status.setText("新版已開啟；目前版本即將自動關閉。")
+            # Rejecting the startup dialog makes main() return before creating
+            # the main window, so the old executable exits cleanly while the
+            # detached new executable continues independently.
+            self.reject()
 
     @pyqtSlot(str)
     def _handle_update_download_failure(self, detail: str) -> None:

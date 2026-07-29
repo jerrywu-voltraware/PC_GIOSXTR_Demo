@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import argparse
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -27,6 +27,11 @@ APP_ORGANIZATION = "GIOSXTR"
 def _parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--engineering", action="store_true", help="Enable internal engineering controls")
+    parser.add_argument(
+        "--startup-probe",
+        action="store_true",
+        help="Verify the packaged Python runtime and imports, then exit",
+    )
     parser.add_argument("-h", "--help", action="help", help="Show this help message and exit")
     return parser.parse_known_args(argv)
 
@@ -38,6 +43,8 @@ def _env_engineering_enabled() -> bool:
 
 def main() -> int:
     args, qt_args = _parse_args(sys.argv[1:])
+    if args.startup_probe:
+        return 0
     engineering_mode = bool(args.engineering or _env_engineering_enabled())
 
     app = QApplication([sys.argv[0], *qt_args])

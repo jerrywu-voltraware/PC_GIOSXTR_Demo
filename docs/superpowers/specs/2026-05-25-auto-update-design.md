@@ -61,7 +61,8 @@ PC_GIOSXTR_Demo_V1.0.1.exe
 
 ```text
 更新 APP_VERSION 與 exe 名稱
--> 使用 PyInstaller 打包
+-> 使用 `pyinstaller --clean --noconfirm PC_GIOSXTR_Demo.spec` 打包
+-> 執行新版 exe 的 `--startup-probe`，確認內嵌 Python 可啟動
 -> 提交並推送版本變更
 -> 建立 GitHub Release vX.Y.Z
 -> 上傳 PC_GIOSXTR_Demo_VX.Y.Z.exe
@@ -72,6 +73,7 @@ PC_GIOSXTR_Demo_V1.0.1.exe
 
 - 版本號已更新到 `Vx.y.z`
 - `dist\PC_GIOSXTR_Demo_Vx.y.z.exe` 已產生
+- `dist\PC_GIOSXTR_Demo_Vx.y.z.exe --startup-probe` 的結束碼是 `0`
 - GitHub Release tag 是 `vx.y.z`
 - Release asset 名稱是 `PC_GIOSXTR_Demo_Vx.y.z.exe`
 
@@ -124,7 +126,8 @@ PC_GIOSXTR_Demo_V1.0.1.exe
 
 下載檔名保留 GitHub asset 名稱。若檔案已存在，更新程式可以覆蓋或由使用者重新指定儲存位置。
 
-下載完成後，APP 顯示下載路徑，並詢問是否開啟新版 exe。
+下載完成後，APP 顯示下載路徑，並詢問是否開啟新版 exe。若新版程序成功啟動，
+啟動階段的舊版 APP 會自動關閉；若 Windows 無法啟動新版，舊版保持開啟並顯示錯誤。
 
 APP 不嘗試直接替換目前正在執行的 exe。這樣可以避免 Windows 檔案鎖定問題，讓第一版更新機制更可靠。
 
