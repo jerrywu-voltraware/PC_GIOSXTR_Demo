@@ -190,6 +190,19 @@ _CONNECTED = re.compile(
     r"^CONNECTED handle=(\d+)\s+#(\d+|-)\s+(.+?)\s+MAC=([0-9A-Fa-f:]{17})"
 )
 _DISCONNECTED = re.compile(r"^DISCONNECTED handle=(\d+)")
+_DISCONNECT_REASON = re.compile(r"\breason=0x([0-9A-Fa-f]{1,2})\b")
+_BLE_DISCONNECT_REASON_NAMES = {
+    0x05: "AUTHENTICATION_FAILURE",
+    0x08: "CONNECTION_TIMEOUT",
+    0x13: "REMOTE_USER_TERMINATED_CONNECTION",
+    0x14: "REMOTE_DEVICE_TERMINATED_LOW_RESOURCES",
+    0x15: "REMOTE_DEVICE_TERMINATED_POWER_OFF",
+    0x16: "CONNECTION_TERMINATED_BY_LOCAL_HOST",
+    0x22: "LMP_RESPONSE_TIMEOUT",
+    0x3B: "UNACCEPTABLE_CONNECTION_PARAMETERS",
+    0x3D: "MIC_FAILURE",
+    0x3E: "CONNECTION_FAILED_TO_BE_ESTABLISHED",
+}
 _CONNECT_ERROR_PREFIXES = (
     "ERROR:CONN",
     "ERROR:CONNECTING",
@@ -295,6 +308,13 @@ def _crc16_ccitt(data: bytes) -> int:
             else:
                 crc = (crc << 1) & 0xFFFF
     return crc
+
+
+def _ble_disconnect_reason_name(reason_code: int | None) -> str:
+    """Return a stable, searchable name without discarding unknown HCI codes."""
+    if reason_code is None:
+        return "NOT_REPORTED"
+    return _BLE_DISCONNECT_REASON_NAMES.get(reason_code, "UNKNOWN_HCI_REASON")
 
 
 class DongleDeviceManager:
@@ -505,6 +525,7 @@ class DongleSource(DeviceSource):
         # (now stale) DISCONNECTED line. The first DISCONNECTED for such a handle
         # is swallowed so it cannot tear down a link that reused the handle.
         self._stale_disconnect_handles: set[int] = set()
+        self._stale_disconnect_triggers: dict[int, str] = {}
 
         self._rxbuf = bytearray()
         self._running = True
@@ -516,6 +537,15 @@ class DongleSource(DeviceSource):
         self._scan_debug = False  # log every received line during scan() window
         self._connect_futures: dict[str, asyncio.Future[bool]] = {}
         self._disconnect_futures: dict[str, asyncio.Future[bool]] = {}
+        self._disconnect_tasks: dict[str, asyncio.Task[None]] = {}
+        # Why the APP sent AT+DISC for a MAC.  The firmware may return reason
+        # 0x13 even for a locally requested disconnect, so the HCI reason alone
+        # must never be interpreted as proof that the PTU initiated it.
+        self._disconnect_triggers: dict[str, str] = {}
+        # Fire-and-forget AT+DISC commands (currently reconnect preparation) do
+        # not own a Future. Keep a short-lived context so their firmware ACK is
+        # not mislabeled as an unsolicited PTU disconnect.
+        self._recent_disconnect_requests: dict[str, tuple[str, float]] = {}
         # Resolved by the reader when the firmware answers a liveness probe
         # (AT+STATUS -> "STATUS links=...").  Used to handshake-gate recovery.
         self._probe_future: asyncio.Future[bool] | None = None
@@ -629,11 +659,23 @@ class DongleSource(DeviceSource):
             await self._ensure_recovered("reconnect preparation")
             await self._wait_for_scan_idle()
             await self._wait_for_pending_disconnects()
+            trigger = "reconnect_preparation"
             try:
+                self._recent_disconnect_requests[mac] = (
+                    trigger,
+                    self._loop.time() + _DONGLE_DISCONNECT_TIMEOUT_SECONDS,
+                )
                 self._send_command(f"AT+DISC={mac}")
+                _write_dongle_runtime_log(
+                    "event=disconnect_request source=app action=sent "
+                    f"address={mac} trigger={trigger} command=AT+DISC"
+                )
                 self._last_disconnect_monotonic = self._loop.time()
                 _write_scan_debug(f"dongle reconnect: cleared {mac} before AT+CONN")
             except Exception as exc:
+                recent = self._recent_disconnect_requests.get(mac)
+                if recent is not None and recent[0] == trigger:
+                    self._recent_disconnect_requests.pop(mac, None)
                 _write_dongle_runtime_log(
                     f"reconnect pre-disconnect failed for {mac}: {exc}"
                 )
@@ -902,7 +944,46 @@ class DongleSource(DeviceSource):
             _write_scan_debug(f"dongle connect: settling {remaining:.2f}s before AT+CONN")
             await asyncio.sleep(remaining)
 
-    async def _disconnect(self, mac: str) -> None:
+    def _consume_recent_disconnect_trigger(self, mac: str) -> str | None:
+        recent = self._recent_disconnect_requests.pop(mac, None)
+        if recent is None:
+            return None
+        trigger, expires_at = recent
+        if self._loop.time() <= expires_at:
+            return trigger
+        return None
+
+    async def _disconnect(self, mac: str, *, trigger: str = "app_request") -> None:
+        existing = self._disconnect_tasks.get(mac)
+        if existing is not None:
+            if not existing.done():
+                active_trigger = self._disconnect_triggers.get(mac, "unknown")
+                _write_dongle_runtime_log(
+                    "event=disconnect_request source=app action=coalesced "
+                    f"address={mac} active_trigger={active_trigger} "
+                    f"requested_trigger={trigger}"
+                )
+            await asyncio.shield(existing)
+            return
+
+        self._disconnect_triggers[mac] = trigger
+        task = self._loop.create_task(
+            self._disconnect_once(mac, trigger=trigger)
+        )
+        self._disconnect_tasks[mac] = task
+        def cleanup(done_task: asyncio.Task[None]) -> None:
+            if self._disconnect_tasks.get(mac) is task:
+                self._disconnect_tasks.pop(mac, None)
+            self._consume_future_exception(done_task)
+
+        # The shared operation outlives any individual caller.  In particular,
+        # cancellation of the first caller must not remove the registry entry
+        # while AT+DISC is still pending, otherwise a later caller could start a
+        # second command and overwrite the acknowledgement future.
+        task.add_done_callback(cleanup)
+        await asyncio.shield(task)
+
+    async def _disconnect_once(self, mac: str, *, trigger: str) -> None:
         future: asyncio.Future[bool] = self._loop.create_future()
         self._disconnect_futures[mac] = future
         try:
@@ -918,9 +999,13 @@ class DongleSource(DeviceSource):
             self._needs_recovery = True
             for handle in [h for h, m in self._handle_to_mac.items() if m == mac]:
                 self._stale_disconnect_handles.add(handle)
+                self._stale_disconnect_triggers[handle] = trigger
             _write_scan_debug(f"dongle disconnect timed out for {mac}; flagged for recovery")
         finally:
-            self._disconnect_futures.pop(mac, None)
+            if self._disconnect_futures.get(mac) is future:
+                self._disconnect_futures.pop(mac, None)
+            if self._disconnect_triggers.get(mac) == trigger:
+                self._disconnect_triggers.pop(mac, None)
             self._consume_future_exception(future)
 
     async def _handle_stream_stale(self, manager: DongleDeviceManager) -> None:
@@ -931,9 +1016,13 @@ class DongleSource(DeviceSource):
         age = self._loop.time() - (manager._last_notify_monotonic or self._loop.time())
         message = f"stream stale for {mac} ({age:.1f}s without a frame)"
         _write_scan_debug(f"dongle: {message}")
-        _write_dongle_runtime_log(message)
+        _write_dongle_runtime_log(
+            "event=stream_stale source=stream_watchdog "
+            f"address={mac} age_seconds={age:.1f} action=AT+DISC "
+            f"detail={message!r}"
+        )
         try:
-            await self._disconnect(mac)
+            await self._disconnect(mac, trigger="stream_watchdog")
         except Exception as exc:
             _write_dongle_runtime_log(f"stale-stream disconnect failed for {mac}: {exc}")
 
@@ -941,6 +1030,11 @@ class DongleSource(DeviceSource):
         # the line/transport was lost, force source recovery so the same UI path
         # still runs and recording state is retained for auto-reconnect.
         if self._managers.get(mac) is manager:
+            _write_dongle_runtime_log(
+                "event=disconnect source=stream_watchdog phase=synthetic "
+                f"address={mac} reason_code=unavailable "
+                "reason_name=NO_FIRMWARE_ACK trigger=stream_watchdog"
+            )
             self._needs_recovery = True
             try:
                 await self.recover(f"{message}; no disconnect acknowledgement")
@@ -1185,6 +1279,9 @@ class DongleSource(DeviceSource):
         managers = list(self._managers.values())
         self._handle_to_mac.clear()
         self._stale_disconnect_handles.clear()
+        self._stale_disconnect_triggers.clear()
+        self._disconnect_triggers.clear()
+        self._recent_disconnect_requests.clear()
         self._devid_to_mac.clear()
         self._managers.clear()
         self._active_connect_mac = None
@@ -1208,6 +1305,15 @@ class DongleSource(DeviceSource):
         # through call_soon_threadsafe); _transport_generation is only safe
         # lock-free because every mutation happens on that thread.
         self._transport_generation += 1
+        for manager in self._managers.values():
+            if manager.is_connected:
+                _write_dongle_runtime_log(
+                    "event=disconnect source=transport_failure "
+                    f"address={manager.address} port={self._port_name} "
+                    f"generation={self._transport_generation} "
+                    "reason_code=unavailable reason_name=TRANSPORT_FAILURE "
+                    f"detail={message!r}"
+                )
         self._running = False
         self._fail_all_pending_operations(message)
         self._reset_link_state()
@@ -1355,6 +1461,10 @@ class DongleSource(DeviceSource):
             handle = int(match.group(1))
             dev_id_text = match.group(2)
             mac = match.group(4).upper()
+            # A successful new generation invalidates any unconsumed context
+            # from prepare_reconnect's best-effort AT+DISC.  Otherwise a real
+            # disconnect on the new link could be attributed to the old request.
+            self._recent_disconnect_requests.pop(mac, None)
             self._handle_to_mac[handle] = mac
             if dev_id_text != "-":
                 self._devid_to_mac[int(dev_id_text)] = mac
@@ -1370,10 +1480,53 @@ class DongleSource(DeviceSource):
         match = _DISCONNECTED.match(line)
         if match:
             handle = int(match.group(1))
+            stale = handle in self._stale_disconnect_handles
+            mapped_mac = self._handle_to_mac.get(handle)
+            # A stale handle may already belong to a fresh link. Never attribute
+            # that late acknowledgement to the current MAC mapping.
+            mac_for_log = None if stale else mapped_mac
+            command_pending = bool(
+                mac_for_log and mac_for_log in self._disconnect_futures
+            )
+            if stale:
+                trigger = self._stale_disconnect_triggers.pop(
+                    handle, "late_acknowledgement"
+                )
+            elif mac_for_log is not None:
+                trigger = self._disconnect_triggers.pop(mac_for_log, None)
+                if trigger is None:
+                    trigger = self._consume_recent_disconnect_trigger(mac_for_log)
+                if trigger is None:
+                    trigger = "app_request" if command_pending else "unsolicited"
+            else:
+                trigger = "unattributed"
+            requested_by_app = trigger not in {
+                "late_acknowledgement",
+                "unattributed",
+                "unsolicited",
+            }
+
+            reason_match = _DISCONNECT_REASON.search(line)
+            reason_code = (
+                int(reason_match.group(1), 16) if reason_match is not None else None
+            )
+            reason_code_text = (
+                f"0x{reason_code:02X}" if reason_code is not None else "unavailable"
+            )
+            _write_dongle_runtime_log(
+                "event=ble_disconnect source=firmware "
+                f"address={mac_for_log or '-'} handle={handle} "
+                f"reason_code={reason_code_text} "
+                f"reason_name={_ble_disconnect_reason_name(reason_code)} "
+                f"command_pending={str(command_pending).lower()} "
+                f"requested_by_app={str(requested_by_app).lower()} "
+                f"trigger={trigger} ignored={str(stale).lower()} "
+                f"raw_line={line!r}"
+            )
             # A disconnect that previously timed out still owes one DISCONNECTED.
             # Swallow that stale line so it cannot tear down a link that has
             # since reused the same handle number.
-            if handle in self._stale_disconnect_handles:
+            if stale:
                 self._stale_disconnect_handles.discard(handle)
                 _write_scan_debug(f"dongle: swallowing stale DISCONNECTED handle={handle}")
                 return

@@ -12,6 +12,7 @@ import asyncio
 import pytest
 
 from app import device_source as ds
+from app.batch_log import disable_batch_log_file, initialize_batch_log
 from app.ble_adapter import AdapterStatus
 from app.constants import UUID_IOT_NOTIFY, UUID_NOTIFY_200B
 from app.device_source import DongleSource, _crc16_ccitt
@@ -201,6 +202,55 @@ def test_firmware_diagnostics_and_scan_warnings_are_persisted(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize(
+    ("reason_code", "reason_name"),
+    [
+        (0x08, "CONNECTION_TIMEOUT"),
+        (0x13, "REMOTE_USER_TERMINATED_CONNECTION"),
+        (0x16, "CONNECTION_TERMINATED_BY_LOCAL_HOST"),
+        (0xAB, "UNKNOWN_HCI_REASON"),
+        (None, "NOT_REPORTED"),
+    ],
+)
+def test_ble_disconnect_reason_names_preserve_known_unknown_and_missing_codes(
+    reason_code, reason_name
+):
+    assert ds._ble_disconnect_reason_name(reason_code) == reason_name
+
+
+def test_firmware_disconnect_reason_is_written_to_batch_and_runtime(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    batch_path = initialize_batch_log(tmp_path / "batch.txt")
+    src = _make_source()
+    mac = "AA:BB:CC:01:10:90"
+    manager = src.create_manager()
+    manager.address = mac
+    manager._connected = True  # type: ignore[attr-defined]
+    src._register_manager(mac, manager)  # type: ignore[attr-defined]
+    src._handle_to_mac[2] = mac  # type: ignore[attr-defined]
+
+    raw_line = "DISCONNECTED handle=2 #7 GIOS0403ST#7 reason=0x08"
+    try:
+        src._on_line(raw_line)  # type: ignore[attr-defined]
+        batch_text = batch_path.read_text(encoding="utf-8")
+        runtime_text = (tmp_path / "logs" / "dongle_runtime.log").read_text(
+            encoding="utf-8"
+        )
+    finally:
+        disable_batch_log_file(clear_display=True)
+        src._loop.close()  # type: ignore[attr-defined]
+
+    for text in (batch_text, runtime_text):
+        assert "event=ble_disconnect source=firmware" in text
+        assert f"address={mac} handle=2" in text
+        assert "reason_code=0x08 reason_name=CONNECTION_TIMEOUT" in text
+        assert "command_pending=false requested_by_app=false" in text
+        assert "trigger=unsolicited ignored=false" in text
+        assert raw_line in text
+
+
 def test_connected_line_builds_devid_mapping():
     src = _make_source()
     src._on_line("CONNECTED handle=2 #7 GIOS0403ST#7 MAC=AA:BB:CC:01:10:90")  # type: ignore[attr-defined]
@@ -243,7 +293,9 @@ def test_dongle_connect_error_fails_active_connect_immediately():
         loop.run_until_complete(task)
 
 
-def test_reader_exception_disconnects_all_managers_and_marks_source_unready():
+def test_reader_exception_disconnects_all_managers_and_marks_source_unready(
+    monkeypatch,
+):
     loop = asyncio.new_event_loop()
     source = DongleSource(
         "TEST",
@@ -252,6 +304,8 @@ def test_reader_exception_disconnects_all_managers_and_marks_source_unready():
         start_reader=False,
     )
     disconnects: list[str] = []
+    runtime_messages: list[str] = []
+    monkeypatch.setattr(ds, "_write_dongle_runtime_log", runtime_messages.append)
     pending_connect = loop.create_future()
     pending_scan = loop.create_future()
     pending_disconnect = loop.create_future()
@@ -282,6 +336,17 @@ def test_reader_exception_disconnects_all_managers_and_marks_source_unready():
     assert isinstance(pending_scan.exception(), ConnectionError)
     assert isinstance(pending_disconnect.exception(), ConnectionError)
     assert readiness.status is not AdapterStatus.OK
+    transport_events = [
+        message
+        for message in runtime_messages
+        if "event=disconnect source=transport_failure" in message
+    ]
+    assert len(transport_events) == 2
+    assert all("reason_name=TRANSPORT_FAILURE" in message for message in transport_events)
+    assert {message.split("address=", 1)[1].split(" ", 1)[0] for message in transport_events} == {
+        "AA:BB:CC:01:10:90",
+        "AA:BB:CC:01:10:91",
+    }
     loop.close()
 
 
@@ -536,6 +601,69 @@ def test_dongle_keeper_recovers_stale_connection_when_no_frames_arrive():
     loop.close()
 
 
+def test_stream_watchdog_records_source_and_tags_disconnect_command(monkeypatch):
+    source, _serial = _make_source_with_fake_serial()
+    loop = source._loop  # type: ignore[attr-defined]
+    manager = source.create_manager()
+    mac = "AA:BB:CC:01:10:90"
+    manager.address = mac
+    manager._connected = True  # type: ignore[attr-defined]
+    manager._last_notify_monotonic = loop.time() - 15.0  # type: ignore[attr-defined]
+    source._register_manager(mac, manager)  # type: ignore[attr-defined]
+    runtime_messages: list[str] = []
+    disconnect_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(ds, "_write_dongle_runtime_log", runtime_messages.append)
+
+    async def disconnect(address: str, *, trigger: str = "app_request") -> None:
+        disconnect_calls.append((address, trigger))
+        manager._connected = False  # type: ignore[attr-defined]
+        source._unregister_manager(address)  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(source, "_disconnect", disconnect)
+    loop.run_until_complete(source._handle_stream_stale(manager))  # type: ignore[attr-defined]
+
+    assert disconnect_calls == [(mac, "stream_watchdog")]
+    assert any(
+        "event=stream_stale source=stream_watchdog" in message
+        and f"address={mac}" in message
+        and "action=AT+DISC" in message
+        for message in runtime_messages
+    )
+    loop.close()
+
+
+def test_stream_watchdog_without_firmware_ack_records_synthetic_source(
+    monkeypatch,
+):
+    monkeypatch.setattr(ds, "_DONGLE_DISCONNECT_TIMEOUT_SECONDS", 0.02)
+    source, serial = _make_source_with_fake_serial()
+    loop = source._loop  # type: ignore[attr-defined]
+    manager = source.create_manager()
+    mac = "AA:BB:CC:01:10:90"
+    manager.address = mac
+    manager._connected = True  # type: ignore[attr-defined]
+    manager._last_notify_monotonic = loop.time() - 15.0  # type: ignore[attr-defined]
+    disconnects: list[str] = []
+    manager.set_disconnect_callback(disconnects.append)
+    source._register_manager(mac, manager)  # type: ignore[attr-defined]
+    source._handle_to_mac[2] = mac  # type: ignore[attr-defined]
+    runtime_messages: list[str] = []
+    monkeypatch.setattr(ds, "_write_dongle_runtime_log", runtime_messages.append)
+
+    loop.run_until_complete(source._handle_stream_stale(manager))  # type: ignore[attr-defined]
+
+    assert serial.writes == [f"AT+DISC={mac}"]
+    assert disconnects == [mac]
+    assert mac not in source._managers  # type: ignore[attr-defined]
+    assert any(
+        "event=disconnect source=stream_watchdog phase=synthetic" in message
+        and f"address={mac}" in message
+        and "reason_name=NO_FIRMWARE_ACK" in message
+        for message in runtime_messages
+    )
+    loop.close()
+
+
 def test_disconnected_line_dispatches_to_manager():
     src = _make_source()
     events: list[str] = []
@@ -551,10 +679,33 @@ def test_disconnected_line_dispatches_to_manager():
     assert events == [mac]
 
 
-def test_dongle_disconnect_waits_for_disconnected_line_before_unregistering():
+def test_legacy_disconnected_line_without_reason_still_dispatches(monkeypatch):
+    src = _make_source()
+    runtime_messages: list[str] = []
+    monkeypatch.setattr(ds, "_write_dongle_runtime_log", runtime_messages.append)
+    events: list[str] = []
+    mgr = src.create_manager()
+    mgr.set_disconnect_callback(events.append)
+    mac = "AA:BB:CC:01:10:90"
+    mgr.address = mac
+    mgr._connected = True  # type: ignore[attr-defined]
+    src._register_manager(mac, mgr)  # type: ignore[attr-defined]
+    src._handle_to_mac[2] = mac  # type: ignore[attr-defined]
+
+    src._on_line("DISCONNECTED handle=2")  # type: ignore[attr-defined]
+
+    assert events == [mac]
+    assert "reason_code=unavailable reason_name=NOT_REPORTED" in runtime_messages[-1]
+
+
+def test_dongle_disconnect_waits_for_disconnected_line_before_unregistering(
+    monkeypatch,
+):
     src, serial = _make_source_with_fake_serial()
     loop = src._loop  # type: ignore[attr-defined]
     events: list[str] = []
+    runtime_messages: list[str] = []
+    monkeypatch.setattr(ds, "_write_dongle_runtime_log", runtime_messages.append)
     mgr = src.create_manager()
     mgr.set_disconnect_callback(lambda addr: events.append(addr))
     mac = "AA:BB:CC:01:10:90"
@@ -578,6 +729,109 @@ def test_dongle_disconnect_waits_for_disconnected_line_before_unregistering():
     assert mac not in src._managers  # type: ignore[attr-defined]
     assert 2 not in src._handle_to_mac  # type: ignore[attr-defined]
     assert 7 not in src._devid_to_mac  # type: ignore[attr-defined]
+    disconnect_log = next(
+        message for message in runtime_messages if "event=ble_disconnect" in message
+    )
+    assert "reason_code=0x13 reason_name=REMOTE_USER_TERMINATED_CONNECTION" in disconnect_log
+    assert "command_pending=true requested_by_app=true" in disconnect_log
+    assert "trigger=app_request ignored=false" in disconnect_log
+
+
+def test_firmware_disconnect_ack_preserves_stream_watchdog_trigger(monkeypatch):
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+    src._handle_to_mac[2] = mac  # type: ignore[attr-defined]
+    runtime_messages: list[str] = []
+    monkeypatch.setattr(ds, "_write_dongle_runtime_log", runtime_messages.append)
+
+    task = loop.create_task(
+        src._disconnect(mac, trigger="stream_watchdog")  # type: ignore[attr-defined]
+    )
+    loop.run_until_complete(asyncio.sleep(0))
+    assert serial.writes == [f"AT+DISC={mac}"]
+
+    src._on_line("DISCONNECTED handle=2 #7 GIOS0403ST#7 reason=0x13")  # type: ignore[attr-defined]
+    loop.run_until_complete(task)
+
+    assert "command_pending=true requested_by_app=true" in runtime_messages[-1]
+    assert "trigger=stream_watchdog ignored=false" in runtime_messages[-1]
+    loop.close()
+
+
+def test_concurrent_disconnect_requests_for_same_mac_are_coalesced(monkeypatch):
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+    src._handle_to_mac[2] = mac  # type: ignore[attr-defined]
+    runtime_messages: list[str] = []
+    monkeypatch.setattr(ds, "_write_dongle_runtime_log", runtime_messages.append)
+
+    first = loop.create_task(
+        src._disconnect(mac, trigger="app_request")  # type: ignore[attr-defined]
+    )
+    loop.run_until_complete(asyncio.sleep(0))
+    second = loop.create_task(
+        src._disconnect(mac, trigger="stream_watchdog")  # type: ignore[attr-defined]
+    )
+    loop.run_until_complete(asyncio.sleep(0))
+
+    assert serial.writes == [f"AT+DISC={mac}"]
+    assert any(
+        "event=disconnect_request source=app action=coalesced" in message
+        and "active_trigger=app_request requested_trigger=stream_watchdog" in message
+        for message in runtime_messages
+    )
+
+    src._on_line("DISCONNECTED handle=2 #7 GIOS0403ST#7 reason=0x13")  # type: ignore[attr-defined]
+    loop.run_until_complete(asyncio.gather(first, second))
+
+    disconnect_log = next(
+        message for message in runtime_messages if "event=ble_disconnect" in message
+    )
+    assert "command_pending=true requested_by_app=true" in disconnect_log
+    assert "trigger=app_request ignored=false" in disconnect_log
+    assert src._stale_disconnect_handles == set()  # type: ignore[attr-defined]
+    assert src._needs_recovery is False  # type: ignore[attr-defined]
+    loop.close()
+
+
+def test_cancelled_disconnect_caller_keeps_shared_operation_registered(monkeypatch):
+    src, serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+    src._handle_to_mac[2] = mac  # type: ignore[attr-defined]
+    runtime_messages: list[str] = []
+    monkeypatch.setattr(ds, "_write_dongle_runtime_log", runtime_messages.append)
+
+    first = loop.create_task(
+        src._disconnect(mac, trigger="app_request")  # type: ignore[attr-defined]
+    )
+    loop.run_until_complete(asyncio.sleep(0))
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        loop.run_until_complete(first)
+
+    shared = src._disconnect_tasks[mac]  # type: ignore[attr-defined]
+    assert not shared.done()
+
+    second = loop.create_task(
+        src._disconnect(mac, trigger="stream_watchdog")  # type: ignore[attr-defined]
+    )
+    loop.run_until_complete(asyncio.sleep(0))
+
+    assert serial.writes == [f"AT+DISC={mac}"]
+    assert any("action=coalesced" in message for message in runtime_messages)
+
+    src._on_line("DISCONNECTED handle=2 #7 GIOS0403ST#7 reason=0x13")  # type: ignore[attr-defined]
+    loop.run_until_complete(second)
+    loop.run_until_complete(asyncio.sleep(0))
+
+    assert shared.done()
+    assert mac not in src._disconnect_tasks  # type: ignore[attr-defined]
+    assert src._stale_disconnect_handles == set()  # type: ignore[attr-defined]
+    assert src._needs_recovery is False  # type: ignore[attr-defined]
+    loop.close()
 
 
 def test_dongle_scan_waits_for_pending_disconnect_before_starting():
@@ -702,6 +956,8 @@ def test_disconnect_timeout_swallows_stale_disconnected_on_reused_handle(monkeyp
     src, serial = _make_source_with_fake_serial()
     loop = src._loop  # type: ignore[attr-defined]
     mac = "AA:BB:CC:01:10:90"
+    runtime_messages: list[str] = []
+    monkeypatch.setattr(ds, "_write_dongle_runtime_log", runtime_messages.append)
 
     # First link on handle 0; disconnect it but the firmware never acks.
     mgr1 = src.create_manager()
@@ -729,10 +985,15 @@ def test_disconnect_timeout_swallows_stale_disconnected_on_reused_handle(monkeyp
     assert events == []  # fresh link NOT torn down
     assert src._managers.get(mac) is mgr2  # type: ignore[attr-defined]
     assert 0 not in src._stale_disconnect_handles  # type: ignore[attr-defined]
+    stale_log = runtime_messages[-1]
+    assert "address=- handle=0" in stale_log
+    assert "trigger=app_request ignored=true" in stale_log
 
     # A subsequent real DISCONNECTED for the fresh link tears it down normally.
     src._on_line("DISCONNECTED handle=0 #7 GIOS0403ST#7 reason=0x13")  # type: ignore[attr-defined]
     assert events == [mac]
+    assert f"address={mac} handle=0" in runtime_messages[-1]
+    assert "trigger=unsolicited ignored=false" in runtime_messages[-1]
 
 
 def test_scan_results_parsed_from_at_list():
@@ -862,18 +1123,47 @@ def test_recover_succeeds_when_firmware_answers_probe(monkeypatch):
     loop.close()
 
 
-def test_prepare_reconnect_sends_per_device_disc_before_at_conn():
+def test_prepare_reconnect_sends_per_device_disc_before_at_conn(monkeypatch):
     # A reconnect must clear the firmware's latched per-device link with a
     # per-device AT+DISC (not the global AT+DISC that would drop other links).
     src, serial = _make_source_with_fake_serial()
     loop = src._loop  # type: ignore[attr-defined]
     mac = "AA:BB:CC:01:10:90"
+    src._handle_to_mac[2] = mac  # type: ignore[attr-defined]
+    runtime_messages: list[str] = []
+    monkeypatch.setattr(ds, "_write_dongle_runtime_log", runtime_messages.append)
 
     loop.run_until_complete(src.prepare_reconnect(mac))
 
     assert serial.writes == [f"AT+DISC={mac}"]
+    assert any(
+        "event=disconnect_request source=app action=sent" in message
+        and f"address={mac} trigger=reconnect_preparation" in message
+        for message in runtime_messages
+    )
+    src._on_line("DISCONNECTED handle=2 #7 GIOS0403ST#7 reason=0x13")  # type: ignore[attr-defined]
+    disconnect_log = runtime_messages[-1]
+    assert "command_pending=false requested_by_app=true" in disconnect_log
+    assert "trigger=reconnect_preparation ignored=false" in disconnect_log
     # The disconnect timestamp is recorded so the following AT+CONN settles.
     assert src._last_disconnect_monotonic is not None  # type: ignore[attr-defined]
+    loop.close()
+
+
+def test_connected_invalidates_unconsumed_reconnect_disconnect_context(monkeypatch):
+    src, _serial = _make_source_with_fake_serial()
+    loop = src._loop  # type: ignore[attr-defined]
+    mac = "AA:BB:CC:01:10:90"
+    runtime_messages: list[str] = []
+    monkeypatch.setattr(ds, "_write_dongle_runtime_log", runtime_messages.append)
+
+    loop.run_until_complete(src.prepare_reconnect(mac))
+    src._on_line(f"CONNECTED handle=2 #7 GIOS0403ST#7 MAC={mac}")  # type: ignore[attr-defined]
+    src._on_line("DISCONNECTED handle=2 #7 GIOS0403ST#7 reason=0x08")  # type: ignore[attr-defined]
+
+    disconnect_log = runtime_messages[-1]
+    assert "command_pending=false requested_by_app=false" in disconnect_log
+    assert "trigger=unsolicited ignored=false" in disconnect_log
     loop.close()
 
 
