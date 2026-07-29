@@ -147,7 +147,9 @@ class OverviewPage(QWidget):
         self.labels["output"].setText(f"{state.output_power_w:.2f} W")
         self.labels["eff"].setText(f"{state.system_eff:.2f} %")
         self.labels["temp"].setText(
-            f"Bus {state.bus_temp_deg_c} C / Amp {state.amp_temp_deg_c} C / PRU {state.pru_dyn_temp} C"
+            f"PTU   BUS {state.bus_temp_deg_c} °C   |   AMP {state.amp_temp_deg_c} °C"
+            f"   |   IC {state.ic_temp_deg_c} °C\n"
+            f"PRU   SYS {state.pru_dyn_temp} °C"
         )
         self.labels["packets"].setText(
             f"IOT {state.packet_count_iot} / 20B {state.packet_count_20b} / 200B {state.packet_count_200b}"
