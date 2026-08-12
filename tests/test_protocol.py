@@ -68,6 +68,47 @@ def test_iot_packet_updates_core_values():
     assert state.ptu_mac == "0A:0B:0C:0D:0E:0F"
 
 
+def test_iot_packet_decodes_negative_temperatures():
+    state = DeviceState()
+    data = [0] * 25
+    data[15] = 0xFB  # -5 as int8
+    data[24] = 0xD8  # -40 as int8
+
+    decode_iot_packet(data, state)
+
+    assert state.amp_temp_deg_c == -5
+    assert state.pru_dyn_temp == -40
+
+
+def test_20b_packet_decodes_negative_temperatures():
+    state = DeviceState()
+    data = [0] * 20
+    data[9] = 0xFB  # -5 as int8
+    data[18] = 0xD8  # -40 as int8
+
+    decode_20b_packet(data, state)
+
+    assert state.amp_temp_deg_c == -5
+    assert state.pru_dyn_temp == -40
+
+
+def test_200b_packet_decodes_negative_temperatures():
+    state = DeviceState()
+    data = [0] * 204
+    data[20] = 0xFB  # -5 as int8
+    data[21] = 0xF6  # -10 as int8
+    data[22] = 0xEC  # -20 as int8
+    data[60] = 0xD8  # -40 as int16 (little-endian)
+    data[61] = 0xFF
+
+    decode_200b_packet(data, state)
+
+    assert state.bus_temp_deg_c == -5
+    assert state.amp_temp_deg_c == -10
+    assert state.ic_temp_deg_c == -20
+    assert state.pru_dyn_temp == -40
+
+
 def test_20b_packet_updates_core_values():
     state = DeviceState()
     data = [
@@ -210,6 +251,32 @@ def test_200b_packet_updates_charger_and_error_fields():
     assert state.error_data == 1
     assert state.error_limit == 2
     assert event and event.kind == "error"
+
+
+def test_200b_temperature_error_data_is_signed():
+    state = DeviceState()
+    data = [0] * 204
+    data[192] = 0x03  # ERROR_PTU_OT_IC
+    data[196:200] = [0xF5, 0xFF, 0xFF, 0xFF]  # -11 as int32
+    data[200:204] = [10, 0, 0, 0]
+
+    decode_200b_packet(data, state)
+
+    assert state.error_data == -11
+    assert state.error_limit == 10
+
+
+def test_200b_non_temperature_error_data_stays_unsigned():
+    state = DeviceState()
+    data = [0] * 204
+    data[192] = 0x10  # ERROR_PTU_OC_I_IN
+    data[196:200] = [0xF5, 0xFF, 0xFF, 0xFF]
+    data[200:204] = [10, 0, 0, 0]
+
+    decode_200b_packet(data, state)
+
+    assert state.error_data == 4294967285
+    assert state.error_limit == 10
 
 
 def test_200b_pru_connected_transition_returns_event_without_error():

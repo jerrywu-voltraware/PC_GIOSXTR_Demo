@@ -25,6 +25,20 @@ def signed16(value: int) -> int:
     return value - 65536 if value > 32767 else value
 
 
+def signed8(value: int) -> int:
+    return value - 256 if value > 127 else value
+
+
+def signed32(value: int) -> int:
+    return value - 4294967296 if value > 2147483647 else value
+
+
+# Over-temperature error codes whose error_data/error_limit carry a signed
+# temperature reading (firmware stores int32; other codes carry unsigned
+# voltage/current values).
+TEMPERATURE_ERROR_CODES = frozenset({0x01, 0x02, 0x03, 0xA2})
+
+
 def mac_string(data: list[int]) -> str:
     return ":".join(f"{byte:02X}" for byte in data)
 
@@ -152,7 +166,7 @@ def decode_iot_packet(data: list[int] | bytes | bytearray, state: DeviceState) -
         state.i1_i3_phase_diff_deg = state.i3_deg - state.i1_deg
 
     if len(payload) >= 17:
-        state.amp_temp_deg_c = payload[15]
+        state.amp_temp_deg_c = signed8(payload[15])
         state.ptu_firmware_version = payload[16]
 
     if len(payload) >= 18:
@@ -162,7 +176,7 @@ def decode_iot_packet(data: list[int] | bytes | bytearray, state: DeviceState) -
         state.pru_dyn_vrect = le_u16(payload, 18) * 10
         state.pru_dyn_vout = le_u16(payload, 20) * 10
         state.pru_dyn_iout = le_u16(payload, 22)
-        state.pru_dyn_temp = payload[24]
+        state.pru_dyn_temp = signed8(payload[24])
 
     if len(payload) > 25:
         state.pru_type_string = {0x01: "0403V1", 0x02: "0404V1"}.get(payload[25], "-")
@@ -194,13 +208,13 @@ def decode_20b_packet(data: list[int] | bytes | bytearray, state: DeviceState) -
     if new_i3_current > 0:
         state.i3_current = new_i3_current
 
-    state.amp_temp_deg_c = payload[9]
+    state.amp_temp_deg_c = signed8(payload[9])
     state.ptu_firmware_version = payload[10]
     event = _set_pru_state(state, payload[11]) or event
     state.pru_dyn_vrect = le_u16(payload, 12) * 10
     state.pru_dyn_vout = le_u16(payload, 14) * 10
     state.pru_dyn_iout = le_u16(payload, 16)
-    state.pru_dyn_temp = payload[18]
+    state.pru_dyn_temp = signed8(payload[18])
     state.error_num = payload[19]
     event = _check_error_change(state) or event
     state.update_efficiency()
@@ -217,9 +231,9 @@ def decode_200b_packet(data: list[int] | bytes | bytearray, state: DeviceState) 
     state.ptu_input_current = le_u16(payload, 6)
     state.ptu_bus_voltage = le_u32(payload, 8)
     state.ptu_bus_current = le_u16(payload, 12)
-    state.bus_temp_deg_c = payload[20]
-    state.amp_temp_deg_c = payload[21]
-    state.ic_temp_deg_c = payload[22]
+    state.bus_temp_deg_c = signed8(payload[20])
+    state.amp_temp_deg_c = signed8(payload[21])
+    state.ic_temp_deg_c = signed8(payload[22])
 
     new_i3_current = le_u16(payload, 26)
     if new_i3_current > 0:
@@ -234,7 +248,7 @@ def decode_200b_packet(data: list[int] | bytes | bytearray, state: DeviceState) 
     state.pru_dyn_irect = le_u16(payload, 54)
     state.pru_dyn_vout = le_u16(payload, 56) * 10
     state.pru_dyn_iout = le_u16(payload, 58)
-    state.pru_dyn_temp = le_u16(payload, 60)
+    state.pru_dyn_temp = signed16(le_u16(payload, 60))
     state.pru_dyn_vrect_min = le_u16(payload, 62)
     state.pru_dyn_vrect_set = le_u16(payload, 64)
     state.pru_dyn_vrect_max = le_u16(payload, 66)
@@ -264,8 +278,13 @@ def decode_200b_packet(data: list[int] | bytes | bytearray, state: DeviceState) 
 
     if len(payload) >= 204:
         state.error_num = payload[192]
-        state.error_data = le_u32(payload, 196)
-        state.error_limit = le_u32(payload, 200)
+        error_data = le_u32(payload, 196)
+        error_limit = le_u32(payload, 200)
+        if state.error_num in TEMPERATURE_ERROR_CODES:
+            error_data = signed32(error_data)
+            error_limit = signed32(error_limit)
+        state.error_data = error_data
+        state.error_limit = error_limit
         event = _check_error_change(state) or event
     elif len(payload) > 192:
         state.error_num = payload[192]

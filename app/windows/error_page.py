@@ -237,8 +237,8 @@ class ErrorPage(QWidget):
         self.banner_code.setText(f"目前錯誤代碼: 0x{code:02X} ({code})")
         self.banner_name.setText(error_name(code))
         self.banner_desc.setText(error_description(code))
-        self._set_metric_value(self.error_data_card, f"0x{state.error_data:X} ({state.error_data})")
-        self._set_metric_value(self.error_limit_card, f"0x{state.error_limit:X} ({state.error_limit})")
+        self._set_metric_value(self.error_data_card, f"0x{state.error_data & 0xFFFFFFFF:X} ({state.error_data})")
+        self._set_metric_value(self.error_limit_card, f"0x{state.error_limit & 0xFFFFFFFF:X} ({state.error_limit})")
         self._set_metric_value(self.time_card, state.latest_error_time or "-")
         device = state.device_name or state.device_address or "-"
         if state.device_number is not None:
