@@ -17,6 +17,8 @@ from PyQt6.QtWidgets import (
 from qasync import asyncSlot
 
 from ..ble_manager import BleManager
+from ..theme import ThemeTokens, current_tokens, theme_manager
+from ..typography import font_size
 
 
 class NumberPage(QWidget):
@@ -26,12 +28,11 @@ class NumberPage(QWidget):
         super().__init__(parent)
         self._ble_provider = ble_provider
         root = QVBoxLayout(self)
-        title = QLabel("Device Number")
-        title.setStyleSheet("font-size: 20px; font-weight: 700;")
-        root.addWidget(title)
-        hint = QLabel("Operates on the currently active connected device.")
-        hint.setStyleSheet("color: #888;")
-        root.addWidget(hint)
+        self.title = QLabel("Device Number")
+        root.addWidget(self.title)
+        self.hint = QLabel("Operates on the currently active connected device.")
+        self.hint.setWordWrap(True)
+        root.addWidget(self.hint)
         row = QHBoxLayout()
         self.combo = QComboBox()
         for number in range(1, 255):
@@ -48,6 +49,12 @@ class NumberPage(QWidget):
         self.status.setWordWrap(True)
         root.addWidget(self.status)
         root.addStretch(1)
+        self._apply_theme(current_tokens())
+        theme_manager().theme_changed.connect(self._apply_theme)
+
+    def _apply_theme(self, tokens: ThemeTokens) -> None:
+        self.title.setStyleSheet(f"font-size: {font_size(15)}; font-weight: 700;")
+        self.hint.setStyleSheet(f"color: {tokens.text_secondary};")
 
     def _ble(self) -> BleManager | None:
         return self._ble_provider()

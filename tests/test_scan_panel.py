@@ -351,9 +351,9 @@ def test_scan_panel_uses_scroll_area_and_flexible_list_heights():
     panel = ScanPanel(ble=object())
 
     assert panel.scroll_area.widgetResizable()
-    assert panel.scroll_area.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-    assert panel.list_widget.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-    assert panel.connected_list.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    assert panel.scroll_area.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+    assert panel.list_widget.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+    assert panel.connected_list.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
     assert panel.list_widget.minimumHeight() <= 160
     assert panel.connected_list.minimumHeight() <= 96
 

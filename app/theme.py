@@ -9,6 +9,8 @@ from PyQt6.QtCore import QObject, Qt, QSettings, pyqtSignal
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtWidgets import QApplication, QStyleFactory
 
+from .typography import scaled_px, typography_manager
+
 
 THEME_LIGHT = "light"
 THEME_DARK = "dark"
@@ -274,7 +276,7 @@ QComboBox QAbstractItemView {{
 QTabBar::tab {{
     background: {tokens.surface_alt};
     color: {tokens.text_secondary};
-    padding: 6px 12px;
+    padding: {scaled_px(6)}px {scaled_px(12)}px;
     border: 1px solid {tokens.border};
     border-bottom: none;
 }}
@@ -298,16 +300,24 @@ class _ThemeManager(QObject):
         super().__init__()
         self._tokens: ThemeTokens = _LIGHT
         self._app: QApplication | None = None
+        typography_manager().scale_changed.connect(self._on_scale_changed)
 
     def install(self, app: QApplication, theme_name: str | None = None) -> None:
         """Apply the chosen theme to the app and remember the QApplication."""
         self._app = app
+        typography_manager().install(app)
         fusion = QStyleFactory.create("Fusion")
         if fusion is not None:
             app.setStyle(fusion)
         if theme_name is None:
             theme_name = load_saved_theme()
         self.set_theme(theme_name, persist=False)
+
+    def _on_scale_changed(self, _percent: int) -> None:
+        if self._app is not None:
+            self._app.setStyleSheet(_style_sheet_for(self._tokens))
+        # Page styles also contain typography, so refresh them immediately.
+        self.theme_changed.emit(self._tokens)
 
     def current(self) -> ThemeTokens:
         return self._tokens

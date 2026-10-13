@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
 from ..models import DeviceState
 from ..protocol import error_description
 from ..theme import ThemeTokens, current_tokens, theme_manager
+from ..typography import font_size
 
 
 class ErrorLogDialog(QDialog):
@@ -48,7 +49,6 @@ class ErrorLogDialog(QDialog):
         self.header = QLabel("錯誤通知 (0)")
         header_font = QFont()
         header_font.setBold(True)
-        header_font.setPointSize(11)
         self.header.setFont(header_font)
         root.addWidget(self.header)
 
@@ -57,13 +57,15 @@ class ErrorLogDialog(QDialog):
             ["時間", "代碼", "描述", "讀取值 / 條件值", "裝置"]
         )
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setWordWrap(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setAlternatingRowColors(True)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         root.addWidget(self.table, 1)
@@ -115,13 +117,15 @@ class ErrorLogDialog(QDialog):
             QTableWidgetItem(trigger),
             QTableWidgetItem(device),
         ]
-        mono = QFont("Consolas")
+        mono = QFont(self.table.font())
+        mono.setFamily("Consolas")
         items[0].setFont(mono)
         items[1].setFont(mono)
         items[3].setFont(mono)
         items[1].setForeground(self._error_brush())
         for item in items:
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            item.setToolTip(item.text())
         for col, item in enumerate(items):
             self.table.setItem(row, col, item)
 
@@ -149,10 +153,11 @@ class ErrorLogDialog(QDialog):
         self.setStyleSheet(
             f"QDialog {{ background: {tokens.card_bg}; color: {tokens.text_primary}; }}"
         )
-        self.header.setStyleSheet(f"color: {tokens.error_fg};")
+        self.header.setStyleSheet(f"font-size: {font_size(13)}; color: {tokens.error_fg};")
         self.table.setStyleSheet(
             f"""
             QTableWidget {{
+                font-size: {font_size(11)};
                 background: {tokens.table_bg};
                 alternate-background-color: {tokens.table_alt};
                 border: 1px solid {tokens.card_border};
@@ -174,3 +179,10 @@ class ErrorLogDialog(QDialog):
             item = self.table.item(row, 1)
             if item is not None:
                 item.setForeground(brush)
+            for col in (0, 1, 3):
+                mono_item = self.table.item(row, col)
+                if mono_item is not None:
+                    mono = QFont(self.table.font())
+                    mono.setFamily("Consolas")
+                    mono_item.setFont(mono)
+        self.table.resizeRowsToContents()

@@ -11,9 +11,12 @@ from PyQt6.QtCore import QCoreApplication, QSettings, QStandardPaths, QTimer, Qt
 from PyQt6.QtGui import QDesktopServices, QIcon
 from PyQt6.QtWidgets import (
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QMainWindow,
     QMessageBox,
+    QScrollArea,
+    QSplitter,
     QTabWidget,
     QToolButton,
     QVBoxLayout,
@@ -55,6 +58,7 @@ from .error_page import ErrorPage
 from .log_page import LogPage
 from .number_page import NumberPage
 from .overview_page import OverviewPage
+from .recording_panel import RecordingPanel
 from .scan_panel import ScanPanel
 from .settings_dialog import SettingsDialog
 from .waveform_page import WaveformPage
@@ -88,6 +92,7 @@ AUTO_RECONNECT_DEFAULT = True
 DEMO_CHARGER_MODE_SETTINGS_KEY = "demo/chargerMode"
 DEMO_EBIKE_STYLE_SETTINGS_KEY = "demo/ebikeStyle"
 RECORD_SPLIT_ROWS_SETTINGS_KEY = "recording/splitRows"
+RECORD_DIRECTORY_SETTINGS_KEY = "recording/directory"
 SETTINGS_ORGANIZATION = "GIOSXTR"
 RECONNECT_DELAYS_SECONDS = (1.0, 3.0, 5.0, 10.0)
 RECONNECT_MAX_ATTEMPTS = 10
@@ -154,12 +159,16 @@ class MainWindow(QMainWindow):
         icon = QIcon(str(resource_path(APP_ICON_FILENAME)))
         if not icon.isNull():
             self.setWindowIcon(icon)
-        self.resize(1280, 820)
+        available = self.screen().availableGeometry()
+        self.resize(min(1280, available.width() - 40), min(820, available.height() - 60))
 
-        self.log_dir = Path.cwd() / "logs"
+        _ensure_settings_identity()
+        saved_directory = str(QSettings().value(RECORD_DIRECTORY_SETTINGS_KEY, "") or "")
+        self.log_dir = Path(saved_directory) if saved_directory else Path.cwd() / "logs"
         self.managers: dict[str, DeviceManager] = {}
         self.states: dict[str, DeviceState] = {}
         self.loggers: dict[str, CsvLogger] = {}
+        self._recording_errors: dict[str, str] = {}
         self.recent_device_store = RecentDeviceStore()
         self._close_after_disconnect = False
         self.engineering_mode = engineering_mode
@@ -203,8 +212,12 @@ class MainWindow(QMainWindow):
         central = QWidget()
         layout = QHBoxLayout(central)
         layout.setContentsMargins(8, 8, 8, 8)
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(8)
+        layout.addWidget(self.splitter)
         self.scan_panel = ScanPanel(self.source)
-        self.scan_panel.setFixedWidth(380)
+        self.scan_panel.setMinimumWidth(240)
         self.scan_panel.device_connect_requested.connect(self._connect_device)
         self.scan_panel.disconnect_requested.connect(self._disconnect_active)
         self.scan_panel.device_disconnect_requested.connect(
@@ -221,12 +234,18 @@ class MainWindow(QMainWindow):
         self.scan_panel.open_log_folder_requested.connect(self._open_log_folder)
         self.scan_panel.auto_reconnect_changed.connect(self.set_auto_reconnect_enabled)
         self.scan_panel.set_auto_reconnect_enabled(self.auto_reconnect_enabled)
-        layout.addWidget(self.scan_panel)
+        self.splitter.addWidget(self.scan_panel)
 
         content = QWidget()
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(4)
+        self.recording_panel = RecordingPanel()
+        self.recording_panel.start_requested.connect(self.start_csv_recording_active)
+        self.recording_panel.stop_requested.connect(self.stop_csv_recording_active)
+        self.recording_panel.open_folder_requested.connect(self._open_recording_folder)
+        self.recording_panel.choose_folder_requested.connect(self._choose_log_folder)
+        content_layout.addWidget(self.recording_panel)
 
         self.device_tabs = QTabWidget()
         self.device_tabs.setDocumentMode(True)
@@ -237,8 +256,8 @@ class MainWindow(QMainWindow):
 
         self.tabs = QTabWidget()
         self.settings_btn = QToolButton()
-        self.settings_btn.setText("⚙")
-        self.settings_btn.setToolTip("設定")
+        self.settings_btn.setText("設定")
+        self.settings_btn.setToolTip("設定：字級、外觀、連線與錄製")
         self.settings_btn.setAutoRaise(True)
         self.settings_btn.clicked.connect(self._open_settings)
         self.tabs.setCornerWidget(self.settings_btn, Qt.Corner.TopRightCorner)
@@ -271,10 +290,30 @@ class MainWindow(QMainWindow):
             ("Log", self.log_page),
             ("Error", self.error_page),
         ):
-            self.tabs.addTab(widget, label)
+            # Large type or a small laptop screen must not force the entire
+            # window beyond the desktop. Keep page controls reachable by
+            # scrolling when their intrinsic minimum size cannot fit.
+            viewport = QScrollArea()
+            viewport.setWidgetResizable(True)
+            viewport.setFrameShape(QFrame.Shape.NoFrame)
+            viewport.setWidget(widget)
+            self.tabs.addTab(viewport, label)
         content_layout.addWidget(self.tabs, 1)
-        layout.addWidget(content, 1)
+        self.splitter.addWidget(content)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setSizes([380, 880])
         self.setCentralWidget(central)
+        # Only UI painting is coalesced. Parsing and each CSV write still run
+        # on every notification, independent of the selected page.
+        self._ui_refresh_timer = QTimer(self)
+        self._ui_refresh_timer.setSingleShot(True)
+        self._ui_refresh_timer.setInterval(100)
+        self._ui_refresh_timer.timeout.connect(self.refresh_pages)
+        self._recording_status_timer = QTimer(self)
+        self._recording_status_timer.setInterval(1000)
+        self._recording_status_timer.timeout.connect(self._refresh_recording_status)
+        self._recording_status_timer.start()
         self.refresh_pages()
         self.scan_panel.set_recent_devices(self.recent_device_store.load())
         if os.getenv("QT_QPA_PLATFORM", "").lower() != "offscreen":
@@ -596,13 +635,21 @@ class MainWindow(QMainWindow):
     def _refresh_device_tabs(self) -> None:
         self.device_tabs.blockSignals(True)
         try:
-            self.device_tabs.clear()
-            for address, state in self.states.items():
-                page = QWidget()
-                page.setProperty("address", address)
-                self.device_tabs.addTab(page, self._device_tab_label(state))
+            wanted = list(self.states)
+            existing = [self.device_tabs.widget(i).property("address") for i in range(self.device_tabs.count())]
+            if existing != wanted:
+                while self.device_tabs.count():
+                    page = self.device_tabs.widget(0)
+                    self.device_tabs.removeTab(0)
+                    page.deleteLater()
+                for address in wanted:
+                    page = QWidget()
+                    page.setProperty("address", address)
+                    self.device_tabs.addTab(page, "")
+            for index, (address, state) in enumerate(self.states.items()):
+                self.device_tabs.setTabText(index, self._device_tab_label(state))
                 if address == self.active_address:
-                    self.device_tabs.setCurrentIndex(self.device_tabs.count() - 1)
+                    self.device_tabs.setCurrentIndex(index)
             self.device_tabs.setVisible(len(self.states) > 1)
         finally:
             self.device_tabs.blockSignals(False)
@@ -911,7 +958,11 @@ class MainWindow(QMainWindow):
 
         logger = self.loggers.pop(address, None)
         if logger is not None and logger.is_recording:
-            path = logger.stop()
+            try:
+                path = logger.stop()
+            except OSError as exc:
+                self._recording_failed(address, exc)
+                path = None
             if path is not None:
                 state = self.states.get(address)
                 if state is not None:
@@ -1161,15 +1212,13 @@ class MainWindow(QMainWindow):
         self._maybe_resolve_pending_error(address, state)
         logger = self.loggers.get(address)
         if logger is not None and logger.is_recording:
-            logger.write_state(state)
+            try:
+                logger.write_state(state)
+            except OSError as exc:
+                self._recording_failed(address, exc)
         self.waveform_page.refresh_device(state, self.states, self.active_address)
-        if address == self.active_address:
-            self.refresh_pages()
-        else:
-            self._refresh_device_tabs()
-            self.scan_panel.refresh_connected_devices(
-                self._connected_summary(), self.active_address
-            )
+        if not self._ui_refresh_timer.isActive():
+            self._ui_refresh_timer.start()
 
     def _expire_connect_guard(self, address: str, manager: DeviceManager) -> None:
         """Expire only the attempt that created this safety timer."""
@@ -1256,14 +1305,69 @@ class MainWindow(QMainWindow):
             self._stop_recording(addr)
 
     def _open_log_folder(self) -> None:
+        self._open_directory(self.log_dir)
+
+    def _open_recording_folder(self) -> None:
+        logger = self._active_logger()
+        directory = logger.current_path.parent if logger and logger.is_recording and logger.current_path else self.log_dir
+        self._open_directory(directory)
+
+    def _open_directory(self, directory: Path) -> None:
         try:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
+            directory.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
-            batch_log("FILES", f"Unable to open log folder {self.log_dir}: {exc}", level="ERROR")
+            batch_log("FILES", f"Unable to open log folder {directory}: {exc}", level="ERROR")
             QMessageBox.warning(self, "開啟錄製資料夾失敗", str(exc))
             return
-        batch_log("FILES", f"Opening log folder: {self.log_dir}")
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.log_dir)))
+        batch_log("FILES", f"Opening log folder: {directory}")
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(directory.resolve()))):
+            QMessageBox.warning(self, "開啟錄製資料夾失敗", str(directory))
+
+    def _choose_log_folder(self) -> None:
+        if any(logger.is_recording for logger in self.loggers.values()):
+            return
+        selected = QFileDialog.getExistingDirectory(self, "選擇 CSV 儲存資料夾", str(self.log_dir))
+        if not selected:
+            return
+        self.log_dir = Path(selected)
+        QSettings().setValue(RECORD_DIRECTORY_SETTINGS_KEY, str(self.log_dir))
+        for logger in self.loggers.values():
+            logger.directory = self.log_dir
+        batch_log("FILES", f"CSV directory changed to {self.log_dir}")
+        self._refresh_recording_status()
+
+    def _recording_failed(self, address: str, error: OSError) -> None:
+        logger = self.loggers.get(address)
+        if logger is not None:
+            try:
+                logger.stop()
+            except OSError:
+                pass  # The original failure remains the actionable error.
+        self._recording_errors[address] = str(error)
+        state = self.states.get(address)
+        if state is not None:
+            state.add_log(f"CSV 錄製失敗，已停止: {error}")
+        batch_log("CSV", f"Recording failed address={address}: {error}", level="ERROR")
+        self._refresh_recording_status()
+
+    def _refresh_recording_status(self) -> None:
+        active = {address for address, logger in self.loggers.items() if logger.is_recording}
+        disconnected_count = sum(
+            1 for address in active if address in self.states and not self.states[address].is_connected
+        )
+        self.recording_panel.refresh(
+            self.state,
+            self._active_logger(),
+            self.log_dir,
+            recording_count=len(active),
+            device_count=len(self.states),
+            disconnected_count=disconnected_count,
+            error_count=len(self._recording_errors),
+            error=self._recording_errors.get(self.active_address, ""),
+            other_error=next(
+                (f"{address} · {message}" for address, message in reversed(self._recording_errors.items())), ""
+            ),
+        )
 
     def _start_recording(self, address: str) -> Path | None:
         state = self.states.get(address)
@@ -1272,7 +1376,13 @@ class MainWindow(QMainWindow):
             return None
         if logger.is_recording:
             return logger.current_path
-        path = logger.start(_device_tag(state), max_rows=self.record_split_rows)
+        try:
+            path = logger.start(_device_tag(state), max_rows=self.record_split_rows)
+        except OSError as exc:
+            self._recording_failed(address, exc)
+            self.refresh_pages()
+            return None
+        self._recording_errors.pop(address, None)
         state.add_log(f"CSV recording started: {path.name}")
         self.refresh_pages()
         return path
@@ -1282,7 +1392,12 @@ class MainWindow(QMainWindow):
         logger = self.loggers.get(address)
         if logger is None or not logger.is_recording:
             return None
-        path = logger.stop()
+        try:
+            path = logger.stop()
+        except OSError as exc:
+            self._recording_failed(address, exc)
+            self.refresh_pages()
+            return None
         if path is not None and state is not None:
             state.add_log(f"CSV recording stopped: {path.name}")
         self.refresh_pages()
@@ -1312,6 +1427,7 @@ class MainWindow(QMainWindow):
         return items
 
     def refresh_pages(self) -> None:
+        self._ui_refresh_timer.stop()
         state = self.state
         self._refresh_device_tabs()
         self.demo2_page.set_showcase_states(self.states, self.active_address)
@@ -1333,6 +1449,7 @@ class MainWindow(QMainWindow):
         self.scan_panel.refresh(state)
         self.scan_panel.set_recording_state(state.is_connected, rec_active, rec_path)
         self.scan_panel.refresh_connected_devices(self._connected_summary(), self.active_address)
+        self._refresh_recording_status()
 
     def closeEvent(self, event) -> None:
         if self.managers and not self._close_after_disconnect:
@@ -1349,8 +1466,13 @@ class MainWindow(QMainWindow):
         timer = getattr(self, "_reconnect_health_timer", None)
         if timer is not None:
             timer.stop()
-        for logger in self.loggers.values():
-            logger.stop()
+        self._ui_refresh_timer.stop()
+        self._recording_status_timer.stop()
+        for address, logger in self.loggers.items():
+            try:
+                logger.stop()
+            except OSError as exc:
+                self._recording_failed(address, exc)
         for addr in list(self._reconnect_tasks):
             self._cancel_reconnect(addr)
         self._reconnecting_addresses.clear()

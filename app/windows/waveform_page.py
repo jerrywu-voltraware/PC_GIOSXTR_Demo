@@ -9,12 +9,14 @@ from dataclasses import dataclass, field
 import pyqtgraph as pg
 from pyqtgraph.exporters import ImageExporter
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QFrame,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -24,6 +26,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
@@ -31,6 +35,7 @@ from PyQt6.QtWidgets import (
 from ..constants import SIGNAL_DEFINITIONS
 from ..models import DeviceState
 from ..theme import ThemeTokens, current_tokens, theme_manager
+from ..typography import font_size, scaled_px
 
 
 @dataclass
@@ -173,7 +178,16 @@ class WaveformPage(QWidget):
         controls.addWidget(QLabel("歷史"))
         controls.addWidget(self.history_combo)
         controls.addWidget(self.reset_btn)
-        root.addLayout(controls)
+        self.controls_widget = QWidget()
+        self.controls_widget.setLayout(controls)
+        controls.setContentsMargins(0, 0, 0, 0)
+        self.controls_scroll = QScrollArea()
+        self.controls_scroll.setWidgetResizable(True)
+        self.controls_scroll.setWidget(self.controls_widget)
+        self.controls_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.controls_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.controls_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        root.addWidget(self.controls_scroll)
 
         self.notice = QLabel("波形即時顯示")
         root.addWidget(self.notice)
@@ -246,21 +260,21 @@ class WaveformPage(QWidget):
         if any(chart.field_name == field_name for chart in self.charts):
             return
         plot = pg.PlotWidget(title=label)
-        plot.setMinimumHeight(230)
         self._style_plot(plot)
         plot.showGrid(x=True, y=True, alpha=0.28)
         plot.setLabel("bottom", "Sample")
         plot.setLabel("left", label)
-        plot.getAxis("left").setWidth(72)
         plot.setMouseEnabled(x=True, y=True)
         plot.setDownsampling(auto=True, mode="peak")
         plot.setClipToView(True)
         legend = plot.addLegend(offset=(12, 12))
         self._style_legend(legend)
         stats_label = QLabel("latest --   min --   max --   samples 0")
+        stats_label.setWordWrap(True)
         stats_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         stats_label.setStyleSheet(f"color: {self._tokens.text_secondary}; font-family: Consolas;")
         cursor_label = QLabel("游標 --")
+        cursor_label.setWordWrap(True)
         cursor_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         cursor_label.setStyleSheet(f"color: {self._tokens.text_secondary}; font-family: Consolas;")
         cursor_label.setVisible(self.crosshair_box.isChecked() or self.delta_box.isChecked())
@@ -281,14 +295,14 @@ class WaveformPage(QWidget):
         title.setStyleSheet(f"font-weight: 700; color: {self._tokens.text_primary};")
         self._chart_cards.append(card)
         self._chart_titles.append(title)
-        top.addWidget(title)
-        top.addWidget(cursor_label, 1)
-        top.addWidget(stats_label, 1)
+        top.addWidget(title, 1)
         top.addWidget(save_btn)
         top.addWidget(reset_btn)
         top.addWidget(clear_markers_btn)
         top.addWidget(remove_btn)
         card_layout.addLayout(top)
+        card_layout.addWidget(cursor_label)
+        card_layout.addWidget(stats_label)
         card_layout.addWidget(plot)
         self.container_layout.insertWidget(self.container_layout.count() - 1, card)
         item.plot.setProperty("card", card)
@@ -432,8 +446,8 @@ class WaveformPage(QWidget):
             anchor=(0.5, 1),
             fill=pg.mkBrush(self._delta_b_color),
         )
-        a_label.setFont(pg.Qt.QtGui.QFont("Consolas", 10, 700))
-        b_label.setFont(pg.Qt.QtGui.QFont("Consolas", 10, 700))
+        a_label.setFont(self._annotation_font())
+        b_label.setFont(self._annotation_font())
         a_label.setZValue(19)
         b_label.setZValue(19)
         a_label.setVisible(False)
@@ -683,7 +697,7 @@ class WaveformPage(QWidget):
         ):
             chart.cursor_label.setStyleSheet(
                 f"color: {self._tokens.text_primary}; font-family: Consolas; "
-                f"font-weight: 700; font-size: 11pt; "
+                f"font-weight: 700; font-size: {font_size(11)}; "
                 f"background: rgba(176,132,245,0.18); padding: 4px 6px; border-radius: 4px;"
             )
         else:
@@ -953,7 +967,7 @@ class WaveformPage(QWidget):
             fill=pg.mkBrush(0, 0, 0, 245),
             border=pg.mkPen(marker_color, width=2),
         )
-        label.setFont(pg.Qt.QtGui.QFont("Consolas", 10, 700))
+        label.setFont(self._annotation_font())
         label.setPos(x_value, y_value)
         label.setZValue(21)
         item.plot.addItem(line, ignoreBounds=True)
@@ -1172,9 +1186,38 @@ class WaveformPage(QWidget):
         left = max(0.0, right - max_samples + 1)
         item.plot.setXRange(left, max(right, left + 1), padding=0.01)
 
+    def _annotation_font(self) -> QFont:
+        font = QFont(self.font())
+        font.setFamily("Consolas")
+        font.setBold(True)
+        return font
+
     def _style_plot(self, plot: pg.PlotWidget) -> None:
         t = self._tokens
+        plot.setMinimumHeight(scaled_px(230))
         plot.setBackground(t.plot_bg)
+        plot.getAxis("left").setWidth(scaled_px(80))
+        plot.getAxis("bottom").setHeight(scaled_px(50))
+        for name in ("bottom", "left"):
+            axis = plot.getAxis(name)
+            axis.setStyle(tickFont=self.font())
+            label_visible = axis.label.isVisible()
+            label_options = {
+                "text": axis.labelText,
+                "units": axis.labelUnits,
+                "unitPrefix": axis.labelUnitPrefix,
+                **axis.labelStyle,
+                "font-size": font_size(11),
+            }
+            # These options were added after pyqtgraph 0.13. Preserve them on
+            # newer versions without passing unsupported CSS to older ones.
+            if hasattr(axis, "unitPower"):
+                label_options["unitPower"] = axis.unitPower
+            if hasattr(axis, "getSIPrefixEnableRanges"):
+                label_options["siPrefixEnableRanges"] = axis.getSIPrefixEnableRanges()
+            axis.setLabel(**label_options)
+            axis.showLabel(label_visible)
+        plot.plotItem.setTitle(plot.plotItem.titleLabel.text, size=font_size(13), color=t.plot_axis_text)
         plot.getAxis("bottom").setPen(t.plot_axis)
         plot.getAxis("left").setPen(t.plot_axis)
         plot.getAxis("bottom").setTextPen(t.plot_axis_text)
@@ -1186,6 +1229,12 @@ class WaveformPage(QWidget):
         bg.setAlpha(200)
         legend.setBrush(pg.mkBrush(bg))
         legend.setPen(pg.mkPen(t.plot_legend_pen))
+        legend.setLabelTextSize(font_size(11))
+        legend.setLabelTextColor(t.plot_axis_text)
+        # LabelItem.setAttr only changes its options. Rebuild the rendered
+        # HTML so existing series labels respond to text-scale/theme changes.
+        for _sample, label in legend.items:
+            label.setText(label.text, size=font_size(11), color=t.plot_axis_text)
 
     def _style_card(self, card: QWidget) -> None:
         t = self._tokens
@@ -1202,6 +1251,11 @@ class WaveformPage(QWidget):
     def _apply_theme(self, tokens: ThemeTokens) -> None:
         self._tokens = tokens
         self.notice.setStyleSheet(f"color: {tokens.text_secondary};")
+        self.controls_widget.ensurePolished()
+        self.controls_scroll.setFixedHeight(
+            self.controls_widget.sizeHint().height()
+            + self.style().pixelMetric(QStyle.PixelMetric.PM_ScrollBarExtent) + 6
+        )
 
     def _on_theme_changed(self, tokens: ThemeTokens) -> None:
         self._apply_theme(tokens)
@@ -1211,6 +1265,12 @@ class WaveformPage(QWidget):
             title.setStyleSheet(f"font-weight: 700; color: {tokens.text_primary};")
         for item in self.charts:
             self._style_plot(item.plot)
+            annotation_font = self._annotation_font()
+            for label in (item.a_label, item.b_label):
+                if label is not None:
+                    label.setFont(annotation_font)
+            for marker in item.markers:
+                marker.label.setFont(annotation_font)
             # Recreate the legend so its colors update.
             try:
                 legend = item.plot.plotItem.legend

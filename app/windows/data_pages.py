@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 
 from ..models import DeviceState
 from ..theme import ThemeTokens, current_tokens, theme_manager
+from ..typography import font_size
 
 
 class DataTablePage(QWidget):
@@ -28,7 +29,11 @@ class DataTablePage(QWidget):
         self.table = QTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["Field", "Value"])
         self.table.verticalHeader().setVisible(False)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setWordWrap(False)
+        self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         root.addWidget(self.table, 1)
@@ -39,11 +44,12 @@ class DataTablePage(QWidget):
     def _apply_theme(self, tokens: ThemeTokens) -> None:
         self._tokens = tokens
         self._title_label.setStyleSheet(
-            f"font-size: 18px; font-weight: 700; color: {tokens.text_primary};"
+            f"font-size: {font_size(15)}; font-weight: 700; color: {tokens.text_primary};"
         )
         self.table.setStyleSheet(
             f"""
             QTableWidget {{
+                font-size: {font_size(11)};
                 background: {tokens.table_bg};
                 alternate-background-color: {tokens.table_alt};
                 border: 1px solid {tokens.card_border};
@@ -64,22 +70,30 @@ class DataTablePage(QWidget):
     def _on_theme_changed(self, tokens: ThemeTokens) -> None:
         self._apply_theme(tokens)
         if self._last_rows:
-            self.set_rows(self._last_rows)
+            self.set_rows(self._last_rows, force_style=True)
+        self.table.resizeRowsToContents()
 
-    def set_rows(self, rows: list[tuple[str, str]]) -> None:
+    def set_rows(self, rows: list[tuple[str, str]], *, force_style: bool = False) -> None:
+        if rows == self._last_rows and not force_style:
+            return
         self._last_rows = list(rows)
         field_brush = QBrush(QColor(self._tokens.accent))
         value_brush = QBrush(QColor(self._tokens.text_primary))
         self.table.setRowCount(len(rows))
         for row, (field, value) in enumerate(rows):
             for col, text in enumerate((field, value)):
-                item = QTableWidgetItem(text)
+                item = self.table.item(row, col)
+                if item is None:
+                    item = QTableWidgetItem(text)
+                    self.table.setItem(row, col, item)
+                elif item.text() != text:
+                    item.setText(text)
+                item.setToolTip(text)
                 if col == 0:
                     item.setForeground(field_brush)
                 else:
                     item.setForeground(value_brush)
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-                self.table.setItem(row, col, item)
 
     def refresh(self, state: DeviceState) -> None:
         raise NotImplementedError

@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QBoxLayout,
     QCheckBox,
     QFrame,
     QHBoxLayout,
@@ -33,6 +34,7 @@ from ..device_source import _SCAN_UNAVAILABLE_MESSAGE, DongleTransactionAborted
 from ..models import DeviceState
 from ..recent_devices import RecentDevice
 from ..theme import ThemeTokens, current_tokens, theme_manager
+from ..typography import font_size, scaled_px
 
 
 class ScanPanel(QWidget):
@@ -62,6 +64,8 @@ class ScanPanel(QWidget):
         self._reconnecting_addresses: set[str] = set()
         self._tracked_addresses: set[str] = set()
         self._active_address: str = ""
+        self._last_connected_devices: list[dict[str, str]] = []
+        self._connected_display_signature: tuple | None = None
         self.setObjectName("scanPanel")
 
         outer = QVBoxLayout(self)
@@ -70,7 +74,7 @@ class ScanPanel(QWidget):
         self.scroll_area = QScrollArea()
         self.scroll_area.setObjectName("scanPanelScroll")
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
         self.scroll_content = QWidget()
         self.scroll_content.setObjectName("scanPanelBody")
@@ -78,6 +82,8 @@ class ScanPanel(QWidget):
         root.setContentsMargins(14, 14, 14, 14)
         root.setSpacing(10)
         self.scroll_area.setWidget(self.scroll_content)
+        self.scroll_area.viewport().installEventFilter(self)
+        self._button_rows: list[QHBoxLayout] = []
         outer.addWidget(self.scroll_area)
 
         self._tokens: ThemeTokens = current_tokens()
@@ -91,6 +97,7 @@ class ScanPanel(QWidget):
         scan_state_layout.setSpacing(4)
         self.scan_state_title = QLabel("準備搜尋附近裝置")
         self.scan_state_title.setObjectName("scanStateTitle")
+        self.scan_state_title.setWordWrap(True)
         self.scan_state_detail = QLabel("按下掃描後，只會顯示支援的 VOLTRAWARE 裝置。")
         self.scan_state_detail.setObjectName("scanStateDetail")
         self.scan_state_detail.setWordWrap(True)
@@ -115,7 +122,8 @@ class ScanPanel(QWidget):
         self.list_widget.currentItemChanged.connect(self._on_selection_changed)
         self.list_widget.setMinimumHeight(160)
         self.list_widget.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.list_widget.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         root.addWidget(self.list_widget, 3)
         self._show_empty_result("尚未掃描", "按下搜尋裝置後，附近可連線的裝置會出現在這裡。")
 
@@ -137,9 +145,9 @@ class ScanPanel(QWidget):
             self._show_connected_context_menu
         )
         self.connected_list.setMinimumHeight(96)
-        self.connected_list.setMaximumHeight(200)
         self.connected_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        self.connected_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.connected_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.connected_list.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         root.addWidget(self.connected_list, 2)
 
         self.clear_packet_counts_btn = QPushButton("清除封包計數")
@@ -150,6 +158,7 @@ class ScanPanel(QWidget):
         root.addWidget(self.clear_packet_counts_btn)
 
         disc_row = QHBoxLayout()
+        self._button_rows.append(disc_row)
         disc_row.setSpacing(8)
         self.disconnect_btn = QPushButton("中斷目前裝置")
         self.disconnect_btn.setObjectName("secondaryButton")
@@ -167,6 +176,7 @@ class ScanPanel(QWidget):
         root.addWidget(self.auto_reconnect_box)
 
         rec_active_row = QHBoxLayout()
+        self._button_rows.append(rec_active_row)
         rec_active_row.setSpacing(8)
         self.start_recording_btn = QPushButton("開始錄製(目前)")
         self.start_recording_btn.setObjectName("secondaryButton")
@@ -179,6 +189,7 @@ class ScanPanel(QWidget):
         root.addLayout(rec_active_row)
 
         rec_all_row = QHBoxLayout()
+        self._button_rows.append(rec_all_row)
         rec_all_row.setSpacing(8)
         self.start_recording_all_btn = QPushButton("開始錄製(全部)")
         self.start_recording_all_btn.setObjectName("secondaryButton")
@@ -212,18 +223,40 @@ class ScanPanel(QWidget):
         self.adv_raw.setObjectName("rawData")
         self.adv_raw.setReadOnly(True)
         self.adv_raw.setPlaceholderText("選擇裝置後顯示廣播資料")
-        self.adv_raw.setMaximumHeight(52)
+        self.adv_raw.setMinimumHeight(scaled_px(72))
+        self.adv_raw.setMaximumHeight(scaled_px(110))
         root.addWidget(self.adv_raw)
 
         self.adv_table = QTableWidget(0, 3)
         self.adv_table.setObjectName("advTable")
         self.adv_table.setHorizontalHeaderLabels(["LEN", "TYPE", "VALUE"])
         self.adv_table.verticalHeader().setVisible(False)
+        self.adv_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.adv_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.adv_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         root.addWidget(self.adv_table, 2)
         self._set_advanced_visible(False)
         self.set_recording_state(False, False)
+        self._update_button_layouts()
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self.scroll_area.viewport() and event.type() == QEvent.Type.Resize:
+            self._update_button_layouts()
+        return super().eventFilter(watched, event)
+
+    def _update_button_layouts(self) -> None:
+        """Stack paired actions when their text cannot fit the sidebar width."""
+        available = self.scroll_area.viewport().width() - 28
+        for row in self._button_rows:
+            widgets = [row.itemAt(index).widget() for index in range(row.count())]
+            required = sum(widget.sizeHint().width() for widget in widgets if widget is not None)
+            required += row.spacing() * max(0, len(widgets) - 1)
+            direction = (
+                QBoxLayout.Direction.TopToBottom if required > available
+                else QBoxLayout.Direction.LeftToRight
+            )
+            if row.direction() != direction:
+                row.setDirection(direction)
 
     def _apply_style(self) -> None:
         t = self._tokens
@@ -232,14 +265,14 @@ class ScanPanel(QWidget):
             QWidget#scanPanel {{
                 background: {t.surface_alt};
                 color: {t.text_primary};
-                font-size: 12px;
+                font-size: {font_size(11)};
             }}
             QScrollArea#scanPanelScroll, QWidget#scanPanelBody {{
                 background: {t.surface_alt};
                 border: 0;
             }}
             QLabel#sectionTitle {{
-                font-size: 12px;
+                font-size: {font_size(11)};
                 font-weight: 800;
                 color: {t.text_secondary};
                 padding-top: 4px;
@@ -250,13 +283,13 @@ class ScanPanel(QWidget):
                 border-radius: 8px;
             }}
             QLabel#scanStateTitle {{
-                font-size: 13px;
+                font-size: {font_size(13)};
                 font-weight: 800;
                 color: {t.text_primary};
             }}
             QLabel#scanStateDetail, QLabel#subtleStatus {{
                 color: {t.text_muted};
-                font-size: 11px;
+                font-size: {font_size(11)};
             }}
             QPushButton {{
                 min-height: 26px;
@@ -327,6 +360,20 @@ class ScanPanel(QWidget):
         self._apply_style()
         if self.results:
             self._rebuild_scan_list()
+        else:
+            # Preserve the current adapter/scan hint while refreshing its font.
+            item = self.list_widget.item(0)
+            widget = self.list_widget.itemWidget(item) if item is not None else None
+            labels = widget.findChildren(QLabel) if widget is not None else []
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) is None and len(labels) == 2:
+                self._show_empty_result(labels[0].text(), labels[1].text())
+            elif self.recent_devices:
+                self._rebuild_recent_list()
+        self._connected_display_signature = None
+        self.refresh_connected_devices(self._last_connected_devices, self._active_address)
+        self.adv_raw.setMinimumHeight(scaled_px(72))
+        self.adv_raw.setMaximumHeight(scaled_px(110))
+        self._update_button_layouts()
 
     def _set_scan_state(self, title: str, detail: str, *, busy: bool = False) -> None:
         self.scan_state_title.setText(title)
@@ -341,9 +388,10 @@ class ScanPanel(QWidget):
 
     @staticmethod
     def _set_item_widget(list_widget: QListWidget, item: QListWidgetItem, widget: QWidget, *, min_height: int) -> None:
-        hint = widget.sizeHint()
-        item.setSizeHint(QSize(max(320, hint.width()), max(min_height, hint.height() + 6)))
         list_widget.setItemWidget(item, widget)
+        widget.ensurePolished()
+        hint = widget.sizeHint()
+        item.setSizeHint(QSize(max(300, hint.width()), max(scaled_px(min_height), hint.height() + 8)))
 
     def _show_empty_result(self, title: str, detail: str) -> None:
         self.list_widget.clear()
@@ -357,10 +405,10 @@ class ScanPanel(QWidget):
         layout.setSpacing(2)
         t = self._tokens
         title_label = QLabel(title)
-        title_label.setStyleSheet(f"font-size: 12px; font-weight: 800; color: {t.text_secondary};")
+        title_label.setStyleSheet(f"font-size: {font_size(11)}; font-weight: 800; color: {t.text_secondary};")
         detail_label = QLabel(detail)
         detail_label.setWordWrap(True)
-        detail_label.setStyleSheet(f"font-size: 11px; color: {t.text_muted};")
+        detail_label.setStyleSheet(f"font-size: {font_size(11)}; color: {t.text_muted};")
         layout.addWidget(title_label)
         layout.addWidget(detail_label)
         self._set_item_widget(self.list_widget, item, widget, min_height=64)
@@ -439,7 +487,7 @@ class ScanPanel(QWidget):
         name_text = result.name or "未命名裝置"
         name = QLabel(name_text)
         name_color = t.warning if is_reconnecting else (t.ok_fg if is_connected else t.text_primary)
-        name.setStyleSheet(f"font-size: 13px; font-weight: 800; color: {name_color};")
+        name.setStyleSheet(f"font-size: {font_size(13)}; font-weight: 800; color: {name_color};")
         name_row.addWidget(name, 1)
 
         if is_connected or is_reconnecting:
@@ -447,16 +495,16 @@ class ScanPanel(QWidget):
             badge = QLabel(badge_text)
             badge.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             badge_color = t.warning if is_reconnecting else t.ok_fg
-            badge.setStyleSheet(f"font-size: 10px; color: {badge_color}; font-weight: 800;")
+            badge.setStyleSheet(f"font-size: {font_size(11)}; color: {badge_color}; font-weight: 800;")
             name_row.addWidget(badge)
 
         quality = QLabel(f"{self._rssi_quality(result.rssi)}  {result.rssi} dBm")
         quality.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        quality.setStyleSheet(f"font-size: 10px; color: {t.text_secondary}; font-weight: 700;")
+        quality.setStyleSheet(f"font-size: {font_size(11)}; color: {t.text_secondary}; font-weight: 700;")
         name_row.addWidget(quality)
 
         address = QLabel(result.address)
-        address.setStyleSheet(f"font-size: 10px; color: {t.text_muted};")
+        address.setStyleSheet(f"font-size: {font_size(11)}; color: {t.text_muted};")
 
         layout.addLayout(name_row)
         layout.addWidget(address)
@@ -510,7 +558,7 @@ class ScanPanel(QWidget):
         name_row.setSpacing(6)
         name = QLabel(device.name)
         name_color = t.warning if is_reconnecting else (t.ok_fg if is_connected else t.text_primary)
-        name.setStyleSheet(f"font-size: 13px; font-weight: 800; color: {name_color};")
+        name.setStyleSheet(f"font-size: {font_size(13)}; font-weight: 800; color: {name_color};")
         if is_reconnecting:
             badge_text = "重新連線中"
         else:
@@ -518,12 +566,12 @@ class ScanPanel(QWidget):
         badge = QLabel(badge_text)
         badge.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         badge_color = t.warning if is_reconnecting else (t.ok_fg if is_connected else t.text_secondary)
-        badge.setStyleSheet(f"font-size: 10px; color: {badge_color}; font-weight: 800;")
+        badge.setStyleSheet(f"font-size: {font_size(11)}; color: {badge_color}; font-weight: 800;")
         name_row.addWidget(name, 1)
         name_row.addWidget(badge)
 
         detail = QLabel(f"{device.address}  可直接嘗試連線")
-        detail.setStyleSheet(f"font-size: 10px; color: {t.text_muted};")
+        detail.setStyleSheet(f"font-size: {font_size(11)}; color: {t.text_muted};")
 
         layout.addLayout(name_row)
         layout.addWidget(detail)
@@ -745,9 +793,21 @@ class ScanPanel(QWidget):
         self._active_address = active_address
         self.clear_packet_counts_btn.setEnabled(bool(active_address and active_address in new_connected))
 
+        signature = (active_address, tuple(tuple(sorted(dev.items())) for dev in devices))
+        self._last_connected_devices = [dict(dev) for dev in devices]
+        if signature == self._connected_display_signature:
+            return
+        self._connected_display_signature = signature
+        previous_addresses = [
+            self.connected_list.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self.connected_list.count())
+        ]
+        reuse_rows = previous_addresses == [dev.get("address", "") for dev in devices]
+        previous_scroll = self.connected_list.verticalScrollBar().value()
         self.connected_list.blockSignals(True)
-        self.connected_list.clear()
-        for dev in devices:
+        if not reuse_rows:
+            self.connected_list.clear()
+        for row, dev in enumerate(devices):
             num = dev.get("device_number", "")
             num_part = f"#{num} " if num else ""
             is_recording = dev.get("recording") == "1"
@@ -764,44 +824,58 @@ class ScanPanel(QWidget):
             label = (
                 f"{name_text} ({address_text})  {detail_text}"
             )
-            item = QListWidgetItem()
+            item = self.connected_list.item(row) if reuse_rows else QListWidgetItem()
             item.setToolTip(label)
             item.setData(Qt.ItemDataRole.UserRole, dev.get("address", ""))
-            self.connected_list.addItem(item)
-            row_widget = QWidget()
-            row_widget.setStyleSheet("background: transparent;")
-            row_layout = QVBoxLayout(row_widget)
-            row_layout.setContentsMargins(8, 5, 8, 5)
-            row_layout.setSpacing(2)
+            if reuse_rows:
+                row_widget = self.connected_list.itemWidget(item)
+                name_label = row_widget.findChild(QLabel, "connectedDeviceNameLabel")
+                detail_label = row_widget.findChild(QLabel, "connectedDeviceStatusLabel")
+                address_label = row_widget.findChild(QLabel, "connectedDeviceAddressLabel")
+            else:
+                self.connected_list.addItem(item)
+                row_widget = QWidget()
+                row_widget.setStyleSheet("background: transparent;")
+                row_layout = QVBoxLayout(row_widget)
+                row_layout.setContentsMargins(8, 5, 8, 5)
+                row_layout.setSpacing(2)
+                name_label = QLabel()
+                name_label.setObjectName("connectedDeviceNameLabel")
+                detail_label = QLabel()
+                detail_label.setObjectName("connectedDeviceStatusLabel")
+                detail_label.setWordWrap(True)
+                address_label = QLabel()
+                address_label.setObjectName("connectedDeviceAddressLabel")
+                row_layout.addWidget(name_label)
+                row_layout.addWidget(detail_label)
+                row_layout.addWidget(address_label)
             recording_color = self._tokens.error_fg
             name_color = recording_color if is_recording else self._tokens.text_primary
             detail_color = recording_color if is_recording else self._tokens.text_secondary
             address_color = recording_color if is_recording else self._tokens.text_muted
 
-            name_label = QLabel(name_text)
-            name_label.setObjectName("connectedDeviceNameLabel")
+            name_label.setText(name_text)
             name_label.setToolTip(label)
-            name_label.setStyleSheet(f"font-size: 12px; font-weight: 700; color: {name_color};")
+            name_label.setStyleSheet(f"font-size: {font_size(11)}; font-weight: 700; color: {name_color};")
 
-            detail_label = QLabel(detail_text)
-            detail_label.setObjectName("connectedDeviceStatusLabel")
+            detail_label.setText(detail_text)
             detail_label.setToolTip(label)
-            detail_label.setWordWrap(True)
-            detail_label.setStyleSheet(f"font-size: 12px; color: {detail_color};")
+            detail_label.setStyleSheet(f"font-size: {font_size(11)}; color: {detail_color};")
 
-            address_label = QLabel(address_text)
-            address_label.setObjectName("connectedDeviceAddressLabel")
+            address_label.setText(address_text)
             address_label.setToolTip(label)
-            address_label.setStyleSheet(f"font-size: 11px; color: {address_color};")
+            address_label.setStyleSheet(f"font-size: {font_size(11)}; color: {address_color};")
 
-            row_layout.addWidget(name_label)
-            row_layout.addWidget(detail_label)
-            row_layout.addWidget(address_label)
-            item.setSizeHint(QSize(320, max(72, row_widget.sizeHint().height() + 8)))
-            self.connected_list.setItemWidget(item, row_widget)
+            if reuse_rows:
+                row_widget.ensurePolished()
+                hint = row_widget.sizeHint()
+                item.setSizeHint(QSize(max(300, hint.width()), max(scaled_px(72), hint.height() + 8)))
+            else:
+                self._set_item_widget(self.connected_list, item, row_widget, min_height=72)
             if dev.get("address") == active_address:
                 self.connected_list.setCurrentItem(item)
         self.connected_list.blockSignals(False)
+        self.connected_list.verticalScrollBar().setValue(previous_scroll)
 
         if connected_changed and not self._is_scanning:
             if self.results:

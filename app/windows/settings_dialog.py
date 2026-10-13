@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import QSignalBlocker, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -10,10 +10,12 @@ from PyQt6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QFrame,
     QLabel,
     QLineEdit,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -35,6 +37,7 @@ from ..constants import (
     normalize_record_split_rows,
 )
 from ..theme import THEME_DARK, THEME_LIGHT, theme_manager
+from ..typography import UI_SCALE_CHOICES, typography_manager
 
 
 class SettingsDialog(QDialog):
@@ -66,33 +69,45 @@ class SettingsDialog(QDialog):
         self._source_display_name = source_display_name
         self.setWindowTitle("設定")
         self.setMinimumWidth(520)
+        self.resize(660, 520)
         self.demo_device_battery_pcts = dict(demo_device_battery_pcts or {})
         self.connected_demo_devices = list(connected_demo_devices or [])
         self.demo_device_pct_spins: dict[str, QSpinBox] = {}
 
         root = QVBoxLayout(self)
         tabs = QTabWidget()
-        tabs.addTab(self._about_tab(), "關於")
-        tabs.addTab(self._appearance_tab(), "外觀")
-        tabs.addTab(self._connection_tab(auto_reconnect_enabled), "連線")
+        self.tabs = tabs
+        tabs.addTab(self._scrollable(self._about_tab()), "關於")
+        tabs.addTab(self._scrollable(self._appearance_tab()), "外觀")
+        tabs.addTab(self._scrollable(self._connection_tab(auto_reconnect_enabled)), "連線")
         tabs.addTab(
-            self._demo_tab(
+            self._scrollable(self._demo_tab(
                 demo_use_fake_data,
                 demo_device_name,
                 demo_ebike_pct,
                 demo_escooter_pct,
                 demo_charger_mode,
                 demo_ebike_style,
-            ),
+            )),
             "DEMO",
         )
-        tabs.addTab(self._recording_tab(record_split_rows), "錄製")
-        tabs.addTab(self._engineering_tab(engineering_mode), "工程模式")
+        tabs.addTab(self._scrollable(self._recording_tab(record_split_rows)), "錄製")
+        tabs.addTab(self._scrollable(self._engineering_tab(engineering_mode)), "工程模式")
         root.addWidget(tabs)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
+
+    @staticmethod
+    def _scrollable(page: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        if isinstance(page.layout(), QFormLayout):
+            page.layout().setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        scroll.setWidget(page)
+        return scroll
 
     def _about_tab(self) -> QWidget:
         page = QWidget()
@@ -136,11 +151,42 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.theme_light_radio)
         layout.addWidget(self.theme_dark_radio)
 
-        detail = QLabel("切換後立即套用，設定會自動記住，下次啟動時恢復。")
+        scale_form = QFormLayout()
+        scale_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        self.text_scale_combo = QComboBox()
+        self.text_scale_combo.setObjectName("textScaleCombo")
+        self.text_scale_combo.setAccessibleName("介面字級")
+        for percent in UI_SCALE_CHOICES:
+            suffix = "（預設）" if percent == 100 else ""
+            self.text_scale_combo.addItem(f"{percent}%{suffix}", percent)
+        self.text_scale_combo.setCurrentIndex(
+            self.text_scale_combo.findData(typography_manager().scale())
+        )
+        self.text_scale_combo.currentIndexChanged.connect(self._on_text_scale_changed)
+        typography_manager().scale_changed.connect(self._sync_text_scale)
+        scale_form.addRow("介面字級", self.text_scale_combo)
+        layout.addLayout(scale_form)
+
+        self.text_scale_preview = QLabel("字級預覽：錄製中 12:34:56 · 電壓 48.25 V")
+        self.text_scale_preview.setWordWrap(True)
+        self.text_scale_preview.setStyleSheet("font-weight: 700; padding: 8px;")
+        layout.addWidget(self.text_scale_preview)
+
+        detail = QLabel(
+            "切換後立即套用並記住，下次啟動時恢復。\n"
+            "字級會配合 Windows 顯示縮放；文字偏小時可選擇 125% 或 150%。"
+        )
         detail.setWordWrap(True)
         layout.addWidget(detail)
         layout.addStretch(1)
         return page
+
+    def _on_text_scale_changed(self, _index: int) -> None:
+        typography_manager().set_scale(self.text_scale_combo.currentData())
+
+    def _sync_text_scale(self, percent: int) -> None:
+        with QSignalBlocker(self.text_scale_combo):
+            self.text_scale_combo.setCurrentIndex(self.text_scale_combo.findData(percent))
 
     def _connection_tab(self, auto_reconnect_enabled: bool) -> QWidget:
         page = QWidget()

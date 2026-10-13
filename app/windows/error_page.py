@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -21,12 +22,21 @@ from ..constants import ERROR_CODES
 from ..models import DeviceState
 from ..protocol import error_description, error_name
 from ..theme import ThemeTokens, current_tokens, theme_manager
+from ..typography import font_size, scaled_px
 
 
 class ErrorPage(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
-        root = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        content = QWidget()
+        self.scroll_area.setWidget(content)
+        outer.addWidget(self.scroll_area)
+        root = QVBoxLayout(content)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
@@ -40,7 +50,6 @@ class ErrorPage(QWidget):
         banner_layout.setSpacing(12)
 
         self.banner_badge = QLabel("OK")
-        self.banner_badge.setFixedWidth(54)
         self.banner_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         banner_layout.addWidget(self.banner_badge)
 
@@ -49,6 +58,9 @@ class ErrorPage(QWidget):
         self.banner_code = QLabel("目前錯誤代碼: 0x00 (0)")
         self.banner_name = QLabel("ERROR_NONE")
         self.banner_desc = QLabel("無錯誤")
+        self.banner_code.setWordWrap(True)
+        self.banner_name.setWordWrap(True)
+        self.banner_desc.setWordWrap(True)
         banner_text.addWidget(self.banner_code)
         banner_text.addWidget(self.banner_name)
         banner_text.addWidget(self.banner_desc)
@@ -64,8 +76,8 @@ class ErrorPage(QWidget):
         self.device_card = self._make_metric_card("Device", "-")
         metrics.addWidget(self.error_data_card, 0, 0)
         metrics.addWidget(self.error_limit_card, 0, 1)
-        metrics.addWidget(self.time_card, 0, 2)
-        metrics.addWidget(self.device_card, 0, 3)
+        metrics.addWidget(self.time_card, 1, 0)
+        metrics.addWidget(self.device_card, 1, 1)
         root.addLayout(metrics)
 
         self.reference_label = QLabel("錯誤碼對照")
@@ -74,6 +86,8 @@ class ErrorPage(QWidget):
         self.table = QTableWidget(len(ERROR_CODES), 3)
         self.table.setHorizontalHeaderLabels(["Code", "Name", "Description"])
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setWordWrap(False)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -81,7 +95,8 @@ class ErrorPage(QWidget):
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setStretchLastSection(True)
         for row, (code, name, desc) in enumerate(ERROR_CODES):
             code_item = QTableWidgetItem(f"0x{code:02X} ({code})")
             code_item.setFont(QFont("Consolas"))
@@ -96,7 +111,7 @@ class ErrorPage(QWidget):
         root.addWidget(self.table, 1)
 
         self._last_is_error: bool = False
-        self._last_code: int = 0
+        self._last_code: int | None = None
         self._apply_theme(current_tokens())
         theme_manager().theme_changed.connect(self._apply_theme)
 
@@ -107,8 +122,11 @@ class ErrorPage(QWidget):
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(3)
         title = QLabel(label)
+        title.setWordWrap(True)
         title.setObjectName("metricTitle")
         value_label = QLabel(value)
+        value_label.setWordWrap(True)
+        value_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         value_label.setObjectName("value")
         layout.addWidget(title)
         layout.addWidget(value_label)
@@ -122,15 +140,18 @@ class ErrorPage(QWidget):
 
     def _apply_theme(self, tokens: ThemeTokens) -> None:
         self._tokens = tokens
+        self.banner_badge.setMinimumWidth(scaled_px(64))
+        self.table.setMinimumHeight(scaled_px(220))
         self.title.setStyleSheet(
-            f"font-size: 20px; font-weight: 800; color: {tokens.text_primary};"
+            f"font-size: {font_size(15)}; font-weight: 800; color: {tokens.text_primary};"
         )
         self.reference_label.setStyleSheet(
-            f"font-size: 13px; font-weight: 800; color: {tokens.text_secondary};"
+            f"font-size: {font_size(13)}; font-weight: 800; color: {tokens.text_secondary};"
         )
         self.table.setStyleSheet(
             f"""
             QTableWidget {{
+                font-size: {font_size(11)};
                 background: {tokens.table_bg};
                 alternate-background-color: {tokens.table_alt};
                 border: 1px solid {tokens.card_border};
@@ -160,15 +181,16 @@ class ErrorPage(QWidget):
             title_label = card.findChild(QLabel, "metricTitle")
             if title_label is not None:
                 title_label.setStyleSheet(
-                    f"font-size: 11px; color: {tokens.text_muted}; font-weight: 700;"
+                    f"font-size: {font_size(11)}; color: {tokens.text_muted}; font-weight: 700;"
                 )
             value_label = card.findChild(QLabel, "value")
             if value_label is not None:
                 value_label.setStyleSheet(
-                    f"font-size: 13px; color: {tokens.text_primary}; font-family: Consolas;"
+                    f"font-size: {font_size(13)}; color: {tokens.text_primary}; font-family: Consolas;"
                 )
         self._set_banner_style(self._last_is_error)
         self._restyle_table_rows(self._last_code, self._last_is_error)
+        self.table.resizeRowsToContents()
 
     def _set_banner_style(self, error: bool) -> None:
         tokens = getattr(self, "_tokens", current_tokens())
@@ -180,15 +202,15 @@ class ErrorPage(QWidget):
             self.banner_badge.setText("ERR")
             self.banner_badge.setStyleSheet(
                 f"background: {tokens.error_badge_bg}; color: white;"
-                f" border-radius: 6px; font-size: 18px; font-weight: 900;"
+                f" border-radius: 6px; font-size: {font_size(15)}; font-weight: 900;"
             )
             self.banner_code.setStyleSheet(
-                f"font-size: 15px; font-weight: 800; color: {tokens.error_fg};"
+                f"font-size: {font_size(13)}; font-weight: 800; color: {tokens.error_fg};"
             )
             self.banner_name.setStyleSheet(
-                f"font-size: 12px; color: {tokens.error_fg}; font-family: Consolas;"
+                f"font-size: {font_size(11)}; color: {tokens.error_fg}; font-family: Consolas;"
             )
-            self.banner_desc.setStyleSheet(f"font-size: 12px; color: {tokens.error_fg};")
+            self.banner_desc.setStyleSheet(f"font-size: {font_size(11)}; color: {tokens.error_fg};")
         else:
             self.banner.setStyleSheet(
                 f"QFrame#errorBanner {{ background: {tokens.ok_bg};"
@@ -197,17 +219,17 @@ class ErrorPage(QWidget):
             self.banner_badge.setText("OK")
             self.banner_badge.setStyleSheet(
                 f"background: {tokens.ok_badge_bg}; color: white;"
-                f" border-radius: 6px; font-size: 18px; font-weight: 900;"
+                f" border-radius: 6px; font-size: {font_size(15)}; font-weight: 900;"
             )
             self.banner_code.setStyleSheet(
-                f"font-size: 15px; font-weight: 800; color: {tokens.ok_fg};"
+                f"font-size: {font_size(13)}; font-weight: 800; color: {tokens.ok_fg};"
             )
             self.banner_name.setStyleSheet(
-                f"font-size: 12px; color: {tokens.ok_fg}; font-family: Consolas;"
+                f"font-size: {font_size(11)}; color: {tokens.ok_fg}; font-family: Consolas;"
             )
-            self.banner_desc.setStyleSheet(f"font-size: 12px; color: {tokens.ok_fg};")
+            self.banner_desc.setStyleSheet(f"font-size: {font_size(11)}; color: {tokens.ok_fg};")
 
-    def _restyle_table_rows(self, code: int, is_error: bool) -> None:
+    def _restyle_table_rows(self, code: int | None, is_error: bool) -> None:
         tokens = getattr(self, "_tokens", current_tokens())
         highlight_bg = QBrush(QColor(tokens.table_highlight_bg))
         normal_bg = QBrush(QColor(tokens.table_bg))
@@ -224,16 +246,20 @@ class ErrorPage(QWidget):
                     continue
                 item.setBackground(row_bg)
                 item.setForeground(row_fg)
-                font = item.font()
+                font = self.table.font()
+                if col < 2:
+                    font.setFamily("Consolas")
                 font.setBold(hit and is_error)
                 item.setFont(font)
 
     def refresh(self, state: DeviceState) -> None:
         code = state.error_num
         is_error = code != 0
+        code_changed = code != self._last_code
         self._last_code = code
         self._last_is_error = is_error
-        self._set_banner_style(error=is_error)
+        if code_changed:
+            self._set_banner_style(error=is_error)
         self.banner_code.setText(f"目前錯誤代碼: 0x{code:02X} ({code})")
         self.banner_name.setText(error_name(code))
         self.banner_desc.setText(error_description(code))
@@ -245,13 +271,14 @@ class ErrorPage(QWidget):
             device = f"#{state.device_number} {device}"
         self._set_metric_value(self.device_card, device)
 
-        self._restyle_table_rows(code, is_error)
+        if code_changed:
+            self._restyle_table_rows(code, is_error)
         active_row = -1
         for row, (row_code, _name, _desc) in enumerate(ERROR_CODES):
             if row_code == code:
                 active_row = row
                 break
-        if active_row >= 0 and is_error:
+        if active_row >= 0 and is_error and code_changed:
             self.table.scrollToItem(
                 self.table.item(active_row, 0),
                 QAbstractItemView.ScrollHint.PositionAtCenter,

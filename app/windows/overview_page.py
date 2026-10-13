@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QUrl
+from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QGridLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -23,17 +25,24 @@ from ..batch_log import (
 )
 from ..models import DeviceState
 from ..theme import ThemeTokens, current_tokens, theme_manager
+from ..typography import font_size
 
 
 class OverviewPage(QWidget):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         root = QVBoxLayout(self)
-        title = QLabel("Overview")
-        title.setStyleSheet("font-size: 20px; font-weight: 700;")
-        root.addWidget(title)
+        self.title = QLabel("Overview")
+        root.addWidget(self.title)
+        self.summary_scroll = QScrollArea()
+        self.summary_scroll.setWidgetResizable(True)
+        self.summary_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        summary = QWidget()
         self.grid = QGridLayout()
-        root.addLayout(self.grid)
+        summary.setLayout(self.grid)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.summary_scroll.setWidget(summary)
+        root.addWidget(self.summary_scroll, 2)
         self.labels: dict[str, QLabel] = {}
         self._caption_labels: list[QLabel] = []
         fields = [
@@ -52,6 +61,8 @@ class OverviewPage(QWidget):
             row, col = divmod(index, 2)
             label = QLabel(caption)
             value = QLabel("-")
+            value.setWordWrap(True)
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             self.grid.addWidget(label, row * 2, col)
             self.grid.addWidget(value, row * 2 + 1, col)
             self.labels[key] = value
@@ -69,13 +80,15 @@ class OverviewPage(QWidget):
         self.open_batch_log_button = QPushButton("開啟 batch.txt")
         self.open_batch_log_button.clicked.connect(self.open_batch_log)
         batch_header.addWidget(self.batch_title)
-        batch_header.addWidget(self.batch_hint, 1)
+        batch_header.addStretch(1)
         batch_header.addWidget(self.open_batch_log_button)
         root.addLayout(batch_header)
+        root.addWidget(self.batch_hint)
 
         self.batch_log_text = QPlainTextEdit()
         self.batch_log_text.setObjectName("batchLogText")
         self.batch_log_text.setReadOnly(True)
+        self.batch_log_text.setMaximumBlockCount(BATCH_DISPLAY_LINE_LIMIT)
         self.batch_log_text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
         self.batch_log_text.setPlaceholderText("APP 主要狀態會即時顯示在這裡。")
         self._batch_bus, initial_lines = subscribe_batch_log(
@@ -88,10 +101,14 @@ class OverviewPage(QWidget):
         theme_manager().theme_changed.connect(self._apply_theme)
 
     def _apply_theme(self, tokens: ThemeTokens) -> None:
+        self.title.setStyleSheet(f"font-size: {font_size(15)}; font-weight: 700;")
+        # The content can scroll; enlarging this viewport minimum with the text
+        # scale otherwise forces the entire main window beyond laptop screens.
+        self.summary_scroll.setMinimumHeight(120)
         for label in self._caption_labels:
             label.setStyleSheet(f"font-weight: 700; color: {tokens.text_secondary};")
         value_style = (
-            f"font-size: 16px; padding: 10px;"
+            f"font-size: {font_size(13)}; padding: 10px;"
             f" border: 1px solid {tokens.card_border};"
             f" background: {tokens.surface};"
             f" color: {tokens.text_primary};"
@@ -99,25 +116,27 @@ class OverviewPage(QWidget):
         for value in self.labels.values():
             value.setStyleSheet(value_style)
         self.batch_title.setStyleSheet(
-            f"font-size: 13px; font-weight: 800; color: {tokens.text_secondary};"
+            f"font-size: {font_size(13)}; font-weight: 800; color: {tokens.text_secondary};"
         )
         self.batch_hint.setStyleSheet(
-            f"font-size: 11px; color: {tokens.text_muted};"
+            f"font-size: {font_size(11)}; color: {tokens.text_muted};"
         )
         self.batch_log_text.setStyleSheet(
-            f"font-family: Consolas, monospace; font-size: 11px;"
+            f"font-family: Consolas, monospace; font-size: {font_size(11)};"
             f" border: 1px solid {tokens.card_border};"
             f" background: {tokens.surface}; color: {tokens.text_primary};"
         )
 
     def append_batch_log_line(self, line: str) -> None:
+        scrollbar = self.batch_log_text.verticalScrollBar()
+        follow_latest = scrollbar.value() >= scrollbar.maximum() - 1
+        previous_position = scrollbar.value()
         if self._batch_visible_line_count >= BATCH_DISPLAY_LINE_LIMIT:
             self.batch_log_text.clear()
             self._batch_visible_line_count = 0
         self.batch_log_text.appendPlainText(line)
         self._batch_visible_line_count += 1
-        scrollbar = self.batch_log_text.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        scrollbar.setValue(scrollbar.maximum() if follow_latest else previous_position)
 
     def open_batch_log(self) -> None:
         path = batch_log_path()
