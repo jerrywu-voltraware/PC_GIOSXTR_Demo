@@ -184,8 +184,9 @@ def test_waveform_axes_markers_and_controls_follow_text_scale(qt_app):
     legend_label = chart.plot.plotItem.legend.items[0][1]
     text_format = legend_label.item.document().begin().begin().fragment().charFormat()
     assert text_format.fontPointSize() >= 22
-    title_format = chart.plot.plotItem.titleLabel.item.document().begin().begin().fragment().charFormat()
-    assert title_format.foreground().color().name() == page._tokens.plot_axis_text.lower()
+    # In-plot title was moved to the card header (waveform UX spec); the export
+    # title style is covered in tests/test_waveform_ux.py.
+    assert not chart.plot.plotItem.titleLabel.isVisible()
     assert page.controls_scroll.horizontalScrollBar().maximum() > 0
     assert page.minimumSizeHint().width() < 1000
     assert page.pause_box.height() >= page.pause_box.fontMetrics().height()
@@ -199,8 +200,12 @@ def test_waveform_style_cycle_preserves_rendered_axes_titles_and_existing_and_ne
     page.add_chart()
     chart = page.charts[0]
     first = DeviceState(device_address="AA:BB:CC:DD:EE:01", device_name="First device", is_connected=True)
+    second = DeviceState(device_address="AA:BB:CC:DD:EE:02", device_name="Second device", is_connected=True)
+    states = {first.device_address: first, second.device_address: second}
     page.scope_combo.setCurrentIndex(1)
-    page.refresh(first)
+    # Two overlaid devices: the legend is only shown for >= 2 series.
+    page.refresh_device(first, states, first.device_address)
+    page.refresh_device(second, states, first.device_address)
     _show(page, qt_app, width=850, height=600)
     x_axis = chart.plot.getAxis("bottom")
     y_axis = chart.plot.getAxis("left")
@@ -220,7 +225,7 @@ def test_waveform_style_cycle_preserves_rendered_axes_titles_and_existing_and_ne
             qt_app.processEvents()
             expected_size = 11 * scale / 100
             expected_color = page._tokens.plot_axis_text.lower()
-            for axis, text, units in ((x_axis, "Sample", "s"), (y_axis, original_y, "")):
+            for axis, text, units in ((x_axis, "Sample", "s"),):
                 assert axis.labelText == text
                 assert axis.labelUnits == units
                 assert axis.label.isVisible()
@@ -228,6 +233,11 @@ def test_waveform_style_cycle_preserves_rendered_axes_titles_and_existing_and_ne
                 assert rendered_format(axis.label).fontPointSize() == pytest.approx(expected_size)
                 assert rendered_format(axis.label).foreground().color().name() == expected_color
                 assert axis.style["tickFont"].pointSizeF() == pytest.approx(expected_size)
+            # The left axis name was removed (unit lives in the card header);
+            # styling must not resurrect it, but tick text still follows scale.
+            assert y_axis.labelText == original_y
+            assert not y_axis.label.isVisible()
+            assert y_axis.style["tickFont"].pointSizeF() == pytest.approx(expected_size)
             assert existing_legend.item.toPlainText() == "First device"
             assert existing_legend.isVisible()
             assert rendered_format(existing_legend.item).fontPointSize() == pytest.approx(expected_size)
@@ -243,13 +253,11 @@ def test_waveform_style_cycle_preserves_rendered_axes_titles_and_existing_and_ne
             assert rendered_format(new_label.item).foreground().color().name() == expected_color
             chart.plot.removeItem(curve)
 
-            # Updating the live title after styling must retain the text style.
-            page.refresh(first)
-            title = chart.plot.plotItem.titleLabel
-            assert "First device" in title.item.toPlainText()
-            assert title.isVisible()
-            assert rendered_format(title.item).fontPointSize() == pytest.approx(13 * scale / 100)
-            assert rendered_format(title.item).foreground().color().name() == expected_color
+            # Refreshing data after styling must not bring back an in-plot title
+            # (moved to the card header) nor break the legend.
+            page.refresh_device(first, states, first.device_address)
+            assert not chart.plot.plotItem.titleLabel.isVisible()
+            assert existing_legend.isVisible()
 
     x_axis.showLabel(False)
     theme_manager().set_theme("light", persist=False)

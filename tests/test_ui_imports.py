@@ -1698,7 +1698,7 @@ def test_waveform_page_keeps_rolling_scope_window():
     assert page.history_combo.currentData() == 500
     assert len(chart.x) == 500
     assert chart.y[-1] == 53599
-    assert "samples 500" in chart.stats_label.text()
+    assert "samples 500" in chart.stats_label.toolTip()
 
 
 def test_waveform_page_has_no_device_selector_inside_waveform_controls():
@@ -1735,15 +1735,15 @@ def test_waveform_page_follows_active_device_tabs_and_preserves_device_history()
     assert chart.series[second.device_address].y == [54000.0]
     assert chart.x == [0.0]
     assert chart.y == [52000.0]
-    assert "PTU #6" in chart.stats_label.text()
-    assert "PTU #10" not in chart.stats_label.text()
+    assert "PTU #6" in chart.stats_label.toolTip()
+    assert "PTU #10" not in chart.stats_label.toolTip()
 
     page.set_devices(states, second.device_address)
 
-    assert chart.x == [0.0]
+    assert chart.x == [1.0]  # late device starts at the current max count (F2)
     assert chart.y == [54000.0]
-    assert "PTU #6" not in chart.stats_label.text()
-    assert "PTU #10" in chart.stats_label.text()
+    assert "PTU #6" not in chart.stats_label.toolTip()
+    assert "PTU #10" in chart.stats_label.toolTip()
 
 
 def test_waveform_page_can_overlay_all_connected_devices_in_one_chart():
@@ -1775,8 +1775,8 @@ def test_waveform_page_can_overlay_all_connected_devices_in_one_chart():
 
     assert chart.series[first.device_address].curve.isVisible()
     assert chart.series[second.device_address].curve.isVisible()
-    assert "PTU #6" in chart.stats_label.text()
-    assert "PTU #10" in chart.stats_label.text()
+    assert "PTU #6" in chart.stats_label.toolTip()
+    assert "PTU #10" in chart.stats_label.toolTip()
 
 
 def test_waveform_page_preserves_last_waveform_when_device_disconnects():
@@ -1802,8 +1802,8 @@ def test_waveform_page_preserves_last_waveform_when_device_disconnects():
 
     assert chart.y == [52000.0]
     assert chart.series[state.device_address].curve.isVisible()
-    assert "PTU #6" in chart.stats_label.text()
-    assert "samples 1" in chart.stats_label.text()
+    assert "PTU #6" in chart.stats_label.toolTip()
+    assert "samples 1" in chart.stats_label.toolTip()
 
 
 def test_waveform_page_preserves_overlay_when_all_devices_disconnect():
@@ -1832,8 +1832,8 @@ def test_waveform_page_preserves_overlay_when_all_devices_disconnect():
 
     assert chart.series[first.device_address].curve.isVisible()
     assert chart.series[second.device_address].curve.isVisible()
-    assert "PTU #6" in chart.stats_label.text()
-    assert "PTU #10" in chart.stats_label.text()
+    assert "PTU #6" in chart.stats_label.toolTip()
+    assert "PTU #10" in chart.stats_label.toolTip()
 
 
 def test_waveform_page_resumes_reconnected_device_at_latest_sample():
@@ -1868,11 +1868,11 @@ def test_waveform_page_resumes_reconnected_device_at_latest_sample():
 
     chart = page.charts[0]
     first_series = chart.series[first.device_address]
-    assert chart.series[second.device_address].x[-1] == 5.0
-    assert first_series.x == [0.0, 5.0, 6.0]
+    assert chart.series[second.device_address].x[-1] == 6.0
+    assert first_series.x == [0.0, 6.0, 7.0]
     assert math.isnan(first_series.y[-2])
     assert first_series.y[-1] == 53000.0
-    assert "samples 2" in chart.stats_label.text()
+    assert "samples 2" in chart.stats_label.toolTip()
 
 
 def test_waveform_page_can_add_and_clear_markers():
@@ -1973,11 +1973,14 @@ def test_waveform_page_delta_cursor_reports_ab_difference():
     assert chart.a_line is not None and chart.a_line.isVisible()
     assert chart.b_line is not None and chart.b_line.isVisible()
     assert chart.cursor_label is not None
-    assert "A Sample 0.0" in chart.cursor_label.text()
-    assert "B Sample 2.0" in chart.cursor_label.text()
+    # Single elided line: the Δ measurement leads so it stays visible;
+    # the full A/B/Δ text lives in the tooltip (F1).
+    assert chart.cursor_label.text().lstrip("⟦ ").startswith("Δ Sample +2.0")
     assert "Delta" not in chart.cursor_label.text()
-    assert "Δ Sample +2.0" in chart.cursor_label.text()
-    assert "ΔPTU #6: +100.00 (+100.0%)" in chart.cursor_label.text()
+    assert "A Sample 0.0" in chart.cursor_label.toolTip()
+    assert "B Sample 2.0" in chart.cursor_label.toolTip()
+    assert "Δ Sample +2.0" in chart.cursor_label.toolTip()
+    assert "ΔPTU #6: +100.00 (+100.0%)" in chart.cursor_label.toolTip()
 
     page._clear_delta()
 
@@ -2016,9 +2019,9 @@ def test_waveform_page_saves_chart_image_from_chart_button(monkeypatch, tmp_path
         lambda *args, **kwargs: (str(target), "PNG Files (*.png)"),
     )
 
-    chart.save_button.click()
+    chart.save_action.trigger()
 
-    assert chart.save_button.text() == "儲存圖片"
+    assert chart.save_action.text() == "儲存圖片"
     assert exported["plot_item"] is chart.plot.plotItem
     assert exported["filename"] == str(target)
     assert target.read_bytes() == b"png"
@@ -2058,7 +2061,7 @@ def test_main_window_waveform_stores_non_active_device_and_shows_it_when_tab_bec
     window._set_active(second.device_address)
 
     assert chart.y == [54123.0]
-    assert "PTU #10" in chart.stats_label.text()
+    assert "PTU #10" in chart.stats_label.toolTip()
     window.close()
 
 

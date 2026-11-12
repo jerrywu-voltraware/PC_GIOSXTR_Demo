@@ -8,8 +8,8 @@ from dataclasses import dataclass, field
 
 import pyqtgraph as pg
 from pyqtgraph.exporters import ImageExporter
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import QEvent, Qt, QTimer
+from PyQt6.QtGui import QAction, QFont, QPainter
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -23,13 +23,16 @@ from PyQt6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
     QSizePolicy,
     QStyle,
+    QToolButton,
     QVBoxLayout,
     QWidget,
+    QWidgetAction,
 )
 
 from ..constants import SIGNAL_DEFINITIONS
@@ -45,7 +48,6 @@ class DeviceSeries:
     curve: pg.PlotDataItem
     x: list[float] = field(default_factory=list)
     y: list[float] = field(default_factory=list)
-    sample_index: int = 0
     visible: bool = True
 
 
@@ -64,13 +66,14 @@ class ChartItem:
     field_name: str
     plot: pg.PlotWidget
     stats_label: QLabel
-    save_button: QPushButton
+    save_action: QAction
     series: dict[str, DeviceSeries] = field(default_factory=dict)
     curve: pg.PlotDataItem | None = None
     x: list[float] = field(default_factory=list)
     y: list[float] = field(default_factory=list)
     markers: list[WaveformMarker] = field(default_factory=list)
     cursor_label: QLabel | None = None
+    cursor_full_text: str = ""
     vline: pg.InfiniteLine | None = None
     hline: pg.InfiniteLine | None = None
     mouse_proxy: object | None = None
@@ -87,9 +90,55 @@ class ChartItem:
     region: pg.LinearRegionItem | None = None
     dirty: bool = False
     legend_key: tuple = ()
+    card: QWidget | None = None
+    title_label: QLabel | None = None
+    collapse_btn: QToolButton | None = None
+    menu_btn: QToolButton | None = None
+    reset_action: QAction | None = None
+    clear_markers_action: QAction | None = None
+    remove_action: QAction | None = None
+    collapsed: bool = False
+
+
+MAX_CHARTS = 8
+
+
+class _ElidedLabel(QLabel):
+    """Single-line label that elides on the right instead of forcing width."""
+
+    def __init__(self, text: str = "", parent=None) -> None:
+        super().__init__(text, parent)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setMinimumWidth(0)
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 - Qt override
+        painter = QPainter(self)
+        text = self.fontMetrics().elidedText(
+            self.text().replace("\n", " | "), Qt.TextElideMode.ElideRight, self.width()
+        )
+        self.style().drawItemText(
+            painter,
+            self.rect(),
+            int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+            self.palette(),
+            self.isEnabled(),
+            text,
+            self.foregroundRole(),
+        )
+        painter.end()
+
+
+def _signal_group(field_name: str) -> str:
+    if field_name.startswith("pru"):
+        return "PRU"
+    if field_name.startswith("error"):
+        return "Error"
+    return "PTU"
 
 
 class WaveformPage(QWidget):
+    _CARD_SPACING = 6
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.charts: list[ChartItem] = []
@@ -106,28 +155,55 @@ class WaveformPage(QWidget):
 
         controls = QHBoxLayout()
         controls.setSpacing(8)
-        self.signal_combo = QComboBox()
-        for label, field_name in SIGNAL_DEFINITIONS:
-            self.signal_combo.addItem(label, field_name)
         self.scope_combo = QComboBox()
         self.scope_combo.addItem("目前裝置", "current")
         self.scope_combo.addItem("全部裝置", "all")
         self.scope_combo.currentIndexChanged.connect(self._apply_device_filter)
-        self.add_btn = QPushButton("新增曲線")
-        self.add_btn.clicked.connect(self.add_chart)
         self.pause_box = QCheckBox("暫停")
         self.crosshair_box = QCheckBox("十字準線")
         self.crosshair_box.toggled.connect(self._on_crosshair_toggled)
-        self.delta_box = QCheckBox("Δ 游標 (A/B)")
+        # Analysis tools live in one menu; QAction keeps the checkbox-like API
+        # (setChecked/isChecked/toggled/setEnabled) used by callers and tests.
+        self.delta_box = QAction("Δ 游標 (A/B)", self)
+        self.delta_box.setCheckable(True)
         self.delta_box.toggled.connect(self._on_delta_toggled)
-        self.delta_clear_btn = QPushButton("清除 A/B")
+        self.delta_clear_btn = QAction("清除 A/B", self)
         self.delta_clear_btn.setEnabled(False)
-        self.delta_clear_btn.clicked.connect(self._clear_delta)
-        self.region_box = QCheckBox("框選統計")
+        self.delta_clear_btn.triggered.connect(lambda _checked=False: self._clear_delta())
+        self.region_box = QAction("框選統計", self)
+        self.region_box.setCheckable(True)
         self.region_box.toggled.connect(self._on_region_toggled)
-        self.region_clear_btn = QPushButton("清除框選")
+        self.region_clear_btn = QAction("清除框選", self)
         self.region_clear_btn.setEnabled(False)
-        self.region_clear_btn.clicked.connect(self._clear_region)
+        self.region_clear_btn.triggered.connect(lambda _checked=False: self._clear_region())
+        self.settings_btn = QAction("波形設定…", self)
+        self.settings_btn.setToolTip("Δ 游標顯示與量測選項")
+        self.settings_btn.triggered.connect(lambda _checked=False: self._open_settings_dialog())
+        self._settings_dialog: QDialog | None = None
+        self.analysis_btn = QToolButton()
+        self.analysis_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        analysis_menu = QMenu(self.analysis_btn)
+        analysis_menu.addAction(self.delta_box)
+        analysis_menu.addAction(self.delta_clear_btn)
+        analysis_menu.addSeparator()
+        analysis_menu.addAction(self.region_box)
+        analysis_menu.addAction(self.region_clear_btn)
+        analysis_menu.addSeparator()
+        analysis_menu.addAction(self.settings_btn)
+        self.analysis_btn.setMenu(analysis_menu)
+        self._analysis_menu = analysis_menu
+        self.delta_box.toggled.connect(self._update_analysis_text)
+        self.region_box.toggled.connect(self._update_analysis_text)
+        self._update_analysis_text()
+        # Signal chooser: a menu holding a multi-select checklist that stays open.
+        self._signal_checks: dict[str, QCheckBox] = {}
+        self.signal_btn = QToolButton()
+        self.signal_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        signal_menu = QMenu(self.signal_btn)
+        signal_menu.addAction(self._build_signal_list_action(signal_menu))
+        self.signal_btn.setMenu(signal_menu)
+        self._signal_menu = signal_menu
+        self._update_signal_button()
         self._region_color = "#FF7A59"
         self._region_syncing = False
         self.delta_highlight_box = QCheckBox("醒目顯示 Δ")
@@ -161,20 +237,10 @@ class WaveformPage(QWidget):
         self.reset_btn.clicked.connect(self.reset_all)
         controls.addWidget(QLabel("裝置"))
         controls.addWidget(self.scope_combo)
-        controls.addWidget(QLabel("訊號"))
-        controls.addWidget(self.signal_combo, 1)
-        controls.addWidget(self.add_btn)
+        controls.addWidget(self.signal_btn)
         controls.addWidget(self.pause_box)
         controls.addWidget(self.crosshair_box)
-        controls.addWidget(self.delta_box)
-        controls.addWidget(self.delta_clear_btn)
-        controls.addWidget(self.region_box)
-        controls.addWidget(self.region_clear_btn)
-        self.settings_btn = QPushButton("波形設定")
-        self.settings_btn.setToolTip("Δ 游標顯示與量測選項")
-        self.settings_btn.clicked.connect(self._open_settings_dialog)
-        self._settings_dialog: QDialog | None = None
-        controls.addWidget(self.settings_btn)
+        controls.addWidget(self.analysis_btn)
         controls.addWidget(QLabel("歷史"))
         controls.addWidget(self.history_combo)
         controls.addWidget(self.reset_btn)
@@ -193,6 +259,8 @@ class WaveformPage(QWidget):
         root.addWidget(self.notice)
         self._chart_cards: list[QWidget] = []
         self._chart_titles: list[QLabel] = []
+        self._device_sample_index: dict[str, int] = {}
+        self._relayout_busy = False
         self._tokens: ThemeTokens = current_tokens()
         self._apply_theme(self._tokens)
         theme_manager().theme_changed.connect(self._on_theme_changed)
@@ -201,8 +269,11 @@ class WaveformPage(QWidget):
         self.scroll.setWidgetResizable(True)
         self.container = QWidget()
         self.container_layout = QVBoxLayout(self.container)
+        self.container_layout.setContentsMargins(0, 0, 0, 0)
+        self.container_layout.setSpacing(self._CARD_SPACING)
         self.container_layout.addStretch(1)
         self.scroll.setWidget(self.container)
+        self.scroll.viewport().installEventFilter(self)
         root.addWidget(self.scroll, 1)
         self._disconnected_hold = False
 
@@ -252,73 +323,217 @@ class WaveformPage(QWidget):
         value = self.history_combo.currentData()
         return int(value) if value is not None else 5000
 
-    def add_chart(self) -> None:
-        if len(self.charts) >= 5:
-            return
-        label = self.signal_combo.currentText()
-        field_name = str(self.signal_combo.currentData())
-        if any(chart.field_name == field_name for chart in self.charts):
-            return
-        plot = pg.PlotWidget(title=label)
+    # ---- signal chooser (checklist) -------------------------------------
+    def _build_signal_list_action(self, menu: QMenu) -> QWidgetAction:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(2)
+        current_group = ""
+        for label, field_name in SIGNAL_DEFINITIONS:
+            group = _signal_group(field_name)
+            if group != current_group:
+                current_group = group
+                header = QLabel(group)
+                header.setStyleSheet("font-weight: 700; padding-top: 4px;")
+                layout.addWidget(header)
+            box = QCheckBox(label)
+            box.toggled.connect(lambda checked, name=field_name: self._on_signal_check_toggled(name, checked))
+            self._signal_checks[field_name] = box
+            layout.addWidget(box)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(panel)
+        scroll.setMinimumWidth(scaled_px(220))
+        scroll.setFixedHeight(scaled_px(420))
+        action = QWidgetAction(menu)
+        action.setDefaultWidget(scroll)
+        return action
+
+    def _on_signal_check_toggled(self, field_name: str, checked: bool) -> None:
+        if checked:
+            if self._find_chart(field_name) is None:
+                self.add_chart(field_name)
+        else:
+            chart = self._find_chart(field_name)
+            if chart is not None:
+                self.remove_chart(chart)
+
+    def _sync_signal_checks(self) -> None:
+        at_limit = len(self.charts) >= MAX_CHARTS
+        active = {chart.field_name for chart in self.charts}
+        for field_name, box in self._signal_checks.items():
+            checked = field_name in active
+            if box.isChecked() != checked:
+                box.blockSignals(True)
+                box.setChecked(checked)
+                box.blockSignals(False)
+            box.setEnabled(checked or not at_limit)
+            box.setToolTip("" if checked or not at_limit else f"最多 {MAX_CHARTS} 張圖")
+        self._update_signal_button()
+
+    def _update_signal_button(self) -> None:
+        self.signal_btn.setText(f"訊號 ({len(self.charts)}) ▾")
+
+    def _update_analysis_text(self, *_args) -> None:
+        modes = []
+        if self.delta_box.isChecked():
+            modes.append("Δ")
+        if self.region_box.isChecked():
+            modes.append("框選")
+        suffix = f" ({'+'.join(modes)})" if modes else ""
+        self.analysis_btn.setText(f"分析工具{suffix} ▾")
+
+    def _find_chart(self, field_name: str) -> ChartItem | None:
+        for chart in self.charts:
+            if chart.field_name == field_name:
+                return chart
+        return None
+
+    def set_signal_checked(self, field_name: str, checked: bool) -> None:
+        """Add (checked) or remove (unchecked) the chart for ``field_name``."""
+        if checked:
+            self.add_chart(field_name)
+        else:
+            chart = self._find_chart(field_name)
+            if chart is not None:
+                self.remove_chart(chart)
+
+    # ---- chart cards -----------------------------------------------------
+    def add_chart(self, field_name: str | None = None) -> ChartItem | None:
+        if len(self.charts) >= MAX_CHARTS:
+            return None
+        labels = {name: label for label, name in SIGNAL_DEFINITIONS}
+        if field_name is None or not isinstance(field_name, str):
+            field_name = next(
+                (name for _label, name in SIGNAL_DEFINITIONS if self._find_chart(name) is None), None
+            )
+            if field_name is None:
+                return None
+        if field_name not in labels:
+            return None
+        if self._find_chart(field_name) is not None:
+            return None
+        label = labels[field_name]
+        plot = pg.PlotWidget()
         self._style_plot(plot)
         plot.showGrid(x=True, y=True, alpha=0.28)
         plot.setLabel("bottom", "Sample")
-        plot.setLabel("left", label)
         plot.setMouseEnabled(x=True, y=True)
         plot.setDownsampling(auto=True, mode="peak")
         plot.setClipToView(True)
         legend = plot.addLegend(offset=(12, 12))
         self._style_legend(legend)
-        stats_label = QLabel("latest --   min --   max --   samples 0")
-        stats_label.setWordWrap(True)
-        stats_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        legend.setVisible(False)
+        stats_label = _ElidedLabel("latest --   min --   max --   n 0")
         stats_label.setStyleSheet(f"color: {self._tokens.text_secondary}; font-family: Consolas;")
         cursor_label = QLabel("游標 --")
-        cursor_label.setWordWrap(True)
+        cursor_label.setWordWrap(False)
+        cursor_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         cursor_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         cursor_label.setStyleSheet(f"color: {self._tokens.text_secondary}; font-family: Consolas;")
-        cursor_label.setVisible(self.crosshair_box.isChecked() or self.delta_box.isChecked())
-        save_btn = QPushButton("儲存圖片")
-        item = ChartItem(label=label, field_name=field_name, plot=plot, stats_label=stats_label, save_button=save_btn)
-        item.cursor_label = cursor_label
-        remove_btn = QPushButton("移除")
-        reset_btn = QPushButton("重設")
-        clear_markers_btn = QPushButton("清除標籤")
+        cursor_label.setVisible(False)
+        # Re-elide when the label itself gets its new width; the viewport
+        # resize fires before child layouts have settled.
+        cursor_label.installEventFilter(self)
         card = QWidget()
         card.setObjectName("waveformCard")
         self._style_card(card)
+        save_action = QAction("儲存圖片", card)
+        reset_action = QAction("重設", card)
+        clear_markers_action = QAction("清除標籤", card)
+        remove_action = QAction("移除", card)
+        item = ChartItem(label=label, field_name=field_name, plot=plot, stats_label=stats_label, save_action=save_action)
+        item.cursor_label = cursor_label
+        item.card = card
+        item.reset_action = reset_action
+        item.clear_markers_action = clear_markers_action
+        item.remove_action = remove_action
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(10, 8, 10, 10)
-        card_layout.setSpacing(8)
+        card_layout.setContentsMargins(8, 4, 8, 6)
+        card_layout.setSpacing(4)
         top = QHBoxLayout()
+        top.setSpacing(6)
+        collapse_btn = QToolButton()
+        collapse_btn.setText("▾")
+        collapse_btn.setAutoRaise(True)
+        collapse_btn.setToolTip("折疊／展開")
         title = QLabel(label)
         title.setStyleSheet(f"font-weight: 700; color: {self._tokens.text_primary};")
+        menu_btn = QToolButton()
+        menu_btn.setText("⋯")
+        menu_btn.setAutoRaise(True)
+        menu_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(menu_btn)
+        for action in (save_action, reset_action, clear_markers_action, remove_action):
+            menu.addAction(action)
+        menu_btn.setMenu(menu)
+        item.collapse_btn = collapse_btn
+        item.title_label = title
+        item.menu_btn = menu_btn
         self._chart_cards.append(card)
         self._chart_titles.append(title)
-        top.addWidget(title, 1)
-        top.addWidget(save_btn)
-        top.addWidget(reset_btn)
-        top.addWidget(clear_markers_btn)
-        top.addWidget(remove_btn)
+        top.addWidget(collapse_btn)
+        top.addWidget(title)
+        top.addWidget(stats_label, 1)
+        top.addWidget(menu_btn)
         card_layout.addLayout(top)
         card_layout.addWidget(cursor_label)
-        card_layout.addWidget(stats_label)
         card_layout.addWidget(plot)
         self.container_layout.insertWidget(self.container_layout.count() - 1, card)
         item.plot.setProperty("card", card)
-        remove_btn.clicked.connect(lambda: self.remove_chart(item))
-        reset_btn.clicked.connect(lambda: self.reset_chart(item))
-        clear_markers_btn.clicked.connect(lambda: self.clear_markers(item))
-        save_btn.clicked.connect(lambda: self.save_chart_image(item))
+        remove_action.triggered.connect(lambda _c=False: self.remove_chart(item))
+        reset_action.triggered.connect(lambda _c=False: self.reset_chart(item))
+        clear_markers_action.triggered.connect(lambda _c=False: self.clear_markers(item))
+        save_action.triggered.connect(lambda _c=False: self.save_chart_image(item))
+        collapse_btn.clicked.connect(lambda _c=False: self.set_chart_collapsed(item, not item.collapsed))
         plot.scene().sigMouseClicked.connect(lambda event, chart=item: self._handle_plot_click(chart, event))
         self._install_crosshair(item)
         self._install_delta_lines(item)
         self._install_region(item)
         self.charts.append(item)
+        # Catch up with the shared x window / region / delta mode right away.
+        self._on_chart_set_changed()
+        self._sync_cursor_visibility(item)
+        self._sync_new_chart_modes(item)
+        return item
 
-    def remove_chart(self, item: ChartItem) -> None:
+    def _sync_new_chart_modes(self, item: ChartItem) -> None:
+        if self.delta_box.isChecked():
+            self._set_delta_visible(item, True)
+        if self.region_box.isChecked() and item.region is not None:
+            others = [c for c in self.charts if c is not item and c.region is not None]
+            if others:
+                self._region_syncing = True
+                try:
+                    item.region.setRegion(others[0].region.getRegion())
+                    item.region.setVisible(True)
+                finally:
+                    self._region_syncing = False
+
+    def _resolve_chart(self, chart) -> ChartItem | None:
+        if isinstance(chart, str):
+            return self._find_chart(chart)
+        return chart if chart in self.charts else None
+
+    def remove_chart(self, item) -> None:
+        item = self._resolve_chart(item)
+        if item is None:
+            return
         self.clear_markers(item)
         self._clear_delta_visuals(item)
+        if item.mouse_proxy is not None:
+            try:
+                item.mouse_proxy.disconnect()
+            except Exception:
+                pass
+        # Unlink before the widget goes away so no view keeps a dead link.
+        self.charts.remove(item)
+        try:
+            item.plot.plotItem.vb.linkView(pg.ViewBox.XAxis, None)
+        except Exception:
+            pass
         for graphics_item in (item.vline, item.hline, item.a_line, item.b_line, item.a_label, item.b_label, item.region):
             if graphics_item is not None:
                 try:
@@ -335,31 +550,143 @@ class WaveformPage(QWidget):
         item.a_x = None
         item.b_x = None
         item.mouse_proxy = None
-        if item in self.charts:
-            self.charts.remove(item)
-        card = item.plot.property("card")
+        card = item.card
         if card is not None:
             if card in self._chart_cards:
                 idx = self._chart_cards.index(card)
                 self._chart_cards.pop(idx)
                 if idx < len(self._chart_titles):
                     self._chart_titles.pop(idx)
+            card.hide()
             card.deleteLater()
+        self._on_chart_set_changed()
+
+    def set_chart_collapsed(self, item: ChartItem, collapsed: bool) -> None:
+        item.collapsed = bool(collapsed)
+        item.plot.setVisible(not item.collapsed)
+        if item.collapse_btn is not None:
+            item.collapse_btn.setText("▸" if item.collapsed else "▾")
+        self._sync_cursor_visibility(item)
+        self._on_chart_set_changed()
+        if not item.collapsed:
+            item.dirty = True
+
+    def _on_chart_set_changed(self) -> None:
+        self._relink_x_axes()
+        self._update_axis_visibility()
+        self._sync_signal_checks()
+        self._relayout_charts()
+
+    def _relink_x_axes(self) -> None:
+        if not self.charts:
+            return
+        base = self.charts[0].plot.plotItem.vb
+        base.linkView(pg.ViewBox.XAxis, None)
+        for chart in self.charts[1:]:
+            vb = chart.plot.plotItem.vb
+            if vb.linkedView(pg.ViewBox.XAxis) is not base:
+                vb.linkView(pg.ViewBox.XAxis, base)
+
+    def _bottom_expanded_chart(self) -> ChartItem | None:
+        for chart in reversed(self.charts):
+            if not chart.collapsed:
+                return chart
+        return None
+
+    def _update_axis_visibility(self) -> None:
+        bottom = self._bottom_expanded_chart()
+        for chart in self.charts:
+            self._set_x_axis_shown(chart, chart is bottom)
+
+    def _set_x_axis_shown(self, chart: ChartItem, shown: bool) -> None:
+        axis = chart.plot.getAxis("bottom")
+        axis.setStyle(showValues=shown)
+        axis.showLabel(shown)
+        axis.setHeight(scaled_px(50) if shown else scaled_px(6))
+
+    def _set_cursor_text(self, chart: ChartItem, full_text: str) -> None:
+        """Show cursor/delta info on a single elided line; full text in tooltip."""
+        label = chart.cursor_label
+        if label is None:
+            return
+        chart.cursor_full_text = full_text
+        single = full_text.replace("\n", " ")
+        label.setToolTip(full_text)
+        width = label.contentsRect().width()
+        if width < 60:
+            width = max(60, chart.card.width() - 24) if chart.card is not None else 400
+        metrics = label.fontMetrics()
+        label.setText(metrics.elidedText(single, Qt.TextElideMode.ElideRight, width))
+        label.setFixedHeight(metrics.height() + 8)
+
+    def _sync_cursor_visibility(self, item: ChartItem) -> None:
+        if item.cursor_label is not None:
+            wanted = self.crosshair_box.isChecked() or self.delta_box.isChecked()
+            item.cursor_label.setVisible(wanted and not item.collapsed)
+
+    def _chart_overhead(self, chart: ChartItem) -> int:
+        """Height of a card excluding its plot."""
+        card = chart.card
+        layout = card.layout()
+        margins = layout.contentsMargins()
+        header = max(
+            chart.collapse_btn.sizeHint().height() if chart.collapse_btn else 0,
+            chart.menu_btn.sizeHint().height() if chart.menu_btn else 0,
+            chart.title_label.sizeHint().height() if chart.title_label else 0,
+        )
+        height = margins.top() + margins.bottom() + header
+        if chart.collapsed:
+            return height
+        if chart.cursor_label is not None and not chart.cursor_label.isHidden():
+            height += layout.spacing() + chart.cursor_label.sizeHint().height()
+        return height + layout.spacing()
+
+    def _relayout_charts(self) -> None:
+        """Split the scroll viewport height evenly among expanded plots."""
+        if self._relayout_busy:
+            return
+        self._relayout_busy = True
+        try:
+            if not self.charts:
+                return
+            available = self.scroll.viewport().height()
+            min_plot = scaled_px(150)
+            expanded = [chart for chart in self.charts if not chart.collapsed]
+            fixed = sum(self._chart_overhead(chart) for chart in self.charts)
+            fixed += self._CARD_SPACING * (len(self.charts) - 1)
+            if expanded:
+                per_plot = max(min_plot, (available - fixed) // len(expanded))
+                for chart in expanded:
+                    chart.plot.setMinimumHeight(per_plot)
+                    chart.plot.setMaximumHeight(per_plot)
+        finally:
+            self._relayout_busy = False
+
+    def eventFilter(self, obj, event):  # noqa: N802 - Qt override
+        if event.type() == QEvent.Type.Resize:
+            if obj is self.scroll.viewport():
+                self._relayout_charts()
+            else:
+                for chart in self.charts:
+                    if chart.cursor_label is obj and chart.cursor_full_text:
+                        self._set_cursor_text(chart, chart.cursor_full_text)
+                        break
+        return super().eventFilter(obj, event)
 
     def reset_chart(self, item: ChartItem) -> None:
         for series in item.series.values():
             series.x.clear()
             series.y.clear()
-            series.sample_index = 0
             series.curve.setData([], [])
         self.clear_markers(item)
         item.x = []
         item.y = []
-        item.stats_label.setText("latest --   min --   max --   samples 0")
+        self._update_stats(item)
 
     def reset_all(self) -> None:
         for item in self.charts:
             self.reset_chart(item)
+        self._device_sample_index.clear()
 
     def _open_settings_dialog(self) -> None:
         dialog = self._settings_dialog
@@ -410,15 +737,12 @@ class WaveformPage(QWidget):
         hline = pg.InfiniteLine(angle=0, movable=False, pen=pen)
         vline.setZValue(15)
         hline.setZValue(15)
-        visible = self.crosshair_box.isChecked()
         vline.setVisible(False)
         hline.setVisible(False)
         item.plot.addItem(vline, ignoreBounds=True)
         item.plot.addItem(hline, ignoreBounds=True)
         item.vline = vline
         item.hline = hline
-        if item.cursor_label is not None:
-            item.cursor_label.setVisible(visible)
         item.mouse_proxy = pg.SignalProxy(
             item.plot.scene().sigMouseMoved,
             rateLimit=60,
@@ -530,17 +854,16 @@ class WaveformPage(QWidget):
 
     def _on_delta_toggled(self, enabled: bool) -> None:
         self.delta_clear_btn.setEnabled(enabled)
-        cursor_visible = enabled or self.crosshair_box.isChecked()
         for chart in self.charts:
             self._set_delta_visible(chart, enabled)
-            if chart.cursor_label is not None:
-                chart.cursor_label.setVisible(cursor_visible)
+            self._sync_cursor_visibility(chart)
+        self._relayout_charts()
         if enabled:
             self._refresh_all_delta_labels()
         else:
             for chart in self.charts:
                 if chart.cursor_label is not None and not self.crosshair_box.isChecked():
-                    chart.cursor_label.setText("游標 --")
+                    self._set_cursor_text(chart, "游標 --")
 
     def _on_delta_visual_toggled(self, _enabled: bool) -> None:
         self._refresh_all_delta_labels()
@@ -567,15 +890,9 @@ class WaveformPage(QWidget):
         self._refresh_all_delta_labels()
 
     def _place_delta_cursor(self, source: ChartItem, x_value: float) -> None:
-        source_latest = self._latest_chart_x(source)
-        offset_from_right = (source_latest - x_value) if source_latest is not None else 0.0
         slot = self._delta_pending
         for chart in self.charts:
-            if chart is source:
-                target_x = x_value
-            else:
-                chart_latest = self._latest_chart_x(chart)
-                target_x = (chart_latest - offset_from_right) if chart_latest is not None else x_value
+            target_x = x_value
             if slot == "A":
                 chart.a_x = target_x
                 if chart.a_line is not None:
@@ -619,13 +936,17 @@ class WaveformPage(QWidget):
             if address in selected_addresses and series.x
         ]
         if chart.a_x is None and chart.b_x is None:
-            chart.cursor_label.setText("Δ: 點擊圖上設定 A，再點擊設定 B")
+            self._set_cursor_text(chart, "Δ: 點擊圖上設定 A，再點擊設定 B")
             self._clear_delta_visuals(chart)
             return
         show_pct = self.delta_percent_box.isChecked()
         highlight = self.delta_highlight_box.isChecked()
         preview = self.delta_preview_box.isChecked()
+        # The single cursor line is elided on the right, so the Δ/preview
+        # segment (the measurement users care about) goes first, then A/B.
+        head: list[str] = []
         lines: list[str] = []
+        tail: list[str] = []
         a_values: dict[str, float] = {}
         b_values: dict[str, float] = {}
         if chart.a_x is not None:
@@ -663,9 +984,7 @@ class WaveformPage(QWidget):
             delta_line = "   ".join(parts)
             if highlight:
                 delta_line = f"⟦ {delta_line} ⟧"
-            lines.append(delta_line)
-            if preview:
-                lines.append("（預覽：A/B 已放下，目前顯示固定 Δ；按「清除 A/B」可重設）")
+            head.append(delta_line)
         elif chart.a_x is not None and preview and chart.last_mouse_x is not None:
             mx = chart.last_mouse_x
             parts = [f"vs A @Sample {mx:.1f}"]
@@ -681,11 +1000,11 @@ class WaveformPage(QWidget):
             preview_line = "   ".join(parts)
             if highlight:
                 preview_line = f"⟦ {preview_line} ⟧"
-            lines.append(preview_line)
-            lines.append(f"(下一個點擊放 {self._delta_pending})")
+            head.append(preview_line)
+            tail.append(f"(下一個點擊放 {self._delta_pending})")
         else:
-            lines.append(f"(下一個點擊放 {self._delta_pending})")
-        chart.cursor_label.setText("\n".join(lines))
+            tail.append(f"(下一個點擊放 {self._delta_pending})")
+        self._set_cursor_text(chart, "  |  ".join(head + lines + tail))
         self._apply_delta_highlight_style(chart)
         self._update_delta_visuals(chart, visible_series, a_values, b_values)
 
@@ -806,19 +1125,18 @@ class WaveformPage(QWidget):
                 chart.delta_links[addr].setVisible(False)
 
     def _on_crosshair_toggled(self, enabled: bool) -> None:
-        cursor_visible = enabled or self.delta_box.isChecked()
         for item in self.charts:
-            if item.cursor_label is not None:
-                item.cursor_label.setVisible(cursor_visible)
+            self._sync_cursor_visibility(item)
             if not enabled:
                 if item.vline is not None:
                     item.vline.setVisible(False)
                 if item.hline is not None:
                     item.hline.setVisible(False)
                 if item.cursor_label is not None and not self.delta_box.isChecked():
-                    item.cursor_label.setText("游標 --")
+                    self._set_cursor_text(item, "游標 --")
         if self.delta_box.isChecked():
             self._refresh_all_delta_labels()
+        self._relayout_charts()
 
     def _on_crosshair_mouse_moved(self, item: ChartItem, event) -> None:
         crosshair_on = self.crosshair_box.isChecked()
@@ -838,16 +1156,8 @@ class WaveformPage(QWidget):
         if crosshair_on:
             self._broadcast_crosshair(item, x_value, y_value)
         elif delta_on and self.delta_preview_box.isChecked():
-            source_latest = self._latest_chart_x(item)
-            offset_from_right = (source_latest - x_value) if source_latest is not None else 0.0
             for chart in self.charts:
-                if chart is item:
-                    chart.last_mouse_x = x_value
-                else:
-                    chart_latest = self._latest_chart_x(chart)
-                    chart.last_mouse_x = (
-                        chart_latest - offset_from_right if chart_latest is not None else x_value
-                    )
+                chart.last_mouse_x = x_value
                 self._render_chart_delta_text(chart)
 
     def _hide_all_crosshairs(self) -> None:
@@ -861,19 +1171,13 @@ class WaveformPage(QWidget):
             if not crosshair_on and self.delta_box.isChecked():
                 self._render_chart_delta_text(chart)
             elif chart.cursor_label is not None and not self.delta_box.isChecked():
-                chart.cursor_label.setText("游標 --")
+                self._set_cursor_text(chart, "游標 --")
 
     def _broadcast_crosshair(self, source: ChartItem, x_value: float, y_value: float) -> None:
         selected_addresses = self._selected_addresses()
-        source_latest = self._latest_chart_x(source)
-        offset_from_right = (source_latest - x_value) if source_latest is not None else 0.0
         for chart in self.charts:
             is_source = chart is source
-            if is_source:
-                target_x = x_value
-            else:
-                chart_latest = self._latest_chart_x(chart)
-                target_x = (chart_latest - offset_from_right) if chart_latest is not None else x_value
+            target_x = x_value  # x is a shared sample counter: same x == same instant
             chart.last_mouse_x = target_x
             if chart.vline is not None:
                 chart.vline.setPos(target_x)
@@ -903,7 +1207,7 @@ class WaveformPage(QWidget):
                     parts.append(f"{series.label}: {yv:.2f}")
             if is_source:
                 parts.append(f"y={y_value:.2f}")
-            chart.cursor_label.setText("   ".join(parts))
+            self._set_cursor_text(chart, "   ".join(parts))
 
     @staticmethod
     def _sample_value_at(series: DeviceSeries, x_value: float) -> float | None:
@@ -1022,10 +1326,25 @@ class WaveformPage(QWidget):
             filename = f"{filename}.png"
         # Make sure any batched samples are drawn before exporting (WYSIWYG).
         self._flush_dirty()
+        # The on-screen chart omits title/axis names to save space; add them back
+        # for the export so the PNG is self-explanatory, then restore.
+        plot_item = item.plot.plotItem
+        left_axis = item.plot.getAxis("left")
+        left_was_visible = left_axis.label.isVisible()
+        names = [series.label for address, series in item.series.items() if series.visible and series.y]
+        title = f"{item.label} - {', '.join(names)}" if names else item.label
+        plot_item.setTitle(title, size=font_size(13), color=self._tokens.plot_axis_text)
+        item.plot.setLabel("left", item.label)
+        self._set_x_axis_shown(item, True)
         try:
-            ImageExporter(item.plot.plotItem).export(filename)
+            ImageExporter(plot_item).export(filename)
         except Exception as exc:  # pragma: no cover - depends on Qt/OS exporter failures
             QMessageBox.warning(self, "儲存失敗", f"無法儲存圖片：{exc}")
+        finally:
+            plot_item.setTitle(None)
+            plot_item.titleLabel.setText("")
+            left_axis.showLabel(left_was_visible)
+            self._update_axis_visibility()
 
     def _ensure_series(self, item: ChartItem, state: DeviceState, address: str) -> DeviceSeries:
         if address in item.series:
@@ -1050,36 +1369,31 @@ class WaveformPage(QWidget):
         ]
         return max(latest_values) if latest_values else None
 
-    def _align_series_to_latest(self, item: ChartItem, series: DeviceSeries) -> None:
-        latest_x = self._latest_chart_x(item)
-        if latest_x is None:
-            return
-        target_index = int(latest_x) + 1
-        if target_index <= series.sample_index:
-            return
-        if series.x and target_index - 1 > series.x[-1]:
-            series.x.append(float(target_index - 1))
-            series.y.append(math.nan)
-        series.sample_index = target_index
+    def _align_device_to_latest(self, address: str) -> int:
+        """Return the sample index a reconnected device resumes at.
 
-    def _append_sample(
-        self,
-        item: ChartItem,
-        state: DeviceState,
-        address: str,
-        *,
-        align_to_latest: bool = False,
-    ) -> None:
+        Inserts a NaN break at ``target - 1`` on every chart so the gap while the
+        device was away is drawn as a break rather than a connected line.
+        """
+        current = self._device_sample_index.get(address, 0)
+        target = max(self._device_sample_index.values(), default=0)
+        if target <= current:
+            return current
+        for item in self.charts:
+            series = item.series.get(address)
+            if series is not None and series.x and target - 1 > series.x[-1]:
+                series.x.append(float(target - 1))
+                series.y.append(math.nan)
+        return target
+
+    def _append_sample(self, item: ChartItem, state: DeviceState, address: str, x_value: int) -> None:
         series = self._ensure_series(item, state, address)
-        if align_to_latest:
-            self._align_series_to_latest(item, series)
         try:
             value = float(state.get_value(item.field_name))
         except ValueError:
             value = 0.0
-        series.x.append(float(series.sample_index))
+        series.x.append(float(x_value))
         series.y.append(value)
-        series.sample_index += 1
         self._trim_series(item)
         # Buffers, trimming and stats stay synchronous (no sample is ever
         # skipped); only the heavy pyqtgraph polyline redraw is batched onto the
@@ -1104,9 +1418,17 @@ class WaveformPage(QWidget):
         if not state.is_connected:
             return
         self.notice.setText("波形即時顯示")
-        align_to_latest = address in self._resumed_addresses
+        # One counter per device, shared by every chart: the same notify lands
+        # at the same x on all charts, so linked x axes line up in time.
+        if address in self._resumed_addresses:
+            x_value = self._align_device_to_latest(address)
+        else:
+            x_value = self._device_sample_index.get(
+                address, max(self._device_sample_index.values(), default=0)
+            )
         for item in self.charts:
-            self._append_sample(item, state, address, align_to_latest=align_to_latest)
+            self._append_sample(item, state, address, x_value)
+        self._device_sample_index[address] = x_value + 1
         self._resumed_addresses.discard(address)
 
     def refresh(self, state: DeviceState) -> None:
@@ -1120,16 +1442,19 @@ class WaveformPage(QWidget):
     def _flush_dirty(self) -> None:
         # Apply the batched, expensive pyqtgraph operations (full-polyline
         # setData + x-range repaint) at most once per timer tick.
+        any_dirty = False
         for item in self.charts:
             if not item.dirty:
                 continue
+            any_dirty = True
             item.dirty = False
             for series in item.series.values():
                 if series.visible:
                     series.curve.setData(series.x, series.y)
                 else:
                     series.curve.setData([], [])
-            self._update_plot_window(item)
+        if any_dirty:
+            self._update_shared_x_window()
 
     def _trim_series(self, item: ChartItem) -> None:
         max_samples = self._history_limit()
@@ -1159,17 +1484,17 @@ class WaveformPage(QWidget):
             for series in visible_series:
                 legend.addItem(series.curve, series.label)
             item.legend_key = legend_key
+        if legend is not None:
+            # A legend only helps when several devices overlap in one chart.
+            legend.setVisible(len(visible_series) >= 2)
         if visible_series:
             item.curve = visible_series[0].curve
             item.x = visible_series[0].x
             item.y = visible_series[0].y
-            title_suffix = visible_series[0].label if len(visible_series) == 1 else "全部裝置"
-            item.plot.setTitle(f"{item.label} - {title_suffix}")
         else:
             item.curve = None
             item.x = []
             item.y = []
-            item.plot.setTitle(item.label)
         self._update_stats(item, visible_series)
         if self.delta_box.isChecked() and (item.a_x is not None or item.b_x is not None):
             self._update_delta_labels_for(item)
@@ -1177,14 +1502,25 @@ class WaveformPage(QWidget):
         # The x-range repaint and curve setData are batched onto the render timer.
         item.dirty = True
 
-    def _update_plot_window(self, item: ChartItem) -> None:
-        visible = [series for address, series in item.series.items() if address in self._selected_addresses() and series.x]
-        if not visible:
+    def _update_shared_x_window(self) -> None:
+        """Scroll every chart to the same x window (they are x-linked)."""
+        selected = self._selected_addresses()
+        spans = [
+            (series.x[0], series.x[-1])
+            for item in self.charts
+            for address, series in item.series.items()
+            if address in selected and series.x
+        ]
+        if not spans:
             return
-        right = max(series.x[-1] for series in visible)
-        max_samples = self._history_limit()
-        left = max(0.0, right - max_samples + 1)
-        item.plot.setXRange(left, max(right, left + 1), padding=0.01)
+        right = max(last for _first, last in spans)
+        # Start at the oldest sample actually on screen, not at 0: charts added
+        # after the device has streamed a while would otherwise leave the left
+        # part of every (x-linked) plot empty.
+        oldest = min(first for first, _last in spans)
+        left = max(oldest, right - self._history_limit() + 1)
+        for item in self.charts:
+            item.plot.setXRange(left, max(right, left + 1), padding=0.01)
 
     def _annotation_font(self) -> QFont:
         font = QFont(self.font())
@@ -1194,10 +1530,9 @@ class WaveformPage(QWidget):
 
     def _style_plot(self, plot: pg.PlotWidget) -> None:
         t = self._tokens
-        plot.setMinimumHeight(scaled_px(230))
+        plot.setMinimumHeight(scaled_px(150))
         plot.setBackground(t.plot_bg)
         plot.getAxis("left").setWidth(scaled_px(80))
-        plot.getAxis("bottom").setHeight(scaled_px(50))
         for name in ("bottom", "left"):
             axis = plot.getAxis(name)
             axis.setStyle(tickFont=self.font())
@@ -1217,7 +1552,6 @@ class WaveformPage(QWidget):
                 label_options["siPrefixEnableRanges"] = axis.getSIPrefixEnableRanges()
             axis.setLabel(**label_options)
             axis.showLabel(label_visible)
-        plot.plotItem.setTitle(plot.plotItem.titleLabel.text, size=font_size(13), color=t.plot_axis_text)
         plot.getAxis("bottom").setPen(t.plot_axis)
         plot.getAxis("left").setPen(t.plot_axis)
         plot.getAxis("bottom").setTextPen(t.plot_axis_text)
@@ -1291,6 +1625,17 @@ class WaveformPage(QWidget):
             if item.hline is not None:
                 item.hline.setPen(crosshair_pen)
             self._apply_delta_highlight_style(item)
+        # Text scale changes the axis heights; keep label/tick visibility as is.
+        bottom = self._bottom_expanded_chart()
+        for item in self.charts:
+            item.plot.getAxis("bottom").setHeight(scaled_px(50) if item is bottom else scaled_px(6))
+        self._relayout_charts()
+
+    @staticmethod
+    def _fmt_short(value: float) -> str:
+        if abs(value - round(value)) < 1e-9:
+            return str(int(round(value)))
+        return f"{value:.2f}"
 
     def _update_stats(self, item: ChartItem, visible_series: list[DeviceSeries] | None = None) -> None:
         if visible_series is None:
@@ -1299,7 +1644,9 @@ class WaveformPage(QWidget):
             ]
         visible_with_data = [series for series in visible_series if self._finite_values(series.y)]
         if not visible_with_data:
-            item.stats_label.setText("latest --   min --   max --   samples 0")
+            empty = "latest --   min --   max --   n 0"
+            item.stats_label.setText(empty)
+            item.stats_label.setToolTip(empty)
             return
         show_region = (
             self.region_box.isChecked()
@@ -1311,12 +1658,17 @@ class WaveformPage(QWidget):
             r1, r2 = item.region.getRegion()
             region_lo, region_hi = (r1, r2) if r1 <= r2 else (r2, r1)
         lines = []
+        shorts = []
         for series in visible_with_data:
             values = self._finite_values(series.y)
             latest = values[-1]
             line = (
                 f"{series.label}: latest {latest:.2f}   min {min(values):.2f}   "
                 f"max {max(values):.2f}   samples {len(values)}"
+            )
+            short = (
+                f"latest {self._fmt_short(latest)}  min {self._fmt_short(min(values))}  "
+                f"max {self._fmt_short(max(values))}  n {len(values)}"
             )
             if region_lo is not None and region_hi is not None:
                 in_range = [
@@ -1327,11 +1679,23 @@ class WaveformPage(QWidget):
                 if in_range:
                     rmin = min(in_range)
                     rmax = max(in_range)
-                    line += (
-                        f"   框選[{region_lo:.0f}~{region_hi:.0f}]: "
+                    region_text = (
+                        f"框選[{region_lo:.0f}~{region_hi:.0f}]: "
                         f"min {rmin:.2f}  max {rmax:.2f}  Δ {rmax - rmin:.2f}  n={len(in_range)}"
                     )
                 else:
-                    line += f"   框選[{region_lo:.0f}~{region_hi:.0f}]: --"
+                    region_text = f"框選[{region_lo:.0f}~{region_hi:.0f}]: --"
+                line += "   " + region_text
+                short += "  " + region_text
             lines.append(line)
-        item.stats_label.setText("\n".join(lines))
+            shorts.append(short)
+        full = "\n".join(lines)
+        if len(visible_with_data) == 1:
+            text = shorts[0]
+        else:
+            text = "  |  ".join(
+                f"{series.label} {self._fmt_short(self._finite_values(series.y)[-1])}"
+                for series in visible_with_data
+            )
+        item.stats_label.setText(text)
+        item.stats_label.setToolTip(full)
