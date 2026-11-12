@@ -80,6 +80,7 @@ def test_main_window_tabs_do_not_include_removed_pages():
         "PRU",
         "Number",
         "Waveform",
+        "Compare",
         "DEMO",
         "Log",
         "Error",

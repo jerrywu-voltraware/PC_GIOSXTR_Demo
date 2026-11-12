@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
     QLabel,
+    QMenu,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -17,9 +18,13 @@ from PyQt6.QtWidgets import (
 from ..models import DeviceState
 from ..theme import ThemeTokens, current_tokens, theme_manager
 from ..typography import font_size
+from .compare_page import comparable_field
 
 
 class DataTablePage(QWidget):
+    compare_toggle_requested = pyqtSignal(str, str)  # (source, row label)
+    compare_open_requested = pyqtSignal()
+
     def __init__(self, title: str, parent=None) -> None:
         super().__init__(parent)
         self.title = title
@@ -38,6 +43,10 @@ class DataTablePage(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         root.addWidget(self.table, 1)
         self._last_rows: list[tuple[str, str]] = []
+        # Compare integration: main window wires these up.
+        self.compare_is_added = None  # callable(source, row_label) -> bool
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_context_menu)
         self._apply_theme(current_tokens())
         theme_manager().theme_changed.connect(self._on_theme_changed)
 
@@ -94,6 +103,30 @@ class DataTablePage(QWidget):
                 else:
                     item.setForeground(value_brush)
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+    def build_context_menu(self, row: int) -> QMenu:
+        """Menu for a table row; actions are exposed for tests."""
+        menu = QMenu(self)
+        label_item = self.table.item(row, 0) if row >= 0 else None
+        label = label_item.text() if label_item is not None else ""
+        if comparable_field(self.title, label) is None:
+            action = menu.addAction("此欄位無法加入比較")
+            action.setEnabled(False)
+            self._toggle_action = None
+        else:
+            added = bool(self.compare_is_added and self.compare_is_added(self.title, label))
+            action = menu.addAction("從比較移除" if added else "加入比較")
+            action.triggered.connect(lambda _=False, r=label: self.compare_toggle_requested.emit(self.title, r))
+            self._toggle_action = action
+        open_action = menu.addAction("開啟比較頁")
+        open_action.triggered.connect(self.compare_open_requested.emit)
+        return menu
+
+    def _on_context_menu(self, pos) -> None:
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        self.build_context_menu(row).exec(self.table.viewport().mapToGlobal(pos))
 
     def refresh(self, state: DeviceState) -> None:
         raise NotImplementedError

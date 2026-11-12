@@ -61,6 +61,7 @@ from .overview_page import OverviewPage
 from .recording_panel import RecordingPanel
 from .scan_panel import ScanPanel
 from .settings_dialog import SettingsDialog
+from .compare_page import CompareEntry, ComparePage, comparable_field, device_label as compare_device_label
 from .waveform_page import WaveformPage
 
 
@@ -266,6 +267,12 @@ class MainWindow(QMainWindow):
         self.pru_page = PruPage()
         self.number_page = NumberPage(self._active_manager)
         self.waveform_page = WaveformPage()
+        self.compare_page = ComparePage()
+        self.ptu_page.compare_is_added = self._compare_is_added
+        self.pru_page.compare_is_added = self._compare_is_added
+        for data_page in (self.ptu_page, self.pru_page):
+            data_page.compare_toggle_requested.connect(self._toggle_compare)
+            data_page.compare_open_requested.connect(self._open_compare_tab)
         self.demo2_page = Demo2Page(
             engineering_mode=self.engineering_mode,
             demo_use_fake_data=self.demo_use_fake_data,
@@ -286,6 +293,7 @@ class MainWindow(QMainWindow):
             ("PRU", self.pru_page),
             ("Number", self.number_page),
             ("Waveform", self.waveform_page),
+            ("Compare", self.compare_page),
             ("DEMO", self.demo2_page),
             ("Log", self.log_page),
             ("Error", self.error_page),
@@ -1217,6 +1225,7 @@ class MainWindow(QMainWindow):
             except OSError as exc:
                 self._recording_failed(address, exc)
         self.waveform_page.refresh_device(state, self.states, self.active_address)
+        self.compare_page.feed(address, state)
         if not self._ui_refresh_timer.isActive():
             self._ui_refresh_timer.start()
 
@@ -1426,6 +1435,26 @@ class MainWindow(QMainWindow):
             )
         return items
 
+    def _compare_is_added(self, source: str, row_label: str) -> bool:
+        field = comparable_field(source, row_label)
+        return field is not None and self.compare_page.has_entry(self.active_address, field[0])
+
+    def _toggle_compare(self, source: str, row_label: str) -> None:
+        field = comparable_field(source, row_label)
+        if field is None:
+            return
+        field_name, unit = field
+        address = self.active_address
+        if self.compare_page.has_entry(address, field_name):
+            self.compare_page.remove_entry((address, field_name))
+            return
+        self.compare_page.add_entry(
+            CompareEntry(address, compare_device_label(self.state, address), source, row_label, field_name, unit)
+        )
+
+    def _open_compare_tab(self) -> None:
+        self.tabs.setCurrentIndex(self.tabs.indexOf(self.compare_page.parentWidget().parentWidget()))
+
     def refresh_pages(self) -> None:
         self._ui_refresh_timer.stop()
         state = self.state
@@ -1442,6 +1471,7 @@ class MainWindow(QMainWindow):
         for page in pages:
             page.refresh(state)
         self.waveform_page.set_devices(self.states, self.active_address)
+        self.compare_page.set_devices(self.states, self.active_address)
         active_logger = self._active_logger()
         rec_active = active_logger is not None and active_logger.is_recording
         rec_path = str(active_logger.current_path) if (active_logger and active_logger.current_path) else ""
