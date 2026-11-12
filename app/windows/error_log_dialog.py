@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
@@ -33,10 +34,19 @@ class ErrorLogDialog(QDialog):
     The dialog is non-modal so the user can keep interacting with the main
     window; closing the dialog only hides it — subsequent errors reopen it
     with the prior rows preserved.
+
+    When auto-popup is disabled, rows are still recorded but the dialog is not
+    shown; the owner surfaces an unread reminder instead.
     """
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    # Emitted when the user toggles the in-dialog "don't pop up" box;
+    # carries the new auto-popup state (True = pop up on new errors).
+    popup_enabled_changed = pyqtSignal(bool)
+    cleared = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None, *, popup_enabled: bool = True) -> None:
         super().__init__(parent)
+        self.popup_enabled = bool(popup_enabled)
         self.setWindowTitle("錯誤通知")
         self.setModal(False)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
@@ -74,6 +84,10 @@ class ErrorLogDialog(QDialog):
         self.clear_button = QPushButton("清除清單")
         self.clear_button.clicked.connect(self._clear_rows)
         button_row.addWidget(self.clear_button)
+        self.suppress_popup_box = QCheckBox("不要自動彈出（可在 設定 → 通知 重新開啟）")
+        self.suppress_popup_box.setChecked(not self.popup_enabled)
+        self.suppress_popup_box.toggled.connect(self._on_suppress_toggled)
+        button_row.addWidget(self.suppress_popup_box)
         button_row.addStretch(1)
         self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         self.button_box.rejected.connect(self.close)
@@ -88,7 +102,22 @@ class ErrorLogDialog(QDialog):
         self._apply_theme(self._tokens)
         theme_manager().theme_changed.connect(self._apply_theme)
 
-    def append_error(self, state: DeviceState) -> None:
+    def set_popup_enabled(self, enabled: bool) -> None:
+        """Sync from the owner/settings without re-emitting the change."""
+        self.popup_enabled = bool(enabled)
+        self.suppress_popup_box.blockSignals(True)
+        self.suppress_popup_box.setChecked(not self.popup_enabled)
+        self.suppress_popup_box.blockSignals(False)
+
+    def _on_suppress_toggled(self, suppressed: bool) -> None:
+        self.popup_enabled = not suppressed
+        self.popup_enabled_changed.emit(self.popup_enabled)
+
+    def append_error(self, state: DeviceState) -> str:
+        """Record one error row; pop up only when auto-popup is enabled.
+
+        Returns a one-line summary of the row for reminders/tooltips.
+        """
         code = state.error_num
         code_hex = f"0x{code:02X}"
         desc = error_description(code)
@@ -132,13 +161,21 @@ class ErrorLogDialog(QDialog):
         self.table.scrollToBottom()
         self._update_header()
 
-        if not self.isVisible():
-            self.show()
-        self.raise_()
+        if self.popup_enabled:
+            if not self.isVisible():
+                self.show()
+            self.raise_()
+        summary = f"{timestamp}  {code_hex} {desc}"
+        if trigger != "-":
+            summary += f"  {trigger}"
+        if device:
+            summary += f"  {device}"
+        return summary
 
     def _clear_rows(self) -> None:
         self.table.setRowCount(0)
         self._update_header()
+        self.cleared.emit()
 
     def _update_header(self) -> None:
         self.header.setText(f"錯誤通知 ({self.table.rowCount()})")

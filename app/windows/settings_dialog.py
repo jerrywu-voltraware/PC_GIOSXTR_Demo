@@ -45,6 +45,7 @@ class SettingsDialog(QDialog):
     demo_settings_changed = pyqtSignal(bool, int, int, str, object, str, str)
     check_updates_requested = pyqtSignal()
     auto_reconnect_changed = pyqtSignal(bool)
+    error_popup_changed = pyqtSignal(bool)
     switch_source_requested = pyqtSignal()
     record_split_rows_changed = pyqtSignal(int)
 
@@ -53,6 +54,7 @@ class SettingsDialog(QDialog):
         *,
         engineering_mode: bool,
         auto_reconnect_enabled: bool = True,
+        error_popup_enabled: bool = True,
         demo_use_fake_data: bool = True,
         demo_device_name: str = DEFAULT_DEMO_DEVICE_NAME,
         demo_ebike_pct: int = 76,
@@ -80,6 +82,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._scrollable(self._about_tab()), "關於")
         tabs.addTab(self._scrollable(self._appearance_tab()), "外觀")
         tabs.addTab(self._scrollable(self._connection_tab(auto_reconnect_enabled)), "連線")
+        tabs.addTab(self._scrollable(self._notification_tab(error_popup_enabled)), "通知")
         tabs.addTab(
             self._scrollable(self._demo_tab(
                 demo_use_fake_data,
@@ -220,6 +223,23 @@ class SettingsDialog(QDialog):
         layout.addWidget(self.auto_reconnect_box)
 
         detail = QLabel("僅在裝置意外斷線時啟動；使用者手動中斷連線時不會自動連回。")
+        detail.setWordWrap(True)
+        layout.addWidget(detail)
+        layout.addStretch(1)
+        return page
+
+    def _notification_tab(self, error_popup_enabled: bool) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+
+        self.error_popup_box = QCheckBox("發生錯誤時彈出錯誤通知視窗")
+        self.error_popup_box.setChecked(error_popup_enabled)
+        self.error_popup_box.toggled.connect(self.error_popup_changed.emit)
+        layout.addWidget(self.error_popup_box)
+
+        detail = QLabel("關閉後，錯誤仍會記錄在錯誤清單，並在右上角顯示未讀錯誤數提醒；點提醒即可查看。")
         detail.setWordWrap(True)
         layout.addWidget(detail)
         layout.addStretch(1)

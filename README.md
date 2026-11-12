@@ -8,10 +8,12 @@ Windows desktop port of `Flutter_Gios040xst_Eng`, implemented with Python, PyQt6
 - Supported-device filtering for Central and GIOS ST device names.
 - Advertising data reconstruction with raw bytes and AD structure table.
 - IOT, 20B, and 200B notify packet decoding.
-- PTU, PRU, Number, Waveform, Log, and Error pages.
+- PTU, PRU, Number, Waveform, Compare, Log, and Error pages.
 - Manual CSV recording with Start Recording and Stop Recording controls.
 - Device-number write and reset commands.
-- Live waveform plots with up to 5 selected signals.
+- Live waveform plots with up to 8 selected signals: compact stacked charts, shared x-axis, signal checklist, collapsible charts, and an Analysis menu for Δ (A/B) cursors and region statistics.
+- Compare page: right-click a PTU/PRU field → 加入比較 to watch mixed signals (also across devices) in one value table and unit-grouped, x-linked charts; the list is remembered.
+- Optional error popup (Settings → 通知); when disabled, errors are still recorded and an unread reminder appears at the top right.
 - Readable 11 pt text with persistent 100–200% text scaling in Settings → Appearance.
 - Always-visible CSV health: elapsed time, successfully written rows, split count, last write, and storage errors.
 - Searchable device events with pause/follow controls; CSV recording continues while the log view is paused.

@@ -47,6 +47,7 @@ from ..constants import (
 )
 from ..csv_logger import CsvLogger
 from ..models import DataEvent, DeviceState
+from ..theme import ThemeTokens, current_tokens, theme_manager
 from ..protocol import parse_notify_packet
 from ..recent_devices import RecentDevice, RecentDeviceStore
 from ..resources import resource_path
@@ -90,6 +91,8 @@ def _default_update_save_path(asset: UpdateAsset, downloads_dir: str | None = No
 
 AUTO_RECONNECT_SETTINGS_KEY = "connection/autoReconnect"
 AUTO_RECONNECT_DEFAULT = True
+ERROR_POPUP_SETTINGS_KEY = "notifications/errorPopup"
+ERROR_POPUP_DEFAULT = True
 DEMO_CHARGER_MODE_SETTINGS_KEY = "demo/chargerMode"
 DEMO_EBIKE_STYLE_SETTINGS_KEY = "demo/ebikeStyle"
 RECORD_SPLIT_ROWS_SETTINGS_KEY = "recording/splitRows"
@@ -186,6 +189,8 @@ class MainWindow(QMainWindow):
         self._update_check_running = False
         self._last_adapter_status: AdapterStatus | None = None
         self.auto_reconnect_enabled = _settings_bool(AUTO_RECONNECT_SETTINGS_KEY, AUTO_RECONNECT_DEFAULT)
+        self.error_popup_enabled = _settings_bool(ERROR_POPUP_SETTINGS_KEY, ERROR_POPUP_DEFAULT)
+        self._unread_error_count = 0
         self._manual_disconnect_addresses: set[str] = set()
         # Addresses that are connecting OR connected-but-not-yet-streaming.
         # The dongle cannot start a new connection while a previous link is
@@ -261,7 +266,21 @@ class MainWindow(QMainWindow):
         self.settings_btn.setToolTip("設定：字級、外觀、連線與錄製")
         self.settings_btn.setAutoRaise(True)
         self.settings_btn.clicked.connect(self._open_settings)
-        self.tabs.setCornerWidget(self.settings_btn, Qt.Corner.TopRightCorner)
+        # Unread-error reminder shown when the error popup is disabled.
+        self.error_alert_btn = QToolButton()
+        self.error_alert_btn.setAutoRaise(False)
+        self.error_alert_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.error_alert_btn.clicked.connect(self._open_error_log_from_alert)
+        self.error_alert_btn.setVisible(False)
+        corner = QWidget()
+        corner_layout = QHBoxLayout(corner)
+        corner_layout.setContentsMargins(0, 0, 0, 0)
+        corner_layout.setSpacing(6)
+        corner_layout.addWidget(self.error_alert_btn)
+        corner_layout.addWidget(self.settings_btn)
+        self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
+        self._style_error_alert_btn()
+        theme_manager().theme_changed.connect(self._style_error_alert_btn)
         self.overview_page = OverviewPage()
         self.ptu_page = PtuPage()
         self.pru_page = PruPage()
@@ -434,6 +453,7 @@ class MainWindow(QMainWindow):
             demo_device_battery_pcts=self.demo_device_battery_pcts,
             connected_demo_devices=self._connected_demo_device_settings(),
             auto_reconnect_enabled=self.auto_reconnect_enabled,
+            error_popup_enabled=self.error_popup_enabled,
             record_split_rows=self.record_split_rows,
             source_display_name=getattr(self.source, "display_name", ""),
             parent=self,
@@ -441,6 +461,7 @@ class MainWindow(QMainWindow):
         dialog.engineering_mode_changed.connect(self.set_engineering_mode)
         dialog.demo_settings_changed.connect(self.set_demo_settings)
         dialog.auto_reconnect_changed.connect(self.set_auto_reconnect_enabled)
+        dialog.error_popup_changed.connect(self.set_error_popup_enabled)
         dialog.record_split_rows_changed.connect(self.set_record_split_rows)
         dialog.check_updates_requested.connect(lambda: self._start_manual_update_check(dialog))
         dialog.switch_source_requested.connect(lambda: self._handle_switch_source(dialog))
@@ -1285,12 +1306,63 @@ class MainWindow(QMainWindow):
 
     def _ensure_error_log_dialog(self) -> ErrorLogDialog:
         if self._error_log_dialog is None:
-            self._error_log_dialog = ErrorLogDialog(self)
+            dialog = ErrorLogDialog(self, popup_enabled=self.error_popup_enabled)
+            dialog.popup_enabled_changed.connect(self.set_error_popup_enabled)
+            dialog.cleared.connect(self._clear_unread_errors)
+            self._error_log_dialog = dialog
         return self._error_log_dialog
 
     def _show_error_dialog(self, state: DeviceState) -> None:
         dialog = self._ensure_error_log_dialog()
-        dialog.append_error(state)
+        summary = dialog.append_error(state)
+        if dialog.isVisible():
+            # The user is looking at the list (popped up or opened by hand).
+            self._clear_unread_errors()
+            return
+        self._unread_error_count += 1
+        self._update_error_alert(summary)
+
+    def set_error_popup_enabled(self, enabled: bool, *, persist: bool = True) -> None:
+        self.error_popup_enabled = bool(enabled)
+        if self._error_log_dialog is not None:
+            self._error_log_dialog.set_popup_enabled(self.error_popup_enabled)
+        if persist:
+            _ensure_settings_identity()
+            QSettings().setValue(ERROR_POPUP_SETTINGS_KEY, self.error_popup_enabled)
+            batch_log(
+                "SETTINGS",
+                f"Error popup {'enabled' if self.error_popup_enabled else 'disabled'}",
+            )
+
+    def _update_error_alert(self, last_summary: str = "") -> None:
+        count = self._unread_error_count
+        self.error_alert_btn.setVisible(count > 0)
+        if count <= 0:
+            return
+        self.error_alert_btn.setText(f"⚠ {count} 筆錯誤")
+        tip = f"{count} 筆未讀錯誤，點擊查看錯誤清單"
+        if last_summary:
+            tip += f"\n最新：{last_summary}"
+        self.error_alert_btn.setToolTip(tip)
+
+    def _clear_unread_errors(self) -> None:
+        self._unread_error_count = 0
+        self._update_error_alert()
+
+    def _open_error_log_from_alert(self) -> None:
+        dialog = self._ensure_error_log_dialog()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._clear_unread_errors()
+
+    def _style_error_alert_btn(self, tokens: ThemeTokens | None = None) -> None:
+        t = tokens or current_tokens()
+        self.error_alert_btn.setStyleSheet(
+            f"QToolButton {{ background: {t.error_bg}; color: {t.error_fg}; "
+            f"border: 1px solid {t.error_border}; border-radius: 4px; "
+            f"padding: 2px 8px; font-weight: 700; }}"
+        )
 
     def start_csv_recording_active(self) -> Path | None:
         addr = self.active_address
